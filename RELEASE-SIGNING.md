@@ -369,30 +369,51 @@ failing `./check-deps.sh`; the commit id is inside the signed manifest statement
 
 ### The Docker image (audit M5)
 
-**Today.** No image is published under a public name; `docs/SELF-HOSTING.md` has people build
-it. The deploy bundle no longer defaults to `ghcr.io/flayrlabs/skwod-server:main`: the compose
-file requires `SKWOD_IMAGE` and the Unraid template carries a digest placeholder that pulls
-nothing until it is replaced. `deploy/verify-image.sh` checks that a reference is pinned by
-digest and verifies a cosign signature. **Nothing is signed yet, because nothing is published**
-— cosign signing was not run or tested in this change.
+**Workflow.** `.github/workflows/image.yml` in the public repository builds
+`ghcr.io/flayrlabs/skwod-server` for linux/amd64 and linux/arm64, each on a native GitHub runner
+(no QEMU). It runs only on a `skwod-v<n>` tag: pushed, or re-run by hand with
+`gh workflow run image.yml -R FlayrLabs/skwod --ref skwod-v<n>`. It never runs for pull requests.
+`deploy/image-release-guard.sh` (tested by `deploy/test-image-release-guard.sh`) refuses unless
+`<n>` equals `CURRENT_PROJECT_VERSION` in `apps/apple/project.yml` and the tagged commit is on
+`main`, so a tag on an unreviewed commit gets no image.
 
-**Publishing procedure, when images are published:**
-
-1. Build in a GitHub Actions workflow in the source repository (`.github/workflows/image.yml`),
-   triggered by a `v<n>` tag only, with `permissions: id-token: write, packages: write`.
-2. Push by digest and by an immutable version tag (`:v<n>`); never move `:main` / `:latest` to
-   an unreviewed build, and do not document them.
-3. Sign the digest keylessly in the same job:
-   `cosign sign --yes ghcr.io/flayrlabs/skwod-server@sha256:<digest>` (Fulcio certificate bound
-   to that workflow and tag, entry in Rekor). No long-lived signing key exists to steal.
-4. Put the digest in the release notes. Hosts verify with
-   `deploy/verify-image.sh ghcr.io/flayrlabs/skwod-server@sha256:<digest>`, which pins the
-   signer to `https://github.com/FlayrLabs/skwod/.github/workflows/image.yml@refs/tags/v<n>`
-   and the issuer to GitHub Actions. If the workflow lives elsewhere, change
-   `IDENTITY_REGEXP` in that script in the same commit.
-5. Residual trust: GitHub Actions and Sigstore. A compromised workflow run on a release tag
-   produces a validly signed image; reproducible image builds (plan above, step 5) are what
-   would let a host check the digest against source.
+1. **Build and test, per architecture, with no registry credentials.** The image is built with no
+   cache, with SBOM and provenance (`mode=max`) attestations, as an OCI archive.
+   `deploy/smoke-test-image.sh` then runs that exact archive twice. The first run uses the Unraid
+   template's flags, and the image must become healthy, print the one-time admin token, wait for
+   Start, and run as 99:100. The second run uses the compose posture, started at once, and the
+   bundled `livekit-server` must be running.
+2. **Publish** (the only job with `packages: write` and `id-token: write`). It runs behind the
+   `release` environment, so a maintainer approves each run. Before pushing anything it refuses a
+   build that is already published, or one that is not newer than the `org.opencontainers.image.version`
+   label of the current `latest`. All publishing shares one concurrency group (`image-publish`).
+   It then pushes the two tested
+   archives byte for byte (`<n>-amd64`, `<n>-arm64`), merges them into one multi-arch index tagged
+   `<n>-candidate`, and signs that digest keylessly: `cosign sign --yes …@sha256:<digest>`. That is a Fulcio
+   certificate bound to the workflow and its ref, with an entry in Rekor; there is no long-lived key
+   to steal. The job then checks the signature with `deploy/verify-image.sh`, the same check hosts
+   run. **Only then** does it tag that digest `<n>` and move `latest` to it, after checking once more that this only moves
+   it forward. The run summary prints the digest; put
+   it in the release notes.
+3. **Tags.** `<n>` is never overwritten; the workflow refuses. `latest` exists for Unraid's "check for updates" and always points at a
+   signed, smoke-tested build. Compose and VPS hosts still pin by digest (`SKWOD_IMAGE` is
+   required and has no default).
+4. **Hosts verify** with `deploy/verify-image.sh ghcr.io/flayrlabs/skwod-server@sha256:<digest>`
+   (cosign 3 or newer). It pins the signer to
+   `https://github.com/FlayrLabs/skwod/.github/workflows/image.yml@refs/tags/skwod-v<n>` (the
+   workflow path, the repository and a release-tag ref), with the certificate's GitHub
+   repository extension set to `FlayrLabs/skwod` and the issuer set to GitHub Actions. If the
+   workflow moves, change `IDENTITY_REGEXP` in that script in the same commit.
+5. **Repository settings this relies on.** `main` is protected. A tag ruleset lets only
+   maintainers create, move or delete `skwod-v*` tags. The `release` environment requires a
+   maintainer's approval. These live in the repository's settings, not in code; see
+   docs/GOING-PUBLIC.md, section 8, in the monorepo. The GHCR
+   package `skwod-server` must be **public**, or hosts cannot pull it. The repository variable
+   `SKWOD_DEFAULT_PUSH_GATEWAY` (not a secret) is baked in as the built-in push gateway; when it is
+   empty, the workflow warns and the image has none (docs/PUSH.md).
+6. **Residual trust.** You still trust GitHub Actions and Sigstore. A compromised workflow run on
+   a release tag produces a validly signed image. Reproducible image builds (the plan
+   above, step 5) are what would let a host check the digest against source.
 
 ### The published Mac build keeps its secrets in the login keychain (L7)
 

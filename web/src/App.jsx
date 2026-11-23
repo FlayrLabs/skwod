@@ -93,7 +93,7 @@ function HostWizard() {
                 Free. No account, no domain. Your server's key is its address, made automatically.
               </p>
               <div className="flex items-center gap-2 text-[12px] text-white/40 justify-center pt-1">
-                <Globe size={14} /> <span>Want it always on? Run it with <span className="font-mono text-white/60">docker</span> on a NAS like Unraid or Synology.</span>
+                <Globe size={14} /> <span>Want it always on? Run it with <span className="font-mono text-white/60">docker</span> on a NAS like <a href={`${SOURCE_URL}/blob/main/docs/UNRAID.md`} rel="noopener" className="hover:text-white transition">Unraid</a> or Synology.</span>
               </div>
             </div>
           )}

@@ -49,8 +49,11 @@ Found a vulnerability? Please report it privately — see [`SECURITY.md`](SECURI
 verified and which were not:
 
 - **A Mac** — the Mac app has a **Start server** button; server and LiveKit are bundled.
-- **Docker, Unraid, Synology** — one container. `docker build -t skwod-server .` at the repository
-  root, then [`deploy/docker-compose.yml`](deploy/docker-compose.yml).
+- **Unraid** — add the template and press Apply: [`docs/UNRAID.md`](docs/UNRAID.md) is a
+  step-by-step guide for people who have never used Docker.
+- **Docker, Synology** — one container: the published image `ghcr.io/flayrlabs/skwod-server`
+  (amd64 and arm64, signed) pinned by digest, or `docker build -t skwod-server .` at the
+  repository root, then [`deploy/docker-compose.yml`](deploy/docker-compose.yml).
 - **A VPS with your own domain** — `sudo ./deploy/vps-install.sh chat.example.com you@example.com`.
 - **A Windows or Linux PC** — the tray app in `host/`. Its packages have not been built or run on
   those systems yet.
@@ -130,7 +133,7 @@ apps/apple/      SwiftUI app (iOS + macOS) and the iOS notification service exte
 apps/android/    Kotlin / Jetpack Compose app
 push-gateway/    blind APNs gateway (Cloudflare Worker)
 web/             the skwod.io site: landing page and the /join invite page
-deploy/          Docker Compose files, VPS installer, Unraid template
+deploy/          Docker Compose files, VPS installer, Unraid template, image smoke test
 docs/            security model, architecture, decisions, p2p, push, self-hosting, the Apple apps
 ```
 

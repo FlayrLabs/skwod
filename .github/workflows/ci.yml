@@ -38,7 +38,17 @@ jobs:
     defaults:
       run:
         working-directory: ${{ matrix.dir }}
+    env:
+      # The core's live tests build the server too: two debug target dirs. Without debug info
+      # and incremental artifacts they fit on the runner's disk.
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_INCREMENTAL: '0'
     steps:
+      - name: Free the runner's disk (preinstalled SDKs these jobs never use)
+        working-directory: .
+        run: |
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL
+          df -h
       - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
         with:
           persist-credentials: false

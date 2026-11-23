@@ -12,7 +12,7 @@ key is its address ([P2P.md](P2P.md)).
 | Where | What you run | Voice + video | Status |
 |---|---|---|---|
 | [1. A Mac](#1-a-mac-the-app) | the Skwod Mac app | bundled | built and run (see [APPLE.md](APPLE.md) for what was and was not checked) |
-| [2. Docker, Unraid, Synology](#2-docker-unraid-synology) | one container | bundled | **verified** on Docker (linux/arm64) — details below |
+| [2. Docker, Unraid, Synology](#2-docker-unraid-synology) ([Unraid guide](UNRAID.md)) | one container | bundled | **verified** on Docker (linux/arm64) — details below |
 | [3. A Windows PC](#3-a-windows-pc) | the Skwod host tray app | bundled | **not yet built or run on Windows** — see the section |
 | [4. A Linux PC](#4-a-linux-pc) | the Skwod host tray app | bundled | **package not yet built; never run on Linux** — see the section |
 | [5. A VPS](#5-a-vps-always-on-your-own-domain) | Docker + Caddy, your domain | not checked on this path | not re-run for this guide |
@@ -93,8 +93,12 @@ then only friends who can reach your Mac directly can connect (docs/P2P.md, `pub
 For a box that is always on. One container holds the server and a pinned LiveKit (voice and
 video); there is nothing else to run and nothing else to expose.
 
-**Get the image.** It is not published under a public name yet, so build it (works with plain
-`docker build`, BuildKit not required):
+> **On Unraid?** Follow **[UNRAID.md](UNRAID.md)**, a step-by-step guide for people who have never
+> used Docker. The rest of this section is the short version.
+
+**Get the image.** Either use the published one, `ghcr.io/flayrlabs/skwod-server` (linux/amd64
+and linux/arm64, signed; see "Which image" below), or build it yourself. Building works with plain
+`docker build`, and BuildKit is not required:
 
 ```bash
 git clone https://github.com/FlayrLabs/skwod.git && cd skwod
@@ -117,10 +121,9 @@ docker compose logs skwod     # "One-time admin token: XXXXX-XXXXX-XXXXX-XXXXX"
 trusted as the server itself. Two safe choices:
 
 - **The image you built** (above). You are the publisher; nothing more to check.
-- **A published image, pinned by digest and verified.** Never run a tag such as `:main` or
-  `:latest`: a tag is a name the registry can point at different content tomorrow, and anyone
-  who can push to it would be running their code on your box. A digest
-  (`name@sha256:<64 hex>`) is the image's own hash; Docker refuses anything that does not match.
+- **A published image, pinned by digest and verified.** For compose, do not use a tag: a tag is
+  a name the registry can point at different content tomorrow. A digest (`name@sha256:<64 hex>`)
+  is the image's own hash, and Docker refuses anything that does not match it.
 
   ```bash
   IMAGE=ghcr.io/flayrlabs/skwod-server@sha256:<digest from the release notes>
@@ -128,12 +131,17 @@ trusted as the server itself. Two safe choices:
   SKWOD_IMAGE="$IMAGE" docker compose up -d
   ```
 
-  `verify-image.sh` runs `cosign verify` with the signer pinned to the source repository's
-  image workflow on a release tag (keyless Sigstore; the signature is in the public Rekor log).
-  **Status: no image is published under a public name yet, so there is no digest or signature
-  to check today — build it.** When images are published, each release's notes will carry the
-  digest; the publishing and signing procedure is in `RELEASE-SIGNING.md` → *The Docker image*.
-  To update, change the digest on purpose; nothing updates behind your back.
+  `verify-image.sh` runs `cosign verify` (cosign 3 or newer). It pins the signer to the source
+  repository's image workflow, run on a `skwod-v<n>` release tag (keyless
+  Sigstore; the signature is in the public Rekor log). Each release's notes carry the digest, and
+  so does the image workflow's run summary. The publishing and signing procedure is in
+  `RELEASE-SIGNING.md`, under *The Docker image*. To update, change the digest on purpose; nothing
+  updates behind your back.
+- **`:latest`, for Unraid's "check for updates".** The Unraid template uses
+  `ghcr.io/flayrlabs/skwod-server:latest`. The image workflow moves that tag only after the new
+  build has passed its smoke test on both architectures and its signature has been verified. You
+  still trust whoever can run that workflow, so if you want to decide each update yourself, pin a
+  digest in the template instead ([UNRAID.md](UNRAID.md#updating)).
 
 **The admin page is on this machine only.** The compose file publishes port 3477 on
 `127.0.0.1`, not on your LAN. The page is plain HTTP, and until the skwod has an owner it shows
@@ -149,12 +157,12 @@ Synology: enable SSH (Control Panel → Terminal & SNMP) for the setup and switc
 `SKWOD_ADMIN_BIND=0.0.0.0` puts the page back on the LAN; do that only on a network where you
 trust every device, and never on a VPS (Docker's published ports bypass `ufw`).
 
-**Unraid** — Docker tab → Add Container → Template → paste the URL of
-[`deploy/unraid/skwod.xml`](../deploy/unraid/skwod.xml) (or copy it to
-`/boot/config/plugins/dockerMan/templates-user/`), set **Repository** to your image by digest
-(the template ships a placeholder that pulls nothing until you do), Apply. The token is in the
-container's **Logs**. The template publishes the admin page on the Unraid box's `127.0.0.1`
-only; reach it with `ssh -L 3477:127.0.0.1:3477 root@<unraid>`.
+**Unraid**: see **[UNRAID.md](UNRAID.md)**. In short: download
+[`deploy/unraid/skwod.xml`](../deploy/unraid/skwod.xml) to
+`/boot/config/plugins/dockerMan/templates-user/my-skwod.xml`, then Docker tab → Add Container →
+Template **skwod** → Apply (or install it from Community Applications once it is listed). The token
+is in the container's **Logs**. The template publishes the admin page on the Unraid box's
+`127.0.0.1` only, so reach it with `ssh -L 3477:127.0.0.1:3477 root@<unraid>`.
 
 Then, on the box or through the SSH tunnel:
 
@@ -190,9 +198,21 @@ with a fresh volume.
 | Call | through the container's own LiveKit: a publisher on the Mac via the member's p2p voice tunnel, a second participant on the container's loopback. `lk room join --publish-demo` video arrived at the second participant. Then an Opus track published with LiveKit's GCM frame encryption (Go SDK): the SFU lists it as `encryption: GCM`; the receiver opened 680 frames with the call key, 0 with a wrong key, and the plaintext marker was never visible on the wire |
 | Upgrade | a volume written by a root-run server: the default non-root start refuses with the fix-it message; `skwod fix-ownership` (compose's init step) re-owns it and is a no-op the second time; the Unraid-style start (`--user 0:0`, caps `CHOWN,SETUID,SETGID`) re-owns it and then runs `skwod` **and** `livekit-server` as uid 1000 with `CapPrm/CapEff/CapInh/CapAmb = 0` and `NoNewPrivs: 1`; healthcheck `healthy` |
 
+**Mac → Docker move (2026-11-22, linux/arm64 VM).** A data folder made by the Mac app's bundled
+server (owner, member, server, channel, messages, an approval invite) was exported with
+`skwod backup`, restored with the root-run `docker run … skwod restore` from
+[UNRAID.md](UNRAID.md#moving-your-skwod-from-a-mac-to-unraid) and started with the Unraid
+template's flags. The result had the same instance identity and the same p2p node id. The old
+invite still checked valid, both accounts signed in again, the old ciphertext came back
+byte-identical, a new message went through, LiveKit ran with a freshly written loopback
+`livekit.yaml`, and everything ran as 99:100. The test found, and this build fixes, a
+`fix-ownership` bug: it re-owned a 0700 directory before its contents, which locked the walk
+(root with only `CAP_CHOWN`) out of `blobs/`. Not checked here: decryption by the real apps
+after the move. The server stores the same bytes, and the apps keep their own keys.
+
 Not verified: an **amd64** build (the Dockerfile has no architecture-specific step other than the
 LiveKit download, whose amd64 archive and checksum were fetched and verified, but the image was
-only built for arm64); a real Unraid or Synology box (the template's flags were run with plain
+only built for arm64; the image workflow builds and smoke-tests amd64 on its first run); a real Unraid or Synology box (the template's flags were run with plain
 `docker run`); a **direct** p2p path to a container (published UDP port / router forward); the
 call test with the Skwod apps as clients (the encrypted-call check used LiveKit's SDK with a
 shared test key, not the apps' libsignal-distributed keys).
@@ -401,7 +421,7 @@ docker exec -e SKWOD_BACKUP_PASSPHRASE='…' skwod skwod restore --in /backup/sk
 # Restore onto a new box: with the container STOPPED, into an EMPTY appdata folder
 docker run --rm -e SKWOD_BACKUP_PASSPHRASE='…' \
   -v /mnt/user/appdata/skwod:/data -v /mnt/user/backups/skwod:/backup \
-  skwod-server skwod restore --in /backup/skwod-2026-11-19.skwodbackup --data /data/restored
+  ghcr.io/flayrlabs/skwod-server:latest skwod restore --in /backup/skwod-2026-11-19.skwodbackup --data /data/restored
 # …then move the contents of /mnt/user/appdata/skwod/restored up one level and start the container.
 ```
 

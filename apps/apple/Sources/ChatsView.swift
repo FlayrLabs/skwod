@@ -256,7 +256,17 @@ struct SpaceChannelView: View {
                 blocking = ReportTarget(userId: id, name: msg.author, serverId: space.serverId)
             },
             onRetry: { Outbox.retry(app, localId: $0) },
-            onDiscard: { Outbox.discard(app, localId: $0) }))
+            onDiscard: { Outbox.discard(app, localId: $0) },
+            me: app.session?.userId,
+            mentionLabel: { authorLabel($0) },
+            // @everyone counts from the server's PINNED owner and its admins (`EveryoneRule`).
+            everyoneAllowed: { sender in chat.everyoneHonoured(sender, in: space.serverId) },
+            mentionable: memberNames.filter { $0.key != app.session?.userId && !BlockList.shared.contains($0.key) }
+                .map { (userId: $0.key, name: authorLabel($0.key), username: $0.value) }
+                .sorted { $0.name.lowercased() < $1.name.lowercased() }
+                + (chat.everyoneHonoured(app.session?.userId, in: space.serverId)
+                   ? [(userId: MentionComposer.everyoneId, name: "everyone", username: "")] : []),
+            typingFrom: Set(memberNames.keys)))
         .safetyActions(blocking: $blocking, reporting: $reporting)
         .onReceive(NotificationCenter.default.publisher(for: .skwodServerChanged)) { note in
             if note.object as? String == space.serverId { Task { await syncMembers() } }
@@ -324,6 +334,7 @@ struct SpaceChannelView: View {
             },
             composingBanner: composingBanner,
             onCancelCompose: { if editing != nil { draft = "" }; replyingTo = nil; editing = nil },
+            conversationId: space.channelId,
             headerActions: {
                 AnyView(
                     HStack(spacing: 16) {
@@ -502,7 +513,7 @@ struct SpaceChannelView: View {
                                createdAt: m.createdAt, attachment: parsed.attachment, music: parsed.music,
                                replyToId: m.replyToId, replyPreview: replyPreview,
                                isEdited: m.isEdited, isDeleted: m.isDeleted,
-                               sendState: mine ? sendStates[m.messageId] : nil)
+                               sendState: mine ? sendStates[m.messageId] : nil, mentions: ChatTags.mentions(content))
         }
     }
 

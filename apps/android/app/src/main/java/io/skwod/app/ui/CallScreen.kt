@@ -92,6 +92,7 @@ fun VoiceCallScreen(serverId: String, onClose: () -> Unit) {
         roomState.value?.let { r -> r.disconnect(); r.release() }
         roomState.value = null
         CallState.active.value = false
+        CallState.speaking.value = "" to emptySet()
         CallDebug.phase = "idle"; CallDebug.cameraOn = false; CallDebug.remoteParticipants = 0
         CallService.stop(ctx)
     }
@@ -234,7 +235,7 @@ fun VoiceCallScreen(serverId: String, onClose: () -> Unit) {
                 }
                 "connected" -> roomState.value?.let { room ->
                     // Synchronous teardown (see onDispose note) + null out so dispose can't double-release.
-                    ConnectedCall(room, channelId, onLeave = { teardown(); onClose() })
+                    ConnectedCall(room, channelId, serverId, onLeave = { teardown(); onClose() })
                 }
             }
         }
@@ -243,7 +244,7 @@ fun VoiceCallScreen(serverId: String, onClose: () -> Unit) {
 
 /** The connected call: participant tiles (video when published), then the controls. */
 @Composable
-private fun ColumnScope.ConnectedCall(room: Room, channelId: String?, onLeave: () -> Unit) {
+private fun ColumnScope.ConnectedCall(room: Room, channelId: String?, serverId: String, onLeave: () -> Unit) {
     val ctx = LocalContext.current
     val model = AppModel.get(ctx)
     val scope = rememberCoroutineScope()
@@ -260,6 +261,9 @@ private fun ColumnScope.ConnectedCall(room: Room, channelId: String?, onLeave: (
                 is RoomEvent.TrackSubscribed, is RoomEvent.TrackUnsubscribed, is RoomEvent.TrackMuted,
                 is RoomEvent.TrackUnmuted, is RoomEvent.TrackPublished, is RoomEvent.TrackUnpublished,
                 is RoomEvent.ParticipantConnected, is RoomEvent.ParticipantDisconnected -> revision++
+                // Who is speaking: the green ring in the sidebar's voice list.
+                is RoomEvent.ActiveSpeakersChanged ->
+                    CallState.speaking.value = serverId to e.speakers.mapNotNull { it.identity?.value }.toSet()
                 else -> {}
             }
         }

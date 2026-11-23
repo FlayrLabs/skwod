@@ -31,3 +31,9 @@ regexes = [
 [[allowlists]]
 description = "libcrux crate names after libcrux-secrets in Cargo.lock"
 regexes = ['''^libcrux-[a-z0-9-]+$''']
+
+# Not secrets: the app-group key name for mention badges, and the test fixture host key (the
+# z-base-32 alphabet written out) in the build-46 logic tests.
+[[allowlists]]
+description = "mention badge storage key name and the z-base-32 test fixture (not secrets)"
+regexes = ['''^mention-badges\.v2$''', '''^ybndrfg8ejkmcpqxot1uwisza345h769ybndrfg8ejkmcpqxot1u$''']

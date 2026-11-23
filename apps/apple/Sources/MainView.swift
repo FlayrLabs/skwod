@@ -68,6 +68,7 @@ struct MainView: View {
         .overlay(alignment: .top) {
             VStack(spacing: 6) {
                 UpdateBanner()
+                HostNewerBanner()
                 JoinStatusBanner(chat: chat)
             }
         }
@@ -99,6 +100,7 @@ struct MainView: View {
             .overlay(alignment: .top) {
                 VStack(spacing: 6) {
                     UpdateBanner()
+                    HostNewerBanner()
                     ConnectionBanner()
                     JoinStatusBanner(chat: chat)
                 }
@@ -956,6 +958,7 @@ private struct DrawerList: View {
                                 ChannelCard(name: s.channelName, selected: chat.highlightedChannelId == s.channelId)
                             }.buttonStyle(.plain)
                             .overlay(alignment: .trailing) { MutedMark(key: "channel:\(s.channelId)") }
+                            .overlay(alignment: .topTrailing) { TopicMentionBadge(topic: "channel:\(s.channelId)").padding(4) }
                             .contextMenu {
                                 MuteMenuItems(key: "channel:\(s.channelId)")
                                 Button { showInvite = true } label: { Label("Invite people", systemImage: "person.badge.plus") }
@@ -963,6 +966,10 @@ private struct DrawerList: View {
                                     Label("Remove from list", systemImage: "eye.slash")
                                 }
                             }
+                        }
+                        // The server's voice room, and who is in it (build 47).
+                        if query.trimmingCharacters(in: .whitespaces).isEmpty {
+                            MobileVoiceSection(serverId: group.serverId)
                         }
                     } else {
                         // Skwod overview: the list of servers. Tapping one opens its channels.
@@ -973,7 +980,8 @@ private struct DrawerList: View {
                         .padding(.horizontal, 12).padding(.top, 4).padding(.bottom, 6)
                         ForEach(chat.serverGroups) { g in
                             Button { chat.openServer(g) } label: {
-                                ServerCard(name: g.name, channels: g.channels.count)
+                                ServerCard(name: g.name, channels: g.channels.count,
+                                           inVoice: app.voiceRoster.count(serverId: g.serverId, hidden: BlockList.shared.ids))
                             }.buttonStyle(.plain)
                         }
                     }
@@ -1018,11 +1026,82 @@ private struct ChannelCard: View {
     }
 }
 
+/// Mobile: the server's voice room as a card like the channels', with who is in it beneath
+/// (folded away, the count stays on the card). Tapping the card joins the call.
+private struct MobileVoiceSection: View {
+    @EnvironmentObject private var app: AppState
+    let serverId: String
+    @State private var folded = false
+    @State private var checking = false
+    @State private var note: String?
+
+    var body: some View {
+        let inVoice = app.voiceRoster.participants(serverId: serverId, hidden: BlockList.shared.ids)
+        VStack(alignment: .leading, spacing: 0) {
+            Text("Voice").font(.subheadline).foregroundStyle(.white.opacity(0.55))
+                .padding(.horizontal, 12).padding(.top, 14).padding(.bottom, 6)
+            HStack(spacing: 0) {
+                Button { Task { await join() } } label: {
+                    HStack(spacing: 12) {
+                        Image(systemName: "speaker.wave.2.fill").font(.system(size: 15, weight: .medium))
+                            .foregroundStyle(.white.opacity(inVoice.isEmpty ? 0.5 : 0.9))
+                        Text("General").font(.system(size: 16)).foregroundStyle(.white.opacity(0.8)).lineLimit(1)
+                        Spacer()
+                        if checking { ProgressView().controlSize(.small) }
+                    }
+                    .padding(.leading, 14).padding(.trailing, inVoice.isEmpty ? 14 : 4).padding(.vertical, 13)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                if !inVoice.isEmpty {
+                    // Beside the join button, not inside it: folding never starts a call.
+                    Button { folded.toggle() } label: {
+                        HStack(spacing: 4) {
+                            if folded {
+                                Image(systemName: "person.2.fill").font(.system(size: 11))
+                                Text("\(inVoice.count)").font(.system(size: 13, weight: .semibold)).monospacedDigit()
+                            }
+                            Image(systemName: folded ? "chevron.right" : "chevron.down").font(.system(size: 11, weight: .bold))
+                        }
+                        .foregroundStyle(.white.opacity(0.55)).padding(.horizontal, 12).padding(.vertical, 13).contentShape(Rectangle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel(VoiceRoster.countLabel(inVoice.count) ?? "")
+                }
+            }
+            .background(RoundedRectangle(cornerRadius: 12, style: .continuous).fill(Color.white.opacity(0.045)))
+            .padding(.horizontal, 4).padding(.vertical, 2)
+            if !folded {
+                ForEach(inVoice) { p in
+                    VoiceParticipantRow(participant: p, serverId: serverId).padding(.vertical, 2)
+                }
+            }
+        }
+        .alert("Voice & video", isPresented: Binding(get: { note != nil }, set: { if !$0 { note = nil } })) {
+            Button("OK", role: .cancel) { note = nil }
+        } message: { Text(note ?? "") }
+    }
+
+    /// The same route as the Mac sidebar's voice row: set up → the call; otherwise a note.
+    private func join() async {
+        guard let client = app.client, !checking else { return }
+        checking = true
+        defer { checking = false }
+        if (try? await client.voiceConfig())?.configured == true {
+            app.activeCall = CallTarget(serverId: serverId)
+        } else {
+            note = "Voice & video isn't set up on this Skwod yet. Ask the host to turn it on."
+        }
+    }
+}
+
 /// A server row in the mobile skwod overview: monogram + name + channel count. Tapping it opens the
 /// server's channels.
 private struct ServerCard: View {
     let name: String
     let channels: Int
+    /// People in the server's voice room right now.
+    var inVoice: Int = 0
 
     var body: some View {
         HStack(spacing: 12) {
@@ -1034,6 +1113,14 @@ private struct ServerCard: View {
                 Text("\(channels) channel\(channels == 1 ? "" : "s")").font(.caption).foregroundStyle(.white.opacity(0.5))
             }
             Spacer()
+            if inVoice > 0 {
+                HStack(spacing: 3) {
+                    Image(systemName: "speaker.wave.2.fill").font(.system(size: 11))
+                    Text("\(inVoice)").font(.system(size: 13, weight: .semibold)).monospacedDigit()
+                }
+                .foregroundStyle(Color.green.opacity(0.85))
+                .accessibilityLabel(VoiceRoster.countLabel(inVoice) ?? "")
+            }
             Image(systemName: "chevron.right").font(.system(size: 13, weight: .semibold)).foregroundStyle(.white.opacity(0.35))
         }
         .padding(.horizontal, 14).padding(.vertical, 11)

@@ -117,6 +117,10 @@ extension AppState {
                 // (`invite_full`: an invite has as many people waiting as it may — the same
                 // screen shows it, on the invite, with what to do.)
                 joinRequested(serverId: serverId)
+            case "server_deleted", "revoke":
+                // A server was deleted, or this account was removed from it. Nothing in the
+                // event is trusted beyond "look again": the server list decides what goes.
+                Task { await chatModel?.refreshServerList() }
             case "join_approved":
                 Task { await chatModel?.joinDecided(serverId: serverId, approved: true) }
             case "join_denied":
@@ -144,6 +148,10 @@ extension AppState {
                 // one that erased itself, and what a re-keyed device held of ours is rotated.
                 let who = payload["user_id"] as? String ?? ""
                 if who == me { Task { await accountChanged() } } else if !who.isEmpty { Task { await contactDeviceRemoved(userId: who) } }
+            case "voice_state":
+                // Who is in this server's voice room: the whole roster of one room.
+                var next = voiceRoster
+                if next.apply(topic: topic, payload: payload) { voiceRoster = next }
             case "member_joined", "member_approved", "member_removed", "channels_changed":
                 NotificationCenter.default.post(name: .skwodServerChanged, object: serverId)
                 Task {
@@ -162,6 +170,8 @@ extension AppState {
     /// was none produced no event here, so catch up once and let open screens do the same.
     func realtimeConnected() {
         NotificationCenter.default.post(name: .skwodLiveConnected, object: nil)
+        // The rosters come again with the subscriptions; nothing from before the gap is kept.
+        voiceRoster.reset()
         Task {
             // Blocks first (a block made on another device hides its subject here before
             // anything is drawn), then whatever was queued while there was no connection.
@@ -292,8 +302,16 @@ extension AppState {
     /// claimed in the announced ledger) does here: `MessageAlert` — nothing for the chat on
     /// screen or under Do Not Disturb, the app's own sound with a silent banner in front,
     /// a banner with sound otherwise.
-    func incomingAlert(topic: String) -> MessageAlert.Outcome {
-        let muted = MuteCenter.shared.isMuted(workspaceId: bound?.workspaceId ?? current?.id ?? "", scope: topic)
+    func incomingAlert(topic: String, mentionsMe: Bool = false) -> MessageAlert.Outcome {
+        let wid = bound?.workspaceId ?? current?.id ?? ""
+        // A mention of me always alerts — through a muted conversation or server — unless the
+        // whole skwod is muted (`MentionAlertRule`; a blocked sender never gets this far).
+        let muted = !MentionAlertRule.alerts(
+            mentionsMe: mentionsMe,
+            conversationMuted: MuteCenter.shared.isMuted(workspaceId: wid, scope: topic),
+            serverMuted: false,
+            skwodMuted: MuteCenter.shared.holds(workspaceId: wid, key: MuteList.skwod),
+            senderBlocked: false)
         let outcome = MessageAlert.received(.init(
             muted: muted,
             doNotDisturb: myStatus == "dnd",
@@ -303,7 +321,7 @@ extension AppState {
             lastSoundAt: SoundPlayer.lastReceivedAt,
             now: Date().timeIntervalSince1970))
         #if DEBUG
-        E2E.sawAlert(topic: topic, muted: muted, outcome: outcome)
+        E2E.sawAlert(topic: topic, muted: muted, outcome: outcome, mention: mentionsMe)
         #endif
         return outcome
     }
@@ -348,8 +366,28 @@ extension AppState {
                 let unannounced = fresh.filter { claimed.contains($0.messageId) }
                 guard let newest = unannounced.last else { continue }
                 let topic = "channel:\(channelId)"
-                let alert = incomingAlert(topic: topic)
+                // Mentions of me (inside the decrypted text), @everyone from the pinned owner or
+                // an admin (`EveryoneRule`), and replies to my messages.
+                let mine = Set(rows.filter { $0.authorId == me || $0.authorId == "__me__" }.map(\.messageId))
+                let mentioning = unannounced.filter { m in
+                    MentionRule.mentionsMe(ChatTags.mentions(m.content ?? ""), me: me,
+                                           senderMayMentionEveryone: serverId.map { chatModel?.everyoneHonoured(m.authorId, in: $0) ?? false } ?? false,
+                                           replyToMine: MentionNotice.replyToMine(m.replyToId, mine: mine))
+                }
+                if !mentioning.isEmpty, !realtime.isOnScreen(topic) {
+                    MentionBadges.add(ids: mentioning.map(\.messageId), topic: topic, workspaceId: asked.workspaceId)
+                }
+                let alert = incomingAlert(topic: topic, mentionsMe: !mentioning.isEmpty)
                 if !alert.banner { continue }
+                if let mention = mentioning.last {
+                    let place = realtime.chatNames[channelId].map { "#\($0)" } ?? "a channel"
+                    let who = contacts.authorLabel(mention.authorId, claimedName: nil)
+                    realtime.notify(title: MentionAlertRule.title(sender: who, place: place, previews: NotificationState.showPreviews),
+                                    body: LiveSync.preview(MentionCodec.visible(mention.content ?? "")), privacy: .personal,
+                                    thread: topic, id: "mention-\(channelId)", sound: true,
+                                    target: NotificationTarget(workspaceId: asked.workspaceId, scope: topic))
+                    continue
+                }
                 // A post in a server's feed is announced as that, and not at all while the feed
                 // is what the user is looking at.
                 let feedOf = chatModel?.feedChannels.first(where: { $0.value == channelId })?.key
@@ -358,7 +396,7 @@ extension AppState {
                 let feedTitle = feedOf.flatMap { id in chatModel?.spaces.first(where: { $0.serverId == id })?.name }.map { "\($0) · Feed" }
                 let title = realtime.chatNames[channelId].map { "#\($0)" } ?? feedTitle ?? "Skwod"
                 let body = unannounced.count > 1 && NotificationState.showPreviews
-                    ? "\(unannounced.count) new messages" : LiveSync.preview(newest.content ?? "")
+                    ? "\(unannounced.count) new messages" : LiveSync.preview(MentionCodec.visible(newest.content ?? ""))
                 // One notification per channel: a later one replaces it rather than stacking.
                 realtime.notify(title: title, body: body, privacy: .personal, thread: topic, id: "msg-\(channelId)",
                                 sound: alert.bannerSound, target: NotificationTarget(workspaceId: asked.workspaceId, scope: topic))

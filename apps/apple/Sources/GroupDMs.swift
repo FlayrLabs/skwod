@@ -500,6 +500,7 @@ struct GroupChatView: View {
             onDelete: { msg in Task { await deleteMessage(msg) } },
             composingBanner: composingBanner,
             onCancelCompose: { if editing != nil { draft = "" }; replyingTo = nil; editing = nil },
+            conversationId: group.conversationId,
             headerActions: {
                 AnyView(
                     Button { showPeople = true } label: {
@@ -524,7 +525,13 @@ struct GroupChatView: View {
                 blocking = ReportTarget(userId: id, name: msg.author)
             },
             onRetry: { Outbox.retry(app, localId: $0) },
-            onDiscard: { Outbox.discard(app, localId: $0) }))
+            onDiscard: { Outbox.discard(app, localId: $0) },
+            me: app.session?.userId,
+            mentionLabel: { name($0) },
+            everyoneAllowed: { _ in false },
+            mentionable: group.memberUserIds.filter { !BlockList.shared.contains($0) }
+                .map { (userId: $0, name: name($0), username: group.claimedNames[$0] ?? "") },
+            typingFrom: Set(group.memberUserIds)))
         .task(id: group.conversationId) { await load() }
         .onReceive(NotificationCenter.default.publisher(for: .skwodOutboxChanged)) { _ in Task { await reloadFromCache() } }
         .onReceive(NotificationCenter.default.publisher(for: .skwodDMChanged)) { note in
@@ -603,7 +610,7 @@ struct GroupChatView: View {
                                createdAt: m.createdAt, attachment: parsed.attachment, music: parsed.music,
                                replyToId: m.replyToId, replyPreview: replyPreview,
                                isEdited: m.isEdited, isDeleted: m.isDeleted,
-                               sendState: isMine ? sendStates[m.messageId] : nil)
+                               sendState: isMine ? sendStates[m.messageId] : nil, mentions: ChatTags.mentions(m.content ?? ""))
         }
     }
 

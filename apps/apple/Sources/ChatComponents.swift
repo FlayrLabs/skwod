@@ -49,8 +49,22 @@ struct ChatSurface: View {
     /// A reply/edit banner shown above the composer, with a way to cancel it.
     var composingBanner: (text: String, isEdit: Bool)? = nil
     var onCancelCompose: (() -> Void)? = nil
+    /// The conversation's stable id (channel id, DM or group conversation id). What is staged
+    /// in the composer belongs to it, and only to it.
+    var conversationId: String = ""
     /// Optional trailing header actions (e.g. invite, verify).
     @ViewBuilder var headerActions: () -> AnyView
+    /// Pasted / dropped files and images waiting to go with the next send.
+    @State private var staged: [StagedAttachment] = []
+    @State private var dropTargeted = false
+    @State private var intakeError: String?
+    /// The conversation on screen right now (read by paste / drop results that finish later).
+    @State private var activeConversation = ""
+    @Environment(\.typingCenter) private var typing
+    @Environment(\.messageExtras) private var surfaceExtras
+    /// Who the draft mentions so far (ranges into the draft).
+    @State private var mentionPayload = MentionPayload()
+    @State private var mentionHighlight = 0
 
     var body: some View {
         VStack(spacing: 0) {
@@ -58,15 +72,117 @@ struct ChatSurface: View {
             Divider().overlay(.white.opacity(0.08))
             messageList
             if let notice { notice }
+            if !mentionMatches.isEmpty {
+                MentionSuggestions(matches: mentionMatches, highlighted: min(mentionHighlight, mentionMatches.count - 1),
+                                   onPick: pickMention)
+            }
+            if let typing { TypingIndicatorBar(center: typing) }
             if let banner = composingBanner {
                 ComposeBanner(text: banner.text, isEdit: banner.isEdit, onCancel: { onCancelCompose?() })
             }
-            ChatComposer(draft: $draft, sending: sending, sendError: sendError,
-                         placeholder: placeholder, onSend: onSend,
+            ChatComposer(draft: $draft, sending: sending, sendError: intakeError ?? sendError,
+                         placeholder: placeholder, onSend: sendWithMentions,
                          uploading: uploading, onSendFile: onSendFile, onSendMusic: onSendMusic,
-                         onSendImage: onSendImage)
+                         onSendImage: onSendImage, staged: $staged,
+                         mentionKey: mentionKey,
+                         onIntake: { [conversationId] in take($0, startedFor: conversationId) })
         }
         .background(ChatBackground())
+        // What waits in the composer belongs to THIS conversation: switching conversation
+        // (the same surface, new content) never carries it along.
+        .onAppear { activeConversation = conversationId }
+        .onChange(of: conversationId) { _, now in
+            staged = []; intakeError = nil
+            activeConversation = now
+            typing?.stoppedTyping()
+            mentionPayload = MentionPayload()
+        }
+        // "Typing…" goes out while the user types here (throttled; nothing for an empty draft).
+        .onChange(of: draft) { _, now in
+            typing?.draftChanged(now)
+            // Edited around a mention: keep only the ones still exactly in the text.
+            let names = Dictionary(surfaceExtras.mentionable.map { ($0.userId, MentionAutocomplete.tokenSource(name: $0.name, username: $0.username)) }, uniquingKeysWith: { a, _ in a })
+            mentionPayload = MentionAutocomplete.reconcile(mentionPayload, draft: now, names: names)
+            mentionHighlight = 0
+        }
+        .onDisappear { typing?.stoppedTyping() }
+        // Only this conversation's people show as typing in it.
+        .onChange(of: TypingAudience(conversationId: conversationId, members: surfaceExtras.typingFrom), initial: true) { _, audience in
+            typing?.setAudience(audience)
+        }
+        // Drop files or images (a Finder drag, the screenshot thumbnail, a picture from another
+        // app, iPad drag and drop) anywhere on the chat: they wait in the composer like "Attach".
+        .onDrop(of: ComposerIntake.dropTypes, isTargeted: $dropTargeted) { providers in
+            guard acceptsAttachments else { return false }
+            // Tagged with the conversation it was dropped on: a load that finishes after a
+            // switch is discarded, never staged in the next conversation.
+            let startedFor = conversationId
+            return ComposerIntake.load(providers) { take([$0], startedFor: startedFor) }
+        }
+        .overlay {
+            if dropTargeted && acceptsAttachments {
+                RoundedRectangle(cornerRadius: 14, style: .continuous)
+                    .strokeBorder(Color.skAccent, style: StrokeStyle(lineWidth: 2, dash: [8, 6]))
+                    .background(Color.skAccent.opacity(0.06))
+                    .overlay(Label("Drop to attach", systemImage: "paperclip").font(.headline).foregroundStyle(.white))
+                    .padding(8)
+                    .allowsHitTesting(false)
+            }
+        }
+    }
+
+    private var acceptsAttachments: Bool { onSendFile != nil || onSendImage != nil }
+
+    /// Members matching the "@…" being typed (nothing when not in one, or none to mention).
+    private var mentionMatches: [MentionCandidate] {
+        guard !surfaceExtras.mentionable.isEmpty, let q = MentionAutocomplete.activeQuery(in: draft) else { return [] }
+        return MentionAutocomplete.matches(q.query, in: surfaceExtras.mentionable)
+    }
+
+    private func pickMention(_ m: MentionCandidate) {
+        guard let q = MentionAutocomplete.activeQuery(in: draft) else { return }
+        draft = MentionComposer.pick(m, draft: draft, at: q.at, payload: &mentionPayload)
+        mentionHighlight = 0
+    }
+
+    /// Arrow keys / Return / Tab while the popup is up (Mac). True = handled.
+    private func mentionKey(_ key: KeyEquivalent) -> Bool {
+        let matches = mentionMatches
+        guard !matches.isEmpty else { return false }
+        switch key {
+        case .upArrow: mentionHighlight = max(0, mentionHighlight - 1)
+        case .downArrow: mentionHighlight = min(matches.count - 1, mentionHighlight + 1)
+        case .return, .tab: pickMention(matches[min(mentionHighlight, matches.count - 1)])
+        default: return false
+        }
+        return true
+    }
+
+    /// The text goes out with who it mentions inside it (`MentionCodec`; end to end).
+    private func sendWithMentions() {
+        typing?.stoppedTyping()
+        let names = Dictionary(surfaceExtras.mentionable.map { ($0.userId, MentionAutocomplete.tokenSource(name: $0.name, username: $0.username)) }, uniquingKeysWith: { a, _ in a })
+        let payload = MentionAutocomplete.reconcile(mentionPayload, draft: draft, names: names)
+        if !payload.isEmpty { draft = MentionCodec.encode(draft, payload) }
+        mentionPayload = MentionPayload()
+        onSend()
+    }
+
+    /// Add what came in to the waiting list, or say why it couldn't be.
+    private func take(_ results: [Result<StagedAttachment, ComposerIntake.Problem>], startedFor: String) {
+        guard acceptsAttachments, StagingRule.belongs(startedFor: startedFor, current: activeConversation) else { return }
+        intakeError = nil
+        for r in results {
+            switch r {
+            case .success(let item):
+                if staged.count < ComposerIntake.maxStaged { staged.append(item) }
+                #if DEBUG
+                E2E.stagedCount = staged.count
+                #endif
+            case .failure(let p):
+                intakeError = ComposerIntake.sentence(p)
+            }
+        }
     }
 
     private var messageList: some View {
@@ -200,15 +316,47 @@ private struct MessageRow: View {
     var onDelete: ((ChatMessage) -> Void)? = nil
     var onForward: ((ChatMessage) -> Void)? = nil
     @Environment(\.messageExtras) private var extras
-    @State private var hovering = false
+    /// The full text in a sheet where any part of it can be selected ("Select Text…").
+    @State private var selecting = false
+    /// A mention in this message was tapped: that person's card.
+    @State private var profileFor: String?
+    @Environment(\.openURL) private var confirmedOpenURL
+    #if os(macOS)
+    /// A long press on the Mac opens the same actions as a right-click.
+    @State private var longPressMenu = false
+    #endif
 
     var body: some View {
+        // Hover lives in `HoverRow`, so moving the pointer over a row re-renders only its
+        // highlight — not the row (markdown, images, the menu) as it used to on every hover.
+        HoverRow(hoverTime: grouped ? shortTime : nil) { row }
+            // A message that mentions me stands out.
+            .background(mentionsMe ? Color.skAccent.opacity(0.10) : .clear)
+            .overlay(alignment: .leading) {
+                if mentionsMe { Rectangle().fill(Color.skAccent).frame(width: 2) }
+            }
+            .popover(isPresented: Binding(get: { profileFor != nil }, set: { if !$0 { profileFor = nil } })) {
+                if let uid = profileFor {
+                    MentionProfileCard(userId: uid, label: extras.mentionLabel?(uid) ?? "Unknown contact")
+                }
+            }
+            .contextMenu { if !message.isDeleted { menuItems } }
+            #if os(macOS)
+            .onLongPressGesture(minimumDuration: 0.5) { if !message.isDeleted { longPressMenu = true } }
+            .popover(isPresented: $longPressMenu, arrowEdge: .top) {
+                MessageActionsPopover { menuItems }
+            }
+            #endif
+            .sheet(isPresented: $selecting) {
+                DismissableSheet { SelectableTextSheet(text: message.body) }
+            }
+    }
+
+    private var row: some View {
         HStack(alignment: .top, spacing: 12) {
             if grouped {
-                // Reserve the avatar gutter; show the time there on hover.
-                Text(hovering ? shortTime : "")
-                    .font(.system(size: 10, design: .monospaced)).foregroundStyle(.white.opacity(0.35))
-                    .frame(width: 40, alignment: .trailing)
+                // Reserve the avatar gutter (the time shows there on hover: `HoverRow`).
+                Color.clear.frame(width: 40, height: 1)
             } else {
                 AvatarImage(key: message.authorId.map(AvatarStore.userKey), name: message.author, size: 40)
             }
@@ -257,9 +405,6 @@ private struct MessageRow: View {
         .padding(.horizontal, 16)
         .padding(.top, grouped ? 1 : 10)
         .padding(.bottom, 1)
-        .background(hovering ? Color.white.opacity(0.04) : .clear)
-        .onHover { hovering = $0 }
-        .contextMenu { if !message.isDeleted { menuItems } }
     }
 
     /// Long-press / right-click actions. React row first, then copy/reply/forward, then
@@ -274,6 +419,7 @@ private struct MessageRow: View {
         }
         if !message.body.isEmpty {
             Button { Clipboard.copy(message.body) } label: { Label("Copy Text", systemImage: "doc.on.doc") }
+            Button { selecting = true } label: { Label("Select Text…", systemImage: "selection.pin.in.out") }
         }
         if onReply != nil {
             Button { onReply?(message) } label: { Label("Reply", systemImage: "arrowshape.turn.up.left") }
@@ -315,20 +461,42 @@ private struct MessageRow: View {
                 AttachmentView(attachment: attachment)
             }
             if !message.body.isEmpty {
-                Text(LinkSafety.attributed(message.body)).font(.system(size: 15)).foregroundStyle(.white.opacity(0.92))
+                Text(MessageText.attributed(message.body)).font(.system(size: 15)).foregroundStyle(.white.opacity(0.92))
                     .tint(.skAccent)
-                    .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         } else if let track = message.music {
             MusicCard(track: track).frame(maxWidth: 380)
         } else if isEmojiOnly(message.body) {
-            Text(message.body).font(.system(size: 44)).textSelection(.enabled)
+            Text(message.body).font(.system(size: 44))
                 .fixedSize(horizontal: false, vertical: true)
         } else {
-            Text(LinkSafety.attributed(message.body)).font(.system(size: 15)).foregroundStyle(.white.opacity(0.92))
+            // No per-row `.textSelection`: on the Mac every selectable row is a text view of its
+            // own whose click-tracking hit-tests the whole text on the main thread (the build-44
+            // hang: 1.4 s in NSTextSelectionNavigation), and on iOS it takes the long press the
+            // message menu needs. "Copy Text" and "Select Text…" are in that menu instead.
+            Text(renderedBody).font(.system(size: 15)).foregroundStyle(.white.opacity(0.92))
                 .tint(.skAccent)
-                .textSelection(.enabled).fixedSize(horizontal: false, vertical: true)
+                .fixedSize(horizontal: false, vertical: true)
+                .environment(\.openURL, OpenURLAction { url in
+                    if let uid = MentionRender.userId(from: url) { profileFor = uid; return .handled }
+                    confirmedOpenURL(url)   // every other link still goes through its confirmation
+                    return .handled
+                })
         }
+    }
+
+    private var mentionsMe: Bool {
+        !message.mine && MentionRule.mentionsMe(message.mentions, me: extras.me ?? "",
+                                                senderMayMentionEveryone: extras.everyoneAllowed?(message.authorId) ?? false,
+                                                replyToMine: false)
+    }
+
+    private var renderedBody: AttributedString {
+        let base = MessageText.attributed(message.body)
+        guard !message.mentions.isEmpty, let label = extras.mentionLabel else { return base }
+        return MentionRender.apply(base, visible: message.body, payload: message.mentions, label: label,
+                                   everyoneAllowed: extras.everyoneAllowed?(message.authorId) ?? false)
     }
 
     /// True for a short message that is only emoji (+ whitespace) — rendered oversized.
@@ -401,6 +569,14 @@ private struct ChatComposer: View {
     var onSendFile: ((URL) -> Void)? = nil
     var onSendMusic: ((MusicTrack) -> Void)? = nil
     var onSendImage: ((Data) -> Void)? = nil
+    @Binding var staged: [StagedAttachment]
+    var mentionKey: (KeyEquivalent) -> Bool = { _ in false }
+    var onIntake: ([Result<StagedAttachment, ComposerIntake.Problem>]) -> Void = { _ in }
+    @State private var showEmoji = false
+    @FocusState private var fieldFocused: Bool
+    #if os(macOS)
+    @State private var pasteMonitor = ComposerPasteMonitor()
+    #endif
     @State private var showFilePicker = false
     @State private var showMusicPicker = false
     @State private var showCamera = false
@@ -422,6 +598,7 @@ private struct ChatComposer: View {
                 }
                 .frame(maxWidth: .infinity, alignment: .leading).padding(.horizontal, 4)
             }
+            StagedAttachmentsTray(staged: $staged)
             #if os(iOS)
             // Mobile: the + sits OUTSIDE the field in its own circle; the field is a capsule.
             HStack(spacing: 10) {
@@ -442,11 +619,17 @@ private struct ChatComposer: View {
             HStack(spacing: 10) {
                 attachButton
                 field
-                Button { NSApp.orderFrontCharacterPalette(nil) } label: {
+                // The picker is anchored to THIS button (the system character palette opened at
+                // the text caret, i.e. the left of the bar).
+                Button { showEmoji.toggle() } label: {
                     Image(systemName: "face.smiling")
                         .font(.system(size: 20)).foregroundStyle(.white.opacity(0.45))
                 }
                 .buttonStyle(.plain).help("Emoji")
+                .accessibilityIdentifier("composer.emoji")
+                .popover(isPresented: $showEmoji, arrowEdge: .top) {
+                    EmojiPickerPopover { e in draft += e }
+                }
                 sendButton
             }
             .padding(.horizontal, 14).padding(.vertical, 10)
@@ -455,6 +638,14 @@ private struct ChatComposer: View {
             #endif
         }
         .padding(12)
+        #if os(macOS)
+        // ⌘V with files or an image on the clipboard attaches them (text pastes as always).
+        .onAppear {
+            pasteMonitor.start(isFocused: { fieldFocused && (onSendFile != nil || onSendImage != nil) },
+                               deliver: { onIntake($0) })
+        }
+        .onDisappear { pasteMonitor.stop() }
+        #endif
         .fileImporter(isPresented: $showFilePicker, allowedContentTypes: [.item]) { result in
             if case .success(let url) = result { onSendFile?(url) }
         }
@@ -480,6 +671,11 @@ private struct ChatComposer: View {
                         Button { showCamera = true } label: { Label("Take Photo", systemImage: "camera") }
                     }
                     Button { showLibrary = true } label: { Label("Photo Library", systemImage: "photo.on.rectangle") }
+                    // The text field ignores pasted images; this takes them. (Reading the
+                    // clipboard asks the user's permission the first time.)
+                    if UIPasteboard.general.hasImages {
+                        Button { onIntake(ComposerIntake.fromPasteboard()) } label: { Label("Paste Image", systemImage: "doc.on.clipboard") }
+                    }
                 }
                 #endif
                 if onSendFile != nil {
@@ -500,20 +696,55 @@ private struct ChatComposer: View {
         }
     }
 
-    private var field: some View {
+    @ViewBuilder private var field: some View {
+        #if os(iOS)
+        // A UITextView underneath, so the system Paste (edit menu, ⌘V) takes pictures and files.
+        ComposerTextView(text: $draft, placeholder: placeholder,
+                         onPasteItems: { providers in
+                             _ = ComposerIntake.load(providers) { onIntake([$0]) }
+                         })
+            .overlay(alignment: .topLeading) {
+                if draft.isEmpty {
+                    Text(placeholder).foregroundStyle(.white.opacity(0.4)).allowsHitTesting(false)
+                }
+            }
+        #else
         TextField(placeholder, text: $draft, axis: .vertical)
             .textFieldStyle(.plain).foregroundStyle(.white).lineLimit(1...6)
-            .onSubmit(onSend)
+            .focused($fieldFocused)
+            .onKeyPress(keys: [.upArrow, .downArrow, .tab, .return]) { press in
+                mentionKey(press.key) ? .handled : .ignored
+            }
+            .onSubmit(send)
+        #endif
+    }
+
+    private var hasText: Bool { !draft.trimmingCharacters(in: .whitespaces).isEmpty }
+
+    /// Text (if any) goes as before; each waiting attachment goes exactly as "Attach" sends it.
+    private func send() {
+        guard !sending, hasText || !staged.isEmpty else { return }
+        if hasText { onSend() }
+        let items = staged
+        staged = []
+        for item in items {
+            switch item.payload {
+            case .image(let data):
+                if let onSendImage { onSendImage(data) }
+            case .file(let url):
+                onSendFile?(url)
+            }
+        }
     }
 
     private var sendButton: some View {
-        Button(action: onSend) {
+        Button(action: send) {
             Image(systemName: sending ? "hourglass" : "arrow.up.circle.fill")
                 .font(.system(size: 24))
-                .foregroundStyle(draft.trimmingCharacters(in: .whitespaces).isEmpty ? .white.opacity(0.25) : .skAccent)
+                .foregroundStyle(!hasText && staged.isEmpty ? .white.opacity(0.25) : .skAccent)
         }
         .buttonStyle(.plain)
-        .disabled(sending || draft.trimmingCharacters(in: .whitespaces).isEmpty)
+        .disabled(sending || (!hasText && staged.isEmpty))
     }
 }
 
@@ -581,5 +812,79 @@ struct ChatSurfacePreview: View {
             .init(id: "6", author: "sam", body: "nice. what's the safety number thing?", mine: false, reactionPills: [ReactionPill(emoji: "🔒", count: 1, mine: false), ReactionPill(emoji: "👍", count: 2, mine: true)], createdAt: now - 190_000),
             .init(id: "7", author: "you", body: "tap the shield in a DM — compare the 60 digits with the person to be sure no one's in the middle", mine: true, createdAt: now - 60_000),
         ]
+    }
+}
+
+/// A row's hover highlight (and, for a grouped follow-up, its time in the avatar gutter), with
+/// its own state: hovering re-renders this wrapper, not the row inside it.
+private struct HoverRow<Content: View>: View {
+    var hoverTime: String?
+    @ViewBuilder let content: Content
+    @State private var hovering = false
+
+    var body: some View {
+        content
+            .overlay(alignment: .topLeading) {
+                if hovering, let hoverTime {
+                    Text(hoverTime)
+                        .font(.system(size: 10, design: .monospaced)).foregroundStyle(.white.opacity(0.35))
+                        .frame(width: 40, alignment: .trailing)
+                        .padding(.leading, 16).padding(.top, 3)
+                        .allowsHitTesting(false)
+                }
+            }
+            .background(hovering ? Color.white.opacity(0.04) : .clear)
+            .onHover { hovering = $0 }
+    }
+}
+
+/// Rendered message text, kept: parsing markdown and checking links is not free, and a list
+/// re-renders rows often. Keyed by the body (bounded; evicted under memory pressure).
+enum MessageText {
+    private static let cache: NSCache<NSString, Box> = {
+        let c = NSCache<NSString, Box>()
+        c.countLimit = 2000
+        return c
+    }()
+    private final class Box { let value: AttributedString; init(_ v: AttributedString) { value = v } }
+
+    static func attributed(_ body: String) -> AttributedString {
+        // Very long bodies are still rendered in full; only the cache key is the body itself.
+        let key = body as NSString
+        if let hit = cache.object(forKey: key) { return hit.value }
+        let value = LinkSafety.attributed(body)
+        cache.setObject(Box(value), forKey: key)
+        return value
+    }
+}
+
+/// The message actions as a small popover (a long press on the Mac; right-click shows the same
+/// items as a context menu).
+private struct MessageActionsPopover<Items: View>: View {
+    @ViewBuilder let items: Items
+    @Environment(\.dismiss) private var dismiss
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) { items }
+            .buttonStyle(.borderless)
+            .labelStyle(.titleAndIcon)
+            .padding(10)
+            .frame(minWidth: 200, alignment: .leading)
+            .simultaneousGesture(TapGesture().onEnded { dismiss() })
+    }
+}
+
+/// The whole message, selectable, for copying any part of it.
+private struct SelectableTextSheet: View {
+    let text: String
+    var body: some View {
+        ScrollView {
+            Text(text).font(.system(size: 15)).foregroundStyle(.white)
+                .textSelection(.enabled)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .padding(20)
+        }
+        #if os(macOS)
+        .frame(minWidth: 420, minHeight: 240)
+        #endif
     }
 }

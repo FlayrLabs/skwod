@@ -82,6 +82,10 @@ data class Workspace(
      * but it is not opened at launch: its messages stay locked until the password is given again.
      */
     val signedOutByUser: Boolean = false,
+    /** The name the host set for this skwod (`GET /api/instance/name`), cleaned and accepted ([SkwodName]). */
+    val instanceName: String? = null,
+    /** [name] is the user's own name for this skwod on this device (wins over [instanceName]). */
+    val nameSetByUser: Boolean = false,
 ) {
     /** The server ended this session (401): the token was dropped and the user must log in again. */
     val isSignedOut: Boolean get() = token.isEmpty()
@@ -99,7 +103,7 @@ data class Workspace(
      * Always re-derived from the address so a name persisted before the *.skwod.io / localhost
      * mapping existed (e.g. a bare "skwod.io") is corrected on display rather than shown stale.
      */
-    val displayName: String get() = defaultName(server)
+    val displayName: String get() = SkwodName.display(if (nameSetByUser) name else null, instanceName, defaultName(server))
 
     companion object {
         fun slug(server: String): String {
@@ -290,6 +294,48 @@ class AppModel private constructor(private val ctx: Context) {
 
     /** An invite that arrived by deep link / QR / paste and is waiting to prefill the connect screen. */
     var pendingInvite by mutableStateOf<String?>(null)
+    /** The username to prefill with [pendingInvite] when a skwod asks to be logged in to again. */
+    var pendingLoginName by mutableStateOf<String?>(null)
+
+    /**
+     * The active skwod's host refuses this app's protocol ([SessionRefusal.Action.UPDATE_APP]):
+     * a persistent banner with "Update Skwod" — never a sign-out. Cleared by the next good sync
+     * and when the workspace changes.
+     */
+    var hostNewer by mutableStateOf<String?>(null)
+
+    /** Show the banner; the dialog only the first time it comes up. */
+    private fun raiseHostNewer(detail: String) {
+        val first = hostNewer == null
+        hostNewer = detail
+        if (first) enqueueNotice(SecurityAlert("Update Skwod", updateRequiredText(detail)))
+    }
+
+    /** `localId:tokenIssuedAt` of the session already rebuilt once because the host refused its binding. */
+    @Volatile private var rebindTried: String? = null
+    /** The client for which an unbound, not-yet-a-device session was already sent to "set up this device". */
+    @Volatile private var linkRoutedFor: SkwodClient? = null
+
+    /** The text of a failure, for [SessionRefusal.decide]. */
+    private fun errorText(e: Throwable): String = coreErrorDetail(e) ?: e.message.orEmpty()
+
+    /**
+     * A tile / row for [w] was tapped. The skwod already on screen is not torn down (no flash of
+     * the login, no new engine); a skwod whose session is over opens its login and leaves the
+     * active one running. Returns true when it switched.
+     */
+    suspend fun tapSkwod(w: Workspace): Boolean {
+        val latest = workspaces.firstOrNull { it.localId == w.localId } ?: w
+        return when (SkwodTap.outcome(latest, current, engineUp = client != null && !pinFailed)) {
+            SkwodTap.Outcome.STAY -> false
+            SkwodTap.Outcome.LOG_IN -> {
+                pendingLoginName = latest.username
+                pendingInvite = latest.server
+                false
+            }
+            SkwodTap.Outcome.SWITCH -> { activate(latest); true }
+        }
+    }
     /**
      * Joins in progress for the active workspace: after signing up with an invite its code also
      * joins the invite's server, and a join that needs approval waits there — persisted, visible,
@@ -630,7 +676,7 @@ class AppModel private constructor(private val ctx: Context) {
                 deviceId = null; stopped = null; recoveryWaiting = false
                 if (!InstallRoute.mayRegister(cacheOpened = true, online = registerIfNew && baseUrl != null, screen = screen)) return
                 try { deviceId = c.registerDevice() } catch (e: uniffi.skwod_core.CoreException.UpdateRequired) {
-                    enqueueNotice(SecurityAlert("Update required", updateRequiredText(e.detail)))
+                    raiseHostNewer(e.detail)
                 } catch (_: uniffi.skwod_core.CoreException.LinkRequired) {
                     // A session token alone can't add a device: link it, restore it, or reset.
                     needsDeviceLink = true
@@ -678,6 +724,38 @@ class AppModel private constructor(private val ctx: Context) {
             routeIfDeviceError(e)
             false
         }
+    }
+
+    /**
+     * The host answered "device bind required" ([SessionRefusal.Action.BIND_REQUIRED]). Never a
+     * sign-out: bind the session; an install that is not a device of the account yet (a second
+     * phone that just logged in) goes to "set up this device"; a session the core had already
+     * bound is rebuilt on a fresh client ONCE. Returns true when that rebuild was started (the
+     * calling sync loop stops: activating starts a new one).
+     */
+    private suspend fun recoverFromBindRefusal(c: SkwodClient): Boolean {
+        val w = current ?: return false
+        val bound = try { withContext(Dispatchers.IO) { c.bindSession() } }
+            catch (e: kotlinx.coroutines.CancellationException) { throw e }
+            catch (e: Exception) { routeIfDeviceError(e); return false }
+        if (client !== c) return false
+        if (!bound) {
+            sessionBoundFor = null
+            // Once per client, and not while a set-up / reset / restore is already on screen:
+            // "Not now" stays "not now" until the skwod is opened again.
+            if (linkRoutedFor !== c && !needsDeviceLink && resetPending == null && !recoveryWaiting) {
+                linkRoutedFor = c
+                routeDeviceState(registerIfNew = true)
+            }
+            return false
+        }
+        // Bound just now: the next pass asks again.
+        if (sessionBoundFor !== c) { sessionBoundFor = c; return false }
+        val key = "${w.localId}:${w.tokenIssuedAt}"
+        if (rebindTried == key) return false
+        rebindTried = key
+        launchIO { current?.takeIf { it.localId == w.localId && !it.isSignedOut }?.let { activate(it) } }
+        return true
     }
 
     /**
@@ -802,7 +880,17 @@ class AppModel private constructor(private val ctx: Context) {
             restored = false
             return@withLock false
         }
-        workspaces = loaded; workspacesLoaded = true
+        // Two records for the same skwod and account (earlier builds could make one): keep the
+        // one with a live session. Only the other RECORD goes — no cache file is deleted.
+        // Only on proven identity (the host key, or the same https address): an instance id and
+        // pinned key are what a host SAID when first pinned, and must never merge or drop a
+        // record (security review, build 46).
+        val merged = WorkspaceDedupe.merge(loaded, crossAddress = false)
+        workspaces = SkwodName.revalidate(merged.kept); workspacesLoaded = true
+        if (merged.dropped.isNotEmpty()) {
+            prefs.getString("current", null)?.let { cur -> merged.replacedBy[cur]?.let { prefs.edit().putString("current", it).apply() } }
+            saveWorkspaces()
+        }
         // "Block screenshots" is on for a NEW install (no preference, no skwod yet) only.
         settings.decideScreenSecurity(hasWorkspace = workspaces.isNotEmpty())
         AppLock.start(settings)
@@ -838,6 +926,8 @@ class AppModel private constructor(private val ctx: Context) {
             dropClient()
             // …and its socket: no event of the skwod being left is handled under the next one.
             realtime.leave()
+            // What one host said about this app's version says nothing about another's.
+            hostNewer = null
             // A notice still waiting keeps its text, not its action ([NoticeRules.afterSwitch]).
             synchronized(this) {
                 noticeAction = null
@@ -914,7 +1004,9 @@ class AppModel private constructor(private val ctx: Context) {
         enqueueNotice(SecurityAlert("Signed out of ${w.displayName}",
             if (w.signedOutByUser) "You signed out of ${w.displayName} on this phone. Your messages and keys are still here, locked. Log in again with your password to carry on where you left off — no relinking."
             else "Your session on ${w.displayName} has ended — it expired, or it was signed out from another device. Log in again to keep chatting. The messages already on this phone are still here."))
-        // Opens the connect form in Log in mode, prefilled with this skwod's address.
+        // Opens the connect form in Log in mode, prefilled with this skwod's address (and the
+        // username). The cache, its key and the device stay: logging in again is the same device.
+        pendingLoginName = w.username
         pendingInvite = w.server
     }
 
@@ -983,6 +1075,7 @@ class AppModel private constructor(private val ctx: Context) {
         // Conversations of the ACCOUNT (also the ones started on another of our devices), then
         // whatever is waiting in the mailbox.
         launchIO { refreshRoster(); refreshDmList(); groups.refresh(); syncDmsNow(); reports.refresh() }
+        launchIO { refreshServerList(); refreshInstanceName() }
         joins.resume()
     }
 
@@ -1143,15 +1236,32 @@ class AppModel private constructor(private val ctx: Context) {
                                 chat.ticket().let { t -> handleDmEvents(c.syncDms(), t) }
                                 c.processControlInbox(me)
                                 failures = 0; syncFailures.intValue = 0
+                                hostNewer = null
                                 surfaceSecurityNotices()
                                 drainDmEvents()
-                            } catch (e: uniffi.skwod_core.CoreException.UpdateRequired) {
-                                failures = 0
-                                enqueueNotice(SecurityAlert("Update required", updateRequiredText(e.detail)))
+                            } catch (e: kotlinx.coroutines.CancellationException) { throw e
                             } catch (e: Exception) {
-                                // This install is not the device any more (removed, superseded)
-                                // or not yet (a restore is waiting): show that, not "unreachable".
-                                if (routeIfDeviceError(e)) { if (stopped != null) return@launch; kotlinx.coroutines.delay(5000); continue }
+                                // A refusal is sorted BEFORE anything is called "unreachable", and
+                                // only a 401 on /api/auth/me ([signedOutCheck]) ends the session.
+                                val action = SessionRefusal.decide(coreErrorKind(e), errorText(e),
+                                    boundDevice = deviceId != null && sessionBoundFor === c,
+                                    reboundAlready = rebindTried == current?.let { "${it.localId}:${it.tokenIssuedAt}" })
+                                when (action) {
+                                    // This install is not the device any more (removed, superseded)
+                                    // or not yet (a restore is waiting): show that, not "unreachable".
+                                    SessionRefusal.Action.DEVICE_STATE -> {
+                                        routeDeviceState()
+                                        if (stopped != null) return@launch
+                                        kotlinx.coroutines.delay(5000); continue
+                                    }
+                                    SessionRefusal.Action.UPDATE_APP -> { failures = 0; raiseHostNewer(errorText(e)); continue }
+                                    SessionRefusal.Action.BIND_REQUIRED -> {
+                                        failures = 0
+                                        if (recoverFromBindRefusal(c)) return@launch
+                                        continue
+                                    }
+                                    SessionRefusal.Action.SIGNED_OUT, SessionRefusal.Action.TRANSIENT -> {}
+                                }
                                 // Before calling this "unreachable": did the server sign us out?
                                 // (401 = clear the session and show login; anything else = keep it.)
                                 if (signedOutCheck()) return@launch
@@ -1523,11 +1633,18 @@ class AppModel private constructor(private val ctx: Context) {
         // Is this a skwod we already hold a workspace (cache + keys) for? Only on proof: the
         // iroh-authenticated node id for p2p, a pinned-key challenge for classic https. What the
         // server CLAIMS (its instance id) never selects a workspace — see WorkspaceMatch.
-        val existing = WorkspaceMatch.find(workspaces, address, s.userId, instanceId) { pinned ->
+        // …and logging in through a skwod's OTHER address (p2p ↔ https) reuses its entry only when
+        // that address proves the entry's pinned key; unproven is refused, never a second entry
+        // (the same skwod showed up twice, one of them dead). See [LoginReuse].
+        val decision = LoginReuse.decide(workspaces, address, s.userId, instanceId) { pinned ->
             uniffi.skwod_core.verifyServerIdentity(base, pinned)
         }
+        if (decision is LoginReuse.Decision.Refuse) throw SkwodIdentityException(LoginReuse.REFUSED)
+        val existing = (decision as? LoginReuse.Decision.Reuse)?.existing
+        // A p2p skwod logged into through its https address keeps its p2p address (the key is its identity).
+        val keepsP2p = (decision as? LoginReuse.Decision.Reuse)?.keepsP2p == true
         val localId = existing?.localId ?: WorkspaceMatch.newLocalId(workspaces, address, s.userId)
-        val w = Workspace(stored, s.userId, s.token, s.expiresAt,
+        val w = Workspace(if (keepsP2p) existing!!.server else stored, s.userId, s.token, s.expiresAt,
             existing?.name ?: Workspace.defaultName(stored),
             localId = localId, instanceId = existing?.instanceId ?: instanceId,
             // A key that was pinned stays pinned; a first join pins what the authenticated host presents.
@@ -1535,12 +1652,15 @@ class AppModel private constructor(private val ctx: Context) {
             beaconPubkey = beaconPubkey ?: existing?.beaconPubkey,
             beaconContentKey = beaconContentKey ?: existing?.beaconContentKey,
             username = username ?: existing?.username,
-            nodeId = nodeId,
+            nodeId = if (keepsP2p) existing!!.nodeId else nodeId,
             // Never from the invite's `?u=`: only what the host's signed record told us earlier.
             fallbackUrl = existing?.fallbackUrl,
             addressTs = existing?.addressTs ?: 0,
-            tokenIssuedAt = System.currentTimeMillis())
-        workspaces = workspaces.filter { it.localId != localId } + w
+            tokenIssuedAt = System.currentTimeMillis(),
+            instanceName = existing?.instanceName,
+            nameSetByUser = existing?.nameSetByUser ?: false)
+        // One entry per skwod and account: an older dead record of this same skwod goes with it.
+        workspaces = WorkspaceDedupe.merge(workspaces.filter { it.localId != localId } + w, crossAddress = false).kept
         saveWorkspaces()
         // A join started before this account existed on this device now belongs to it.
         joins.bind(stored, w.username, localId)
@@ -1800,6 +1920,191 @@ class AppModel private constructor(private val ctx: Context) {
         return ok
     }
 
+    /** server_id → owner_id, from the last complete `GET /api/servers` of the active skwod. */
+    var serverOwners by mutableStateOf<Map<String, String>>(emptyMap())
+        private set
+
+    /**
+     * Ask the skwod which servers this account is in, and who owns them. A server listed here
+     * that the answer does NOT contain was deleted, or this account was removed from it: it leaves
+     * the list (its keys stay — the user did not ask to forget anything). Only a complete,
+     * successful answer prunes. Called on going live and on `server_deleted` / `revoke` (which
+     * are only "go and check": nothing in their payload is trusted).
+     */
+    suspend fun refreshServerList() {
+        val wid = current?.localId ?: return
+        val owners = ServerList.owners(httpGet("api/servers")) ?: return
+        if (current?.localId != wid) return
+        serverOwners = owners
+        val gone = ServerList.gone(chat.spaces.map { it.serverId }, owners.keys)
+        for (sid in gone) chat.removeServer(sid)
+    }
+
+    /**
+     * The name the host gave this skwod (`GET /api/instance/name`; older hosts answer 404 and
+     * nothing changes). Cleaned, and not taken when it reads like another entry's name or a
+     * generic one ([SkwodName]).
+     */
+    suspend fun refreshInstanceName() {
+        val w = current ?: return
+        val raw = httpGet("api/instance/name") ?: return
+        val name = SkwodName.parse(raw)
+        val others = workspaces.filter { it.localId != w.localId }.flatMap { o ->
+            listOfNotNull(if (o.nameSetByUser) o.name else null, Workspace.defaultName(o.server), o.instanceName) }
+        val accepted = name?.takeIf { SkwodName.accepted(it, others) }
+        val latest = workspaces.firstOrNull { it.localId == w.localId } ?: return
+        if (latest.instanceName == accepted) return
+        val named = latest.copy(instanceName = accepted)
+        workspaces = workspaces.map { if (it.localId == w.localId) named else it }
+        saveWorkspaces()
+        if (current?.localId == w.localId) current = current?.copy(instanceName = accepted)
+    }
+
+    /**
+     * The instance owner names the skwod on its host (core `setInstanceName`, device-signed, op
+     * `instance-name`). Held first to the rule every member applies ([SkwodName.hostName]), so
+     * the owner never sets a name members would refuse; empty clears it. A sentence on failure.
+     */
+    suspend fun setInstanceName(raw: String): String? {
+        val c = client ?: return "Not connected — try again."
+        val spaced = raw.trim().replace(Regex(" +"), " ")
+        if (spaced.isNotEmpty()) {
+            val ok = SkwodName.hostName(spaced)
+                ?: return "A skwod name uses letters, digits, spaces, - _ ' & and emoji, and can't look like an address or a reserved name."
+            if (ok != spaced) return "A skwod name is at most ${SkwodName.MAX} characters."
+        }
+        try { withContext(Dispatchers.IO) { c.setInstanceName(spaced) } }
+        catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (e: Exception) {
+            routeIfDeviceError(e)
+            val text = e.message ?: ""
+            return when {
+                "status 403" in text -> "Only the person who runs this skwod can rename it."
+                "status 400" in text -> "The host refused that name — try letters, digits and emoji."
+                else -> "Couldn't rename the skwod. Check the connection and try again."
+            }
+        }
+        refreshInstanceName()
+        return null
+    }
+
+    /**
+     * "Remove this duplicate": drop the RECORD of a second entry for a skwod and account this
+     * phone has twice (never the open one). Its cache file and key are left on the phone.
+     */
+    fun removeDuplicate(localId: String): Boolean {
+        val w = workspaces.firstOrNull { it.localId == localId } ?: return false
+        if (current?.localId == localId || !WorkspaceLabel.hasTwin(w, workspaces)) return false
+        workspaces = workspaces.filter { it.localId != localId }
+        saveWorkspaces()
+        return true
+    }
+
+    /** The server's PINNED owner (the core's `spaceOwner`), or null when none is pinned / unknown. */
+    suspend fun pinnedServerOwner(serverId: String): String? {
+        val c = client ?: return null
+        return try { withContext(Dispatchers.IO) { c.spaceOwner(serverId) } } catch (_: Exception) { null }
+    }
+
+    /** server id → whose @everyone counts there ([Mentions.everyoneSenders]), for the open skwod. */
+    val everyoneSenders = androidx.compose.runtime.mutableStateMapOf<String, Set<String>>()
+    private val everyoneAskedAt = HashMap<String, Long>()
+
+    /**
+     * Whose @everyone counts in [serverId]: the pinned owner, and the admins the server lists
+     * (Administrator / Manage Server) who are members this device is not holding and has not
+     * blocked. Asked at most every 5 minutes; the last answer is kept in [everyoneSenders].
+     */
+    suspend fun refreshEveryoneSenders(serverId: String, force: Boolean = false): Set<String> {
+        val c = client ?: return emptySet()
+        val asked = current?.localId ?: return emptySet()
+        val now = System.currentTimeMillis()
+        val known = everyoneSenders[serverId]
+        if (!force && known != null && now - (everyoneAskedAt[serverId] ?: 0L) < 300_000L) return known
+        everyoneAskedAt[serverId] = now
+        val pinned = pinnedServerOwner(serverId)
+        val members = listPresenceMembers(serverId)
+        val roles = try { withContext(Dispatchers.IO) { c.listRoles(serverId) } } catch (_: Exception) { emptyList() }
+        // Unknown whom this device holds: fail closed (null — only the pinned owner counts).
+        val held: Set<String>? = try { withContext(Dispatchers.IO) { c.heldMembers(serverId) }.toSet() } catch (_: Exception) { null }
+        if (current?.localId != asked || client !== c) return emptySet()
+        // Assigned roles only: the default (@everyone) role's bits are not an admin's.
+        val bits = roles.map { Mentions.RoleBits(it.roleId, it.permissions, it.isDefault) }
+        val perms = members.take(5000).associate { m -> m.userId to Mentions.everyonePermissions(m.roleIds, bits) }
+        val blocked = perms.keys.filter { isBlockedUser(it) }.toSet()
+        val set = Mentions.everyoneSenders(pinned, perms, held, blocked)
+        everyoneSenders[serverId] = set
+        return set
+    }
+
+    private val badgePrefs by lazy { ctx.getSharedPreferences("skwod-mention-badges", Context.MODE_PRIVATE) }
+
+    /** Unseen mentions of me ([MentionBadgeLedger]): the red "@ n" on rows and tiles. */
+    var mentionBadges by mutableStateOf(MentionBadgeLedger.fromJson(badgePrefs.getString("ledger", null)))
+        private set
+
+    /** Mentions of me that arrived in [topic] while it was not on screen. Each message counts once. */
+    fun addMentionBadges(ids: List<String>, topic: String) {
+        val wid = current?.localId ?: return
+        if (realtime.appActive && realtime.focusedTopic == topic) return
+        val next = mentionBadges.add(ids, topic, wid)
+        if (next != mentionBadges) { mentionBadges = next; badgePrefs.edit().putString("ledger", next.toJson()).apply() }
+    }
+
+    /** The conversation was opened: its "@ n" goes. */
+    fun clearMentionBadges(topic: String) {
+        val wid = current?.localId ?: return
+        val next = mentionBadges.clear(topic, wid)
+        if (next != mentionBadges) { mentionBadges = next; badgePrefs.edit().putString("ledger", next.toJson()).apply() }
+    }
+
+    fun mentionCount(topics: Collection<String>): Int = current?.localId?.let { mentionBadges.count(topics, it) } ?: 0
+
+    /**
+     * Leave a server (not its owner): the host removes the membership (`DELETE
+     * /api/servers/{id}/members/{me}` — leaving is removing yourself; no device proof is asked),
+     * then this device forgets the server's keys and owner pin (`forgetSpace`) and drops it from
+     * the list. Messages already cached stay in the encrypted cache. Null = done, else a sentence.
+     */
+    suspend fun leaveServer(serverId: String): String? {
+        val c = client ?: return "Not connected — try again."
+        val me = session?.userId ?: return "Not connected — try again."
+        // Authoritative here from the confirmation on ([LeaveTombstones]): the server goes now,
+        // and nothing already in flight can bring it back while the host answers.
+        val asked = bound
+        val before = chat.beginLeave(serverId) ?: return null
+        val status = httpSend("api/servers/$serverId/members/$me", "DELETE")
+        // Another skwod (or account) is in use now: its list is not touched.
+        if (bound !== asked) {
+            if (status == 200 || status == 404) try { withContext(Dispatchers.IO) { c.forgetSpace(serverId) } } catch (_: Exception) {}
+            return null
+        }
+        // 404: not a member any more (already left, or removed) — still drop it here.
+        if (status != 200 && status != 404) {
+            chat.leaveFailed(serverId, before)
+            return if (status == 400) "You own this server — delete it instead." else "Couldn't leave the server — try again."
+        }
+        chat.tombstones.confirm(serverId)
+        try { withContext(Dispatchers.IO) { c.forgetSpace(serverId) } } catch (_: Exception) {}
+        chat.removeServer(serverId)
+        return null
+    }
+
+    /**
+     * Delete a server for everyone (its owner only): signed by this device in the core
+     * (`deleteSpace`, op `delete-server`), then forgotten here (`forgetSpace`) and dropped from
+     * the list. Null = done, else a sentence.
+     */
+    suspend fun deleteServer(serverId: String): String? {
+        val c = client ?: return "Not connected — try again."
+        try { withContext(Dispatchers.IO) { c.deleteSpace(serverId) } }
+        catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (e: Exception) { routeIfDeviceError(e); return "Couldn't delete the server. Only its owner can, from a device of their account." }
+        try { withContext(Dispatchers.IO) { c.forgetSpace(serverId) } } catch (_: Exception) {}
+        chat.removeServer(serverId)
+        return null
+    }
+
     /** Ban: kick + a server-side ban row every rejoin path checks (requires Ban Members). */
     suspend fun banMember(serverId: String, userId: String): Boolean {
         val ok = httpSend("api/servers/$serverId/bans/$userId", "POST") == 200
@@ -1993,6 +2298,9 @@ class AppModel private constructor(private val ctx: Context) {
     // ---- workspace persistence (JSON in EncryptedSharedPreferences) ----
 
     private fun saveWorkspaces() {
+        // Every save re-checks host-supplied names against the whole list ([SkwodName.revalidate]).
+        workspaces = SkwodName.revalidate(workspaces)
+        current?.let { c -> workspaces.firstOrNull { it.localId == c.localId }?.let { r -> if (r.instanceName != c.instanceName) current = c.copy(instanceName = r.instanceName) } }
         val arr = JSONArray()
         for (w in workspaces) {
             arr.put(JSONObject().apply {
@@ -2007,6 +2315,8 @@ class AppModel private constructor(private val ctx: Context) {
                 put("addressTs", w.addressTs)
                 put("tokenIssuedAt", w.tokenIssuedAt)
                 if (w.signedOutByUser) put("signedOutByUser", true)
+                w.instanceName?.let { put("instanceName", it) }
+                if (w.nameSetByUser) put("nameSetByUser", true)
             })
         }
         prefs.edit().putString("workspaces", arr.toString()).apply()
@@ -2038,7 +2348,9 @@ class AppModel private constructor(private val ctx: Context) {
                     fallbackUrl = if (o.has("fallbackUrl") && o.optLong("addressTs", 0) > 0) o.getString("fallbackUrl") else null,
                     addressTs = o.optLong("addressTs", 0),
                     tokenIssuedAt = o.optLong("tokenIssuedAt", 0),
-                    signedOutByUser = o.optBoolean("signedOutByUser", false))
+                    signedOutByUser = o.optBoolean("signedOutByUser", false),
+                    instanceName = if (o.has("instanceName")) SkwodName.clean(o.getString("instanceName")) else null,
+                    nameSetByUser = o.optBoolean("nameSetByUser", false))
             }
         } catch (_: Exception) { emptyList() }
     }

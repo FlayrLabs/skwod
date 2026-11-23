@@ -61,7 +61,11 @@ final class Realtime: NSObject, ObservableObject {
     var chatNames: [String: String] = [:]
     /// The topic currently on screen — its messages never notify.
     var focusedTopic: String? {
-        didSet { if let focusedTopic, focusedTopic != oldValue, appActive { clearDelivered(topic: focusedTopic) } }
+        didSet {
+            if let focusedTopic, focusedTopic != oldValue, appActive { clearDelivered(topic: focusedTopic) }
+            // Opening a conversation is seeing its mentions.
+            if let focusedTopic, let wid = mentionWorkspaceId { MentionBadges.clear(topic: focusedTopic, workspaceId: wid) }
+        }
     }
     /// Whether the app is frontmost; background messages always notify.
     var appActive = true
@@ -315,6 +319,22 @@ final class Realtime: NSObject, ObservableObject {
         }
     }
 
+    /// A `typing` event on a topic this client listens to (topic, user id).
+    var onTyping: ((String, String) -> Void)?
+    /// The workspace whose mention badges an opened conversation clears.
+    var mentionWorkspaceId: String?
+    /// Someone's message arrived on a topic (topic, author id): they stopped typing it.
+    var onPosted: ((String, String) -> Void)?
+
+    /// "I'm typing" into `topic` (the open conversation). The caller throttles
+    /// (`TypingSendThrottle`); the server drops more than one a second anyway.
+    func sendTyping(topic: String) {
+        guard !topic.isEmpty else { return }
+        send(["type": "typing", "topic": topic])
+    }
+
+    var currentUserId: String { myUserId }
+
     private func send(_ obj: [String: Any]) {
         guard let task, let data = try? JSONSerialization.data(withJSONObject: obj),
               let text = String(data: data, encoding: .utf8) else { return }
@@ -338,7 +358,11 @@ final class Realtime: NSObject, ObservableObject {
             if let uid = payload["user_id"] as? String, let status = payload["status"] as? String, !blockedIds.contains(uid) {
                 presence[uid] = PresenceSeen(status: status, at: Date())
             }
+        case "typing":
+            // Only ever shown in the open conversation (`TypingState`); never a notification.
+            if let uid = payload["user_id"] as? String { onTyping?(topic, uid) }
         default:
+            if event == "message", let author = payload["author_id"] as? String { onPosted?(topic, author) }
             onEvent?(topic, event, payload)
         }
     }

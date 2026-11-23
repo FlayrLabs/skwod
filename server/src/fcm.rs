@@ -81,6 +81,19 @@ impl Fcm {
         SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs()).unwrap_or(0)
     }
 
+    /// The signed RS256 JWT-bearer assertion exchanged for an access token (Google's
+    /// service-account flow): the service account is the issuer, FCM's scope, an hour's life.
+    fn assertion(&self, now: u64) -> Result<String, jsonwebtoken::errors::Error> {
+        let claims = OAuthClaims {
+            iss: self.client_email.clone(),
+            scope: "https://www.googleapis.com/auth/firebase.messaging".into(),
+            aud: "https://oauth2.googleapis.com/token".into(),
+            iat: now,
+            exp: now + 3600,
+        };
+        jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, &self.encoding_key)
+    }
+
     /// A Google OAuth2 access token for FCM, minted from the service account and cached until ~5
     /// minutes before expiry.
     async fn access_token(&self) -> Option<String> {
@@ -93,14 +106,7 @@ impl Fcm {
                 }
             }
         }
-        let claims = OAuthClaims {
-            iss: self.client_email.clone(),
-            scope: "https://www.googleapis.com/auth/firebase.messaging".into(),
-            aud: "https://oauth2.googleapis.com/token".into(),
-            iat: now,
-            exp: now + 3600,
-        };
-        let assertion = jsonwebtoken::encode(&Header::new(Algorithm::RS256), &claims, &self.encoding_key).ok()?;
+        let assertion = self.assertion(now).ok()?;
         let resp = self
             .http
             .post("https://oauth2.googleapis.com/token")
@@ -159,5 +165,63 @@ mod wake_tests {
         let body = super::wake_body("tok");
         assert_eq!(body["message"]["data"], serde_json::json!({ "wake": "1" }));
         assert!(body["message"].get("notification").is_none());
+    }
+}
+
+#[cfg(test)]
+mod jwt_tests {
+    //! The OAuth JWT-bearer assertion as Google checks it: RS256, the service account as `iss`,
+    //! the FCM scope, Google's token endpoint as `aud`, an hour's life; signed with a PKCS#8 key
+    //! (the `private_key` of a service-account JSON) and verified by the `rsa` crate itself.
+    use super::*;
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD as B64URL;
+    use base64::Engine as _;
+    use rsa09::pkcs1v15::{Signature, VerifyingKey};
+    use rsa09::pkcs8::{EncodePrivateKey, LineEnding};
+    use rsa09::signature::Verifier;
+
+    fn json_part(part: &str) -> serde_json::Value {
+        serde_json::from_slice(&B64URL.decode(part).expect("base64url")).expect("json")
+    }
+
+    #[test]
+    fn oauth_assertion_is_rs256_and_verifies_with_the_public_key() {
+        let key = rsa09::RsaPrivateKey::new(&mut rand::thread_rng(), 2048).expect("keygen");
+        let pem = key.to_pkcs8_pem(LineEnding::LF).expect("pkcs8 pem");
+        assert!(pem.starts_with(concat!("-----BEGIN ", "PRIVATE KEY-----")), "the service-account format");
+        // As it arrives: inside the service-account JSON, newlines escaped.
+        let sa = serde_json::json!({ "project_id": "skwod-test", "client_email": "push@example.com", "private_key": pem.as_str() });
+        let sa: ServiceAccount = serde_json::from_value(sa).unwrap();
+        let fcm = Fcm {
+            project_id: sa.project_id,
+            client_email: sa.client_email,
+            encoding_key: EncodingKey::from_rsa_pem(sa.private_key.as_bytes()).expect("a PKCS#8 RSA key loads"),
+            http: reqwest::Client::new(),
+            cached: Mutex::new(None),
+        };
+        let now = 1_800_000_000;
+        let jwt = fcm.assertion(now).expect("signs");
+        let parts: Vec<&str> = jwt.split('.').collect();
+        assert_eq!(parts.len(), 3);
+
+        let header = json_part(parts[0]);
+        assert_eq!(header["alg"], "RS256");
+        assert_eq!(header["typ"], "JWT");
+
+        let claims = json_part(parts[1]);
+        assert_eq!(claims["iss"], "push@example.com");
+        assert_eq!(claims["scope"], "https://www.googleapis.com/auth/firebase.messaging");
+        assert_eq!(claims["aud"], "https://oauth2.googleapis.com/token");
+        assert_eq!(claims["iat"], now);
+        assert_eq!(claims["exp"], now + 3600);
+
+        let sig = B64URL.decode(parts[2]).unwrap();
+        assert_eq!(sig.len(), 256, "a 2048-bit RSA signature");
+        let sig = Signature::try_from(sig.as_slice()).unwrap();
+        let signed = format!("{}.{}", parts[0], parts[1]);
+        let verifier = VerifyingKey::<sha2::Sha256>::new(key.to_public_key());
+        verifier.verify(signed.as_bytes(), &sig).expect("verifies with the service account's public key");
+        let tampered = format!("{}.{}", parts[0], B64URL.encode(br#"{"iss":"attacker@example.com"}"#));
+        assert!(verifier.verify(tampered.as_bytes(), &sig).is_err());
     }
 }

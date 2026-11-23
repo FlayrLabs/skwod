@@ -89,6 +89,18 @@ struct MessageExtras {
     var onBlock: ((ChatMessage) -> Void)?
     var onRetry: ((String) -> Void)?
     var onDiscard: ((String) -> Void)?
+    /// Build 46 mentions: this account's id, a mentioned user's label (the contact book's rule,
+    /// never the text the sender typed), whether a sender's @everyone counts, and opening a
+    /// mentioned person's profile.
+    var me: String?
+    var mentionLabel: ((String) -> String)?
+    var everyoneAllowed: ((String?) -> Bool)?
+    var onOpenProfile: ((String) -> Void)?
+    /// Who may be @mentioned here: (user id, shown name, username — what the token says).
+    var mentionable: [MentionCandidate] = []
+    /// Who may show as typing here (`TypingAudience`): the DM's peer, the group's held members,
+    /// the channel's server members. Empty = nobody.
+    var typingFrom: Set<String> = []
 }
 
 private struct MessageExtrasKey: EnvironmentKey {

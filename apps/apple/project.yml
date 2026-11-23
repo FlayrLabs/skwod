@@ -18,7 +18,7 @@ settings:
   base:
     SWIFT_VERSION: "5.0"
     MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "45"
+    CURRENT_PROJECT_VERSION: "47"
     ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     # --- build-time switches (docs/APPLE.md) -------------------------------------------------
     # Blind push gateway base URL (https://…). Empty = remote push disabled; the app then only
@@ -151,6 +151,8 @@ targets:
       - path: Sources/WorkspaceIsolation.swift
       # Whose wake it is, whether it may interrupt, how often a host may be dialed (Foundation only).
       - path: Sources/WakeRules.swift
+      # Build 46: who a message mentions, from inside the decrypted text.
+      - path: Sources/Mentions.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: com.skwod.app.NotificationService
@@ -206,6 +208,17 @@ targets:
       - path: Sources/WakeRules.swift
       # How long a hold has left, and what "Waiting to restore" says (contested: no countdown).
       - path: Sources/HoldCountdown.swift
+      # Build 46: what the log-in form accepts (no code to log in), what a refused session
+      # means (never a silent sign-out), and one entry per skwod and account.
+      - path: Sources/LoginEntry.swift
+      - path: Sources/SessionRefusal.swift
+      - path: Sources/WorkspaceDedupe.swift
+      - path: Sources/MenuRules.swift
+      - path: Sources/TypingRules.swift
+      - path: Sources/Mentions.swift
+      # Build 47: who is in a voice room, and a left server staying gone.
+      - path: Sources/VoiceRoster.swift
+      - path: Sources/LeaveRules.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.skwod.logic-tests

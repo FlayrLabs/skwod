@@ -44,6 +44,12 @@ struct Workspace: Codable, Identifiable, Hashable {
     /// knows WHICH skwod a contentless push is about — and no other skwod can claim the wake.
     /// It says nothing about the user or the skwod. nil until the first registration.
     var wakeTag: String? = nil
+    /// The user named this entry themselves ("Rename…"): a name learned from the skwod never
+    /// replaces it. (Optional so earlier workspaces still decode.)
+    var nameSetByUser: Bool? = nil
+    /// `name` is the skwod's own name as its owner set it on the host (`/api/instance/name`).
+    /// Wins over a name guessed from its servers; a name the user set wins over both.
+    var nameFromHost: Bool? = nil
 
     /// The server ended this workspace's session (it answered 401): the token was dropped and
     /// the user has to log in again. Everything else — keys, cache, the pinned server identity —
@@ -64,7 +70,28 @@ struct Workspace: Codable, Identifiable, Hashable {
     /// The name to show in headers/tiles. `name` is only ever the auto-default today, so always
     /// re-derive from the address — this keeps one source of truth and picks up naming fixes even
     /// for workspaces whose stored name predates them.
-    var displayName: String { Workspace.defaultName(for: server) }
+    ///
+    /// Build 46: a name learned from the skwod itself (its first server's name, `learnName`) wins
+    /// over the address-derived default — every p2p skwod used to be called "My skwod", so two
+    /// entries (or two friends' skwods) were indistinguishable in the rail.
+    var displayName: String {
+        let learned = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !learned.isEmpty, !Workspace.isDefaultName(learned) { return learned }
+        return Workspace.defaultName(for: server)
+    }
+
+    /// What no server can fake, shown beside the name: the host key's short form for a p2p
+    /// skwod (as safety numbers are compared), the domain for a classic server.
+    var identityCue: String {
+        if let nodeId { return String(nodeId.prefix(4)).uppercased() + "…" + String(nodeId.suffix(4)).uppercased() }
+        return URL(string: server)?.host ?? server
+    }
+
+    /// The names `defaultName` hands out (never a name the skwod told us).
+    static func isDefaultName(_ s: String) -> Bool {
+        ["my skwod", "skwod"].contains(s.lowercased())
+    }
+
 
     /// A short deterministic slug for a server URL, used for the id and cache filename.
     static func slug(for server: String) -> String {

@@ -118,6 +118,7 @@ struct DMChatView: View {
             notice: hold != .none ? AnyView(heldBanner) : (shown.badge == .none || shown.badge == .verified ? nil : AnyView(unverifiedBanner)),
             composingBanner: composingBanner,
             onCancelCompose: { if editing != nil { draft = "" }; replyingTo = nil; editing = nil },
+            conversationId: convo.conversationId,
             headerActions: {
                 AnyView(
                     HStack(spacing: 10) {
@@ -154,7 +155,15 @@ struct DMChatView: View {
             onReport: { msg in reporting = ReportTarget(userId: convo.peerUserId, name: convo.name, messageText: msg.body.isEmpty ? nil : msg.body, serverId: nil) },
             onBlock: { _ in blocking = ReportTarget(userId: convo.peerUserId, name: convo.name) },
             onRetry: { Outbox.retry(app, localId: $0) },
-            onDiscard: { Outbox.discard(app, localId: $0) }))
+            onDiscard: { Outbox.discard(app, localId: $0) },
+            // Build 46: "@" suggests the peer here too (no @everyone in a direct conversation);
+            // mentions render with the contact book's label and open the person's card.
+            me: app.session?.userId,
+            mentionLabel: { uid in uid == convo.peerUserId ? shown.text : app.contacts.authorLabel(uid, claimedName: nil) },
+            everyoneAllowed: { _ in false },
+            mentionable: BlockList.shared.contains(convo.peerUserId) || convo.peerUserId.isEmpty
+                ? [] : [(userId: convo.peerUserId, name: shown.text, username: convo.name)],
+            typingFrom: convo.peerUserId.isEmpty ? [] : [convo.peerUserId]))
         .task(id: convo.conversationId) { await load() }
         // Queued / delivered / failed, or a block: redraw from the cache.
         .onReceive(NotificationCenter.default.publisher(for: .skwodOutboxChanged)) { _ in Task { await reloadFromCache() } }
@@ -375,7 +384,7 @@ struct DMChatView: View {
                                attachment: parsed.attachment, music: parsed.music,
                                replyToId: m.replyToId, replyPreview: replyPreview,
                                isEdited: m.isEdited, isDeleted: m.isDeleted,
-                               sendState: mine ? sendStates[m.messageId] : nil)
+                               sendState: mine ? sendStates[m.messageId] : nil, mentions: ChatTags.mentions(m.content ?? ""))
         }
     }
 

@@ -179,6 +179,8 @@ async fn voice_token(
     let room = format!("{ROOM_PREFIX}{channel_id}");
     let now_secs = now_ms() / 1000;
     let token = sign_jwt(&api_key, &api_secret, &room, &auth.user_id, now_secs, can_publish);
+    // Someone is about to join: the voice-state list looks at the room now (`voice_state.rs`).
+    state.voice_states.token_minted(now_ms());
     // Include the SFU URL so the client knows where to connect (it isn't surfaced anywhere else).
     let url = livekit_url(&state).await?;
     // `tunnel`: the caller is on the p2p transport and the SFU is the host's local one — it must
@@ -371,7 +373,7 @@ async fn cancel_ring(State(state): State<AppState>, auth: AuthUser, Path(channel
 }
 
 /// The LiveKit HTTP API base for a signaling URL (`ws://h:p` → `http://h:p`).
-fn livekit_http_base(ws_url: &str) -> Option<String> {
+pub(crate) fn livekit_http_base(ws_url: &str) -> Option<String> {
     let rest = ws_url.strip_prefix("ws://").map(|r| format!("http://{r}")).or_else(|| ws_url.strip_prefix("wss://").map(|r| format!("https://{r}")))?;
     Some(rest.trim_end_matches('/').to_string())
 }
@@ -381,7 +383,9 @@ fn livekit_http_base(ws_url: &str) -> Option<String> {
 /// the short token TTL are the backstops; this just makes the cut immediate, and is the only cut
 /// for members connected to an external (non-tunnelled) SFU.
 pub async fn evict_from_server_rooms(state: &AppState, server_id: &str, user_id: &str) {
-    let (Ok(Some((api_key, api_secret))), Ok(Some(url))) = (livekit_creds(state).await, livekit_url(state).await) else { return };
+    // Whoever is evicted leaves the rooms' lists at the next look — which is now.
+    state.voice_states.nudge();
+    let Some((api_key, api_secret, url)) = livekit_admin(state).await else { return };
     let Some(base) = livekit_http_base(&url) else { return };
     let channels: Vec<String> = sqlx::query_scalar("SELECT id FROM channels WHERE server_id = $1 AND type = 'voice'")
         .bind(server_id)
@@ -389,21 +393,9 @@ pub async fn evict_from_server_rooms(state: &AppState, server_id: &str, user_id:
         .await
         .unwrap_or_default();
     let Ok(http) = reqwest::Client::builder().timeout(std::time::Duration::from_secs(5)).build() else { return };
-    let now_secs = now_ms() / 1000;
     for channel_id in channels {
         let room = format!("{ROOM_PREFIX}{channel_id}");
-        let claims = json!({
-            "iss": api_key, "sub": "skwod-server", "iat": now_secs, "nbf": now_secs, "exp": now_secs + 60,
-            "video": { "room": room, "roomAdmin": true },
-        });
-        let signing_input = format!(
-            "{}.{}",
-            B64URL.encode(serde_json::to_vec(&json!({ "alg": "HS256", "typ": "JWT" })).unwrap_or_default()),
-            B64URL.encode(serde_json::to_vec(&claims).unwrap_or_default())
-        );
-        let Ok(mut mac) = <Hmac<Sha256> as Mac>::new_from_slice(api_secret.as_bytes()) else { return };
-        mac.update(signing_input.as_bytes());
-        let admin = format!("{signing_input}.{}", B64URL.encode(mac.finalize().into_bytes()));
+        let admin = admin_token(&api_key, &api_secret, json!({ "room": room, "roomAdmin": true }));
         // 404 (not in the room) is the common, fine outcome.
         let _ = http
             .post(format!("{base}/twirp/livekit.RoomService/RemoveParticipant"))
@@ -412,6 +404,29 @@ pub async fn evict_from_server_rooms(state: &AppState, server_id: &str, user_id:
             .send()
             .await;
     }
+}
+
+/// LiveKit API key, secret and signaling URL, when voice is configured (and, for the managed
+/// LiveKit, currently up).
+pub(crate) async fn livekit_admin(state: &AppState) -> Option<(String, String, String)> {
+    let (key, secret) = livekit_creds(state).await.ok()??;
+    let url = livekit_url(state).await.ok()??;
+    Some((key, secret, url))
+}
+
+/// A one-minute server-side token for the LiveKit room service carrying `grant` (e.g.
+/// `{"roomList": true}` or `{"room": …, "roomAdmin": true}`).
+pub(crate) fn admin_token(api_key: &str, api_secret: &str, grant: Value) -> String {
+    let now_secs = now_ms() / 1000;
+    let claims = json!({ "iss": api_key, "sub": "skwod-server", "iat": now_secs, "nbf": now_secs, "exp": now_secs + 60, "video": grant });
+    let signing_input = format!(
+        "{}.{}",
+        B64URL.encode(serde_json::to_vec(&json!({ "alg": "HS256", "typ": "JWT" })).unwrap_or_default()),
+        B64URL.encode(serde_json::to_vec(&claims).unwrap_or_default())
+    );
+    let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(api_secret.as_bytes()).expect("hmac takes any key length");
+    mac.update(signing_input.as_bytes());
+    format!("{signing_input}.{}", B64URL.encode(mac.finalize().into_bytes()))
 }
 
 #[cfg(test)]

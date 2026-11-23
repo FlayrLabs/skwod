@@ -41,6 +41,7 @@ mod storage;
 mod structure;
 mod updates;
 mod voice;
+mod voice_state;
 mod ws;
 
 mod problems;
@@ -58,6 +59,10 @@ mod content_tests;
 mod audit_tests;
 #[cfg(test)]
 mod audit2_tests;
+#[cfg(test)]
+mod build46_tests;
+#[cfg(test)]
+mod build47_tests;
 
 use clap::{Parser, Subcommand};
 use sqlx::any::AnyPoolOptions;
@@ -364,6 +369,8 @@ async fn run(data: PathBuf, listen: String, database_url: Option<String>, admin_
     }
     let app = api::router(state.clone());
     let _retention = retention::spawn(state.clone());
+    // Who is in which voice room, from LiveKit's room service (`voice_state.rs`).
+    let _voice_states = voice_state::spawn(state.clone());
     // A local copy of the database every day, seven kept (SQLite only; `hostbackup.rs`).
     let _snapshots = database_url.as_deref().is_none_or(|u| !u.starts_with("postgres")).then(|| hostbackup::spawn_snapshots(data.clone()));
 

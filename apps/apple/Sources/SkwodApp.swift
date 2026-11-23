@@ -67,6 +67,9 @@ final class AppState: ObservableObject {
     /// This account already has a device, so this one must be linked from it (or the account
     /// restored / reset) before it can do anything encrypted. Drives `DeviceLinkSheet`.
     @Published var needsDeviceLink = false
+    /// The skwod (workspace id) whose host is newer than this app: it refuses what this build
+    /// sends (426 / an unbindable session). Drives `HostNewerBanner` — never a sign-out.
+    @Published var hostNewerWorkspaceId: String?
     /// nil = not yet checked; true/false = may use the app. Always true unless the build opts into
     /// the paywall (`SKWOD_PAYWALL`, off by default — see docs/APPLE.md).
     @Published var entitled: Bool?
@@ -114,6 +117,8 @@ final class AppState: ObservableObject {
     var inboxTask: Task<Void, Never>?
     /// Live WebSocket relay for the active workspace: instant presence + message notifications.
     let realtime = Realtime()
+    /// Who is typing in the open conversation (build 46).
+    let typing = TypingCenter()
     /// E2EE avatars (profile pics, server icons, skwod icons) for the active workspace.
     let avatars = AvatarStore()
     /// Who is waiting to be let into each server of the active workspace (join requests + members
@@ -150,6 +155,7 @@ final class AppState: ObservableObject {
         // Everything the live connection reports drives a refresh somewhere (LiveSync.swift).
         realtime.onEvent = { [weak self] topic, event, payload in self?.realtimeEvent(topic: topic, event: event, payload: payload) }
         realtime.onConnected = { [weak self] in self?.realtimeConnected() }
+        typing.attach(self)
         nestedCancellable = avatars.objectWillChange
             .sink { [weak self] in self?.objectWillChange.send() }
         waiting.bind(self)
@@ -244,6 +250,8 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Who is in each server's voice room (build 47; `VoiceRoster`, fed by `voice_state`).
+    @Published var voiceRoster = VoiceRoster()
     @Published var activeCall: CallTarget? {
         didSet {
             if activeCall == nil, oldValue != nil {
@@ -471,7 +479,8 @@ final class AppState: ObservableObject {
             } catch _ where !holds(asked) {
                 return
             } catch CoreError.UpdateRequired(let detail) {
-                securityNotice = SecurityAlert(title: "Update required", message: detail)
+                hostNewerWorkspaceId = current?.id
+                Log.app.info("register refused, update required: \(detail, privacy: .public)")
             } catch CoreError.LinkRequired {
                 // A session token alone can't add a device: link it, restore it, or reset.
                 needsDeviceLink = true
@@ -616,9 +625,103 @@ final class AppState: ObservableObject {
         #if os(macOS)
         await HostManager.shared.attach(self)   // the local server may have had to move to another port
         #endif
+        dropDeadDuplicates()
+        // …and on every load.
+        let checked = Workspace.revalidatingNames(workspaces)
+        if checked != workspaces { workspaces = checked; WorkspaceStore.save(workspaces) }
         guard !workspaces.isEmpty else { return }
-        let target = workspaces.first(where: { $0.id == WorkspaceStore.currentId }) ?? workspaces[0]
+        var target = workspaces.first(where: { $0.id == WorkspaceStore.currentId }) ?? workspaces[0]
+        // A skwod whose session ended is not where the app opens when another one is signed in:
+        // its tile says "Log in again" instead of the whole app becoming a log-in screen.
+        if target.isSignedOut, let live = workspaces.first(where: { !$0.isSignedOut }) { target = live }
         await activate(target)
+    }
+
+    /// A signed-out copy of a skwod + account that also has a signed-in entry (made by an older
+    /// build joining the same host twice) leaves the LIST. Its files stay on disk; the signed-in
+    /// entry is untouched.
+    private func dropDeadDuplicates() {
+        let drop = WorkspaceDedupe.droppableAtLaunch(workspaces.map(\.dedupeEntry))
+        guard !drop.isEmpty else { return }
+        workspaces.removeAll { drop.contains($0.id) }
+        WorkspaceStore.save(workspaces)
+        Log.app.info("dropped \(drop.count, privacy: .public) signed-out duplicate skwod entr(y/ies)")
+    }
+
+    /// Remember what a skwod calls itself (its oldest server's name) as the entry's name, so the
+    /// rail and headers stop showing the generic "My skwod". Never over a name the user set, and
+    /// only a name that passes `SkwodNameRule` (cleaned, capped, not a look-alike of another
+    /// entry's name or a reserved label). The host key is shown beside it regardless.
+    func learnName(_ learned: String, for workspaceId: String) {
+        guard let w = workspaces.first(where: { $0.id == workspaceId }), w.nameSetByUser != true, w.nameFromHost != true else { return }
+        let others = workspaces.filter { $0.id != workspaceId }.map(\.displayName)
+        guard let n = SkwodNameRule.acceptLearned(learned, otherNames: others), w.name != n else { return }
+        var updated = w
+        updated.name = n
+        store(updated)
+    }
+
+    /// The skwod's name as its owner set it on the host (build 46; an older host answers 404 and
+    /// nothing changes). Cleaned and checked like any learned name; a name the user set wins.
+    func refreshInstanceName() async {
+        guard let w = current, !w.isSignedOut, let token = session?.token,
+              let base = URL(string: liveBase), !liveBase.isEmpty else { return }
+        var req = URLRequest(url: base.appendingPathComponent("api/instance/name"))
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              var fresh = workspaces.first(where: { $0.id == w.id }), fresh.nameSetByUser != true else { return }
+        let others = workspaces.filter { $0.id != w.id }.map(\.displayName)
+        if let raw = obj["name"] as? String, let accepted = SkwodNameRule.acceptLearned(raw, otherNames: others) {
+            guard fresh.name != accepted || fresh.nameFromHost != true else { return }
+            fresh.name = accepted
+            fresh.nameFromHost = true
+        } else if fresh.nameFromHost == true {
+            // The owner cleared it (or it no longer passes): back to the address-derived name.
+            fresh.name = Workspace.defaultName(for: fresh.server)
+            fresh.nameFromHost = nil
+        } else {
+            return
+        }
+        store(fresh)
+    }
+
+    /// The owner sets the skwod's name on the host (signed by this device through the core).
+    /// Returns a sentence when it failed.
+    func setInstanceName(_ raw: String) async -> String? {
+        guard client != nil else { return "Not connected — try again in a moment." }
+        return await InstanceNameSetter.set(raw, app: self)
+    }
+
+    /// "Rename…" on this device: the user's own label for a skwod (the skwod itself has no name
+    /// the server keeps — `/api/instance/identity` carries only its id and key).
+    func renameLocally(_ workspaceId: String, to raw: String) {
+        guard var w = workspaces.first(where: { $0.id == workspaceId }) else { return }
+        let cleaned = String(String.UnicodeScalarView(raw.unicodeScalars.filter { !WaitingTrust.isInvisible($0) }))
+            .split(whereSeparator: \.isWhitespace).joined(separator: " ").prefix(SkwodNameRule.maxLength)
+        if cleaned.isEmpty {
+            w.name = Workspace.defaultName(for: w.server); w.nameSetByUser = nil
+        } else {
+            w.name = String(cleaned); w.nameSetByUser = true
+        }
+        store(w)
+    }
+
+    /// Entries that are the same skwod and account as another entry (the rail offers to remove one).
+    var duplicateWorkspaceIds: Set<String> { WorkspaceDedupe.duplicated(workspaces.map(\.dedupeEntry)) }
+
+    /// "Remove this duplicate": the record leaves this device's list and its session is revoked.
+    /// Keys, cache and messages on disk are not deleted. Only for an entry that HAS a duplicate.
+    func removeDuplicate(_ w: Workspace) async {
+        guard duplicateWorkspaceIds.contains(w.id) else { return }
+        if !w.isSignedOut { revokeSession(w, base: w.id == current?.id ? liveBase : nil) }
+        let wasCurrent = current?.id == w.id
+        workspaces.removeAll { $0.id == w.id }
+        WorkspaceStore.save(workspaces)
+        if wasCurrent, let next = workspaces.first(where: { !$0.isSignedOut }) ?? workspaces.first {
+            await activate(next)
+        }
     }
 
     /// Make `w` the active workspace (binding its client + cache). For a p2p host this dials the
@@ -683,9 +786,11 @@ final class AppState: ObservableObject {
         startInboxSync()
         if let base {
             // Live relay: instant presence flips + message notifications for this workspace.
+            realtime.mentionWorkspaceId = w.id
             realtime.configure(baseUrl: base, token: w.token, userId: w.userId, status: effectiveStatus)
             await avatars.loadIfNeeded()
             await refreshServerCreatePermission()
+            await refreshInstanceName()
         } else {
             realtime.disconnect()
             scheduleReconnect(w)
@@ -812,27 +917,43 @@ final class AppState: ObservableObject {
                     // this is the slow safety net behind those: every 30 s, or right away while
                     // there is no live socket to tell us.
                     if tick % 6 == 0 || !self.realtime.isLive {
+                        var bound = false
                         do {
                             // Bound before anything else (a bind that could not reach the
                             // server at launch is done here; a no-op once it has been).
-                            _ = try await client.bindSession()
+                            bound = try await client.bindSession()
                             _ = try await client.processControlInbox(myUserId: me)
                             failures = 0
+                            if self.hostNewerWorkspaceId == self.current?.id { self.hostNewerWorkspaceId = nil }
                             await self.drainDmEvents()
                             await self.surfaceSecurityNotices()
-                        } catch CoreError.UpdateRequired(let detail) {
-                            failures = 0
-                            self.enqueueNotice(SecurityAlert(title: "Update required", message: detail))
                         } catch {
                             // Removed, superseded, or a restore still waiting: its screen is up.
                             if await self.routeIfDeviceError(error) { return }
-                            // Not necessarily "unreachable": ask. A server that answers 401 has
-                            // signed us out, and retrying forever behind a "reconnecting" label
-                            // would never say so.
                             failures += 1
-                            if await client.sessionState() == .signedOut, let w = self.current {
-                                await self.handleSignedOut(w)
-                                return
+                            // What the refusal means (`SessionRefusal`): never a silent sign-out,
+                            // never a wipe. Only a 401 on /api/auth/me ends the session, and then
+                            // for this skwod only, with its log-in screen saying so.
+                            var updateRequired = false
+                            if case CoreError.UpdateRequired = error { updateRequired = true }
+                            let signedOut = updateRequired ? false : await client.sessionState() == .signedOut
+                            let decision = SessionRefusal.decide(.init(
+                                errorText: String(describing: error), updateRequired: updateRequired,
+                                sessionSignedOut: signedOut, isRegisteredDevice: self.deviceId != nil,
+                                bindSucceeded: bound))
+                            Log.app.info("sync refused: \(String(describing: decision), privacy: .public)")
+                            switch decision {
+                            case .signedOut:
+                                if let w = self.current { await self.handleSignedOut(w); return }
+                            case .updateApp:
+                                failures = 0
+                                self.hostNewerWorkspaceId = self.current?.id
+                            case .linkDevice:
+                                self.needsDeviceLink = true
+                            case .deviceStopped:
+                                await self.routeDeviceState()
+                            case .bindThenRetry, .transient:
+                                break
                             }
                         }
                     }
@@ -930,8 +1051,10 @@ final class AppState: ObservableObject {
         } else if let claimed = workspaces.first(where: {
             (reportedInstanceId != nil && $0.instanceId == reportedInstanceId) || $0.id == Workspace.slug(for: stored)
         }) {
-            // Never cross-match a p2p address onto a different p2p skwod.
-            let crossesNode = claimed.nodeId != nil && claimed.nodeId != address.nodeId
+            // Never cross-match a p2p address onto a different p2p skwod. (A p2p skwod reached
+            // through its https address IS the same skwod once its pinned key is proven: before
+            // build 46 that made a second entry for it.)
+            let crossesNode = claimed.nodeId != nil && address.nodeId != nil && claimed.nodeId != address.nodeId
             let proven: Bool
             if let pinned = claimed.pinnedKey {
                 proven = await proves(liveBase, pinned)
@@ -955,7 +1078,10 @@ final class AppState: ObservableObject {
         // A key that was pinned STAYS pinned. `existing` is only ever set on proof (the p2p
         // node id authenticated by the transport, or a pinned-key challenge above), so what this
         // login presents can never replace the pin of a workspace it did not prove.
-        var w = Workspace(server: stored, userId: s.userId, token: s.token, expiresAt: s.expiresAt,
+        // A p2p skwod logged into through its https address keeps its p2p address (the key is
+        // its identity); the https one is not stored from a login.
+        let keepsP2P = address.nodeId == nil && existing?.nodeId != nil
+        var w = Workspace(server: keepsP2P ? existing!.server : stored, userId: s.userId, token: s.token, expiresAt: s.expiresAt,
                           name: existing?.name ?? Workspace.defaultName(for: stored),
                           localId: localId, instanceId: existing?.instanceId ?? sameSkwod?.instanceId ?? reportedInstanceId,
                           pinnedKey: existing?.pinnedKey ?? sameSkwod?.pinnedKey ?? identity?.serverPublic)
@@ -966,12 +1092,18 @@ final class AppState: ObservableObject {
             // Never from the invite's `?u=` (anyone can write one into a link): only what the
             // host's signed address record told us earlier.
             w.fallbackURL = existing?.fallbackURL ?? sameSkwod?.fallbackURL
+        } else if keepsP2P, let existing {
+            w.nodeId = existing.nodeId
+            w.fallbackURL = existing.fallbackURL
         }
         w.addressTs = existing?.addressTs ?? sameSkwod?.addressTs
         w.wakeTag = existing?.wakeTag
+        w.nameSetByUser = existing?.nameSetByUser
+        w.nameFromHost = existing?.nameFromHost
         // Replace any existing workspace for the same skwod (re-login / moved).
         workspaces.removeAll { $0.id == w.id }
         workspaces.append(w)
+        workspaces = Workspace.revalidatingNames(workspaces)
         WorkspaceStore.save(workspaces)
         // Remember the address (no secrets, no join code) so it survives sign-out for a one-tap
         // log back in.
@@ -1019,9 +1151,10 @@ final class AppState: ObservableObject {
 
     /// Replace the stored copy of a workspace (same id) and persist.
     private func store(_ updated: Workspace) {
-        workspaces = workspaces.map { $0.id == updated.id ? updated : $0 }
+        // Names are re-checked on every save: one accepted earlier may now clash.
+        workspaces = Workspace.revalidatingNames(workspaces.map { $0.id == updated.id ? updated : $0 })
         WorkspaceStore.save(workspaces)
-        if current?.id == updated.id { current = updated }
+        if let c = current, let fresh = workspaces.first(where: { $0.id == c.id }) { current = fresh }
     }
 
     #if os(macOS)
@@ -1341,6 +1474,11 @@ final class AppState: ObservableObject {
         signOut(of: [w])
     }
 
+    /// Sign out of one skwod (its tile's menu) — the same as `leaveCurrent` for any entry.
+    func signOut(_ w: Workspace) {
+        if w.id == current?.id { leaveCurrent() } else { signOut(of: [w]) }
+    }
+
     private func signOut(of targets: [Workspace]) {
         let liveId = current?.id
         for w in targets where !w.isSignedOut {
@@ -1590,6 +1728,7 @@ struct SkwodApp: App {
             root
                 .environmentObject(app)
                 .environmentObject(updater)
+                .environment(\.typingCenter, app.typing)
                 .preferredColorScheme(.dark)
                 .tint(.skAccent)
                 .windowGlass()   // translucent macOS window — desktop shows through the glass
@@ -1632,7 +1771,7 @@ struct SkwodApp: App {
                     // Center): the server is told, so it pushes instead of trusting the socket.
                     app.pushPhase(phase == .active ? .active : phase == .background ? .background : .inactive)
                     #endif
-                    if phase == .active { appLock.didBecomeActive(); Task { await app.enterForeground() } }
+                    if phase == .active { appLock.didBecomeActive(); MentionBadges.reload(); Task { await app.enterForeground() } }
                     // Looking at a chat again: what Notification Center holds about it is read.
                     if phase == .active, let topic = app.realtime.focusedTopic { app.realtime.clearDelivered(topic: topic) }
                     if phase == .background { appLock.didEnterBackground(); app.enterBackground() }

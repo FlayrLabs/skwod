@@ -9,6 +9,23 @@ struct CallTarget: Identifiable, Equatable {
     var id: String { serverId }
 }
 
+/// Who is speaking in the call THIS device is in (build 47): the green ring around a name in
+/// the sidebar's voice list. Nobody else's call is known here — the server never sees speech.
+@MainActor
+final class VoiceSpeaking: ObservableObject {
+    static let shared = VoiceSpeaking()
+    /// The server whose call this is, and the user ids speaking in it.
+    @Published private(set) var serverId = ""
+    @Published private(set) var speaking: Set<String> = []
+
+    func update(serverId: String, speaking: Set<String>) {
+        if self.serverId != serverId { self.serverId = serverId }
+        if self.speaking != speaking { self.speaking = speaking }
+    }
+
+    func isSpeaking(_ userId: String, in serverId: String) -> Bool { self.serverId == serverId && speaking.contains(userId) }
+}
+
 /// A call that is ringing: which server's voice room, and what to call it on screen.
 struct IncomingCall: Equatable {
     let serverId: String

@@ -70,8 +70,8 @@ pub(crate) fn waiting_room_allows(method: &Method, path: &str, user_id: &str) ->
     }
     // Read-only, and about the caller or the instance only: has it been let in yet, which
     // instance is this, what the app needs to draw an (empty) home screen without errors.
-    // The instance routes are named one by one: `/api/instance/p2p` (the LAN-discovery key)
-    // and the server-creator list are for members.
+    // The instance routes are named one by one: `/api/instance/p2p` (the LAN-discovery key),
+    // the server-creator list and the skwod's name (`/api/instance/name`) are for members.
     const INSTANCE: &[&str] = &["identity", "address-record", "owner-attestation", "can-create-servers", "limits", "local-proof"];
     get && (path == "/api/servers"
         || path == "/api/dms"
@@ -120,6 +120,7 @@ mod tests {
             (Method::POST, "/api/some/route/added/later"),
             (Method::GET, "/api/instance/p2p"),
             (Method::GET, "/api/instance/server-creators"),
+            (Method::GET, "/api/instance/name"),
             (Method::GET, "/api/instance/added-later"),
         ] {
             assert!(!waiting_room_allows(&method, path, me), "{method} {path} should be closed");

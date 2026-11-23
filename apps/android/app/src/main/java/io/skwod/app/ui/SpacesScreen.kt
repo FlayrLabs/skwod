@@ -4,6 +4,7 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.clickable
+import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
@@ -158,6 +159,37 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
     }
 
     var attachMenu by remember { mutableStateOf(false) }
+    // A picture pasted from the clipboard: previewed (and removable) until Send.
+    // It belongs to this channel only ([StagingRule]).
+    var pasted by remember(space.channelId) { mutableStateOf<PastedImage?>(null) }
+    val onScreen by rememberUpdatedState(space.channelId)
+    val clipHasImage = rememberClipboardHasImage()
+    // @mentions: who was picked in the composer (user id → the "@name" inserted), the server's
+    // pinned owner (whose @everyone counts), and how a mentioned account is named here.
+    val mentionPicks = remember { mutableStateListOf<Pair<String, String>>() }
+    var pinnedOwner by remember { mutableStateOf<String?>(null) }
+    LaunchedEffect(space.serverId) { pinnedOwner = model.pinnedServerOwner(space.serverId); model.refreshEveryoneSenders(space.serverId) }
+    // Whose @everyone counts here: the pinned owner and the server's admins ([Mentions.everyoneSenders]).
+    val everyoneAllowed = model.everyoneSenders[space.serverId] ?: emptySet()
+    // Opening the channel clears its "@ n" (and again whenever a mention lands while it is open).
+    LaunchedEffect(space.channelId, model.mentionCount(listOf("channel:${space.channelId}"))) { model.clearMentionBadges("channel:${space.channelId}") }
+    val mentionName: (String, String) -> String = { uid, typed ->
+        if (uid == model.session?.userId) (model.current?.username ?: "you")
+        else model.contacts.shown(uid, memberNames[uid] ?: typed).label
+    }
+    /** The draft as it goes out: the picks still in it ride along, invisibly ([Mentions]). */
+    fun withMentions(text: String): String {
+        val everyone = Regex("(^|\\s)@everyone(\\b|$)").containsMatchIn(text)
+        return Mentions.encode(text, Mentions.locate(text, mentionPicks.toList()), everyone)
+    }
+    // "I'm typing" at most every few seconds, never for an empty composer ([TypingState]).
+    var lastTyping by remember { mutableLongStateOf(0L) }
+    fun announceTyping(text: String) {
+        val now = System.currentTimeMillis()
+        if (TypingState.mayAnnounce(model.settings.typingIndicators, text, lastTyping, now)) {
+            lastTyping = now; model.realtime.sendTyping("channel:${space.channelId}")
+        }
+    }
 
     var showMusic by remember { mutableStateOf(false) }
 
@@ -386,10 +418,14 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
                     onRetry = { Outbox.retry(model, it) },
                     onDiscard = { Outbox.discard(model, it, "channel:${space.channelId}", m.messageId) },
                 )
+                val myId = model.session?.userId ?: ""
+                val replyToMine = m.replyToId?.let { id -> visible.firstOrNull { it.messageId == id }?.authorId }?.let { it == "__me__" || it == myId } == true
+                val mentionsMe = !mine && Mentions.mentionsMe(ChatTags.parse(m.content ?: "").mentions, myId, m.authorId,
+                    everyoneHonoured = Mentions.everyoneHonoured(m.authorId, everyoneAllowed, pinnedOwner), replyToMine = replyToMine)
                 MessageRow(author, m.content ?: "", mine, m.createdAt, grouped, authorId,
                     isEdited = m.isEdited, isDeleted = m.isDeleted, replyPreview = replyPreview,
                     reactions = reactionsByMsg[m.messageId] ?: emptyList(), actions = actions, nameTrust = shownAuthor,
-                    sendState = if (mine) sendStates[m.messageId] else null)
+                    sendState = if (mine) sendStates[m.messageId] else null, mentionsMe = mentionsMe, mentionName = mentionName)
             }
         }
         // Reply / edit banner above the composer, with a cancel.
@@ -402,6 +438,49 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
             }
         }
         sendError?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(4.dp)) }
+        // Typing "@…": the members whose names match, to insert as a mention.
+        Mentions.query(draft)?.let { q ->
+            // Matched on the shown label or the username; the token is the username's.
+            val matches = Mentions.matches(q, memberNames.entries.filter { (uid, _) -> uid != model.session?.userId && !model.isBlockedUser(uid) }
+                .map { (uid, name) -> Mentions.Candidate(uid, model.contacts.shown(uid, name).label, name) })
+            // @everyone is offered to those whose @everyone counts (the pinned owner and admins).
+            val offerEveryone = Mentions.everyoneHonoured(model.session?.userId, everyoneAllowed, pinnedOwner) && "everyone".startsWith(q, ignoreCase = true)
+            if (offerEveryone) Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp).clip(RoundedCornerShape(10.dp)).clickable {
+                draft = Mentions.complete(draft, "@everyone")
+            }.padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                Text("@everyone", color = SkAccent, fontSize = 14.sp, fontWeight = FontWeight.SemiBold)
+                Spacer(Modifier.width(8.dp))
+                Text("notify everyone here", color = Color.White.copy(alpha = 0.5f), fontSize = 12.sp)
+            }
+            if (matches.isNotEmpty()) Column(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) {
+                matches.forEach { c ->
+                    val uid = c.userId
+                    val shown = model.contacts.shown(uid, memberNames[uid])
+                    Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).clickable {
+                        val label = Mentions.tokenFor(c)
+                        draft = Mentions.complete(draft, label); mentionPicks.add(uid to label)
+                    }.padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                        AvatarImage(AvatarStore.userKey(uid), shown.label, size = 24)
+                        Spacer(Modifier.width(8.dp))
+                        Text(shown.label, color = Color.White, fontSize = 14.sp)
+                        NameTrustMark(shown)
+                    }
+                }
+            }
+        }
+        // Only this server's members (as listed) can show as typing here.
+        TypingLine("channel:${space.channelId}", accept = { it.isNotEmpty() && it in memberNames },
+            nameOf = { model.contacts.shown(it, memberNames[it] ?: it.take(6)).label })
+        pasted?.let { p -> PastedImagePreview(p, onRemove = { pasted = null }) }
+            ?: run { if (clipHasImage && !uploading && editing == null) PasteImageChip {
+                // Tagged with the channel it started in: a picture read after a switch is dropped.
+                val startedFor = space.channelId
+                scope.launch {
+                    val result = try { Result.success(ComposerPaste.take(ctx, model)) } catch (e: AttachmentException) { Result.failure(e) }
+                    if (!StagingRule.belongs(startedFor, onScreen)) return@launch
+                    result.onSuccess { pasted = it; sendError = null }.onFailure { sendError = it.message }
+                }
+            } }
         Row(verticalAlignment = Alignment.CenterVertically) {
             Box {
                 IconButton(onClick = { attachMenu = true }, enabled = !uploading) {
@@ -421,7 +500,7 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
                         leadingIcon = { Icon(Icons.Filled.MusicNote, null) })
                 }
             }
-            OutlinedTextField(draft, { draft = it }, placeholder = { Text("Message #${space.channelName}…", color = Color.White.copy(alpha = 0.4f)) },
+            OutlinedTextField(draft, { draft = it; announceTyping(it) }, placeholder = { Text("Message #${space.channelName}…", color = Color.White.copy(alpha = 0.4f)) },
                 modifier = Modifier.weight(1f), maxLines = 4,
                 textStyle = LocalTextStyle.current.copy(color = Color.White),
                 colors = OutlinedTextFieldDefaults.colors(
@@ -431,7 +510,14 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
                     unfocusedBorderColor = Color.White.copy(alpha = 0.15f)))
             Spacer(Modifier.width(8.dp))
             FilledIconButton(onClick = {
+                // A pasted picture goes exactly like one picked with + (stripped, encrypted, queued).
+                pasted?.takeIf { editing == null }?.let { pic ->
+                    pasted = null
+                    sendAttachment { Uploads.prepareImage(ctx, model, pic.bytes, forDm = false) }
+                }
                 val text = draft.trim(); if (text.isEmpty()) return@FilledIconButton
+                lastTyping = 0L
+                val outgoing = withMentions(text); mentionPicks.clear()
                 val replyTarget = replyingTo; val editTarget = editing
                 sendError = null; draft = ""; replyingTo = null; editing = null
                 // Nothing here waits for the network: the message is queued in the core (it is
@@ -442,8 +528,8 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
                     try {
                         if (c == null) throw IllegalStateException()
                         withContext(Dispatchers.IO) {
-                            if (editTarget != null) c.queueChannelEdit(space.channelId, editTarget.messageId, text)
-                            else c.queueChannelMessage(space.channelId, text, replyTarget?.messageId, emptyList(), emptyList())
+                            if (editTarget != null) c.queueChannelEdit(space.channelId, editTarget.messageId, outgoing)
+                            else c.queueChannelMessage(space.channelId, outgoing, replyTarget?.messageId, emptyList(), emptyList())
                         }
                         reloadLocal()
                         Outbox.kick(model, composed = true)
@@ -453,7 +539,7 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
                         sendError = OutboxPolicy.queueError((e as? uniffi.skwod_core.CoreException.Invalid)?.detail)
                     }
                 }
-            }, enabled = !sending && draft.isNotBlank(), shape = RoundedCornerShape(50)) {
+            }, enabled = !sending && (draft.isNotBlank() || (pasted != null && editing == null && !uploading)), shape = RoundedCornerShape(50)) {
                 Icon(Icons.Filled.ArrowUpward, "Send", tint = Color.Black)
             }
         }

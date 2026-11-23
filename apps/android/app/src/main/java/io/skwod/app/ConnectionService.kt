@@ -164,4 +164,9 @@ object CallState {
     val active = androidx.compose.runtime.mutableStateOf(false)
     val hangupRequests = androidx.compose.runtime.mutableIntStateOf(0)
     fun requestHangup() { hangupRequests.intValue = hangupRequests.intValue + 1 }
+    /**
+     * Who is speaking in the call THIS phone is in (build 47): (server id, user ids). The
+     * sidebar's green ring. Nobody else's call is known here — the server never sees speech.
+     */
+    val speaking = androidx.compose.runtime.mutableStateOf("" to emptySet<String>())
 }

@@ -250,6 +250,8 @@ final class AppState: ObservableObject {
         }
     }
 
+    /// Who is in each server's voice room (build 47; `VoiceRoster`, fed by `voice_state`).
+    @Published var voiceRoster = VoiceRoster()
     @Published var activeCall: CallTarget? {
         didSet {
             if activeCall == nil, oldValue != nil {

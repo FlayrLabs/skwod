@@ -243,6 +243,29 @@ object Mentions {
         return if (q.any { it.isWhitespace() } || q.length > 32) null else q
     }
 
+    /**
+     * Someone the composer may @mention: user id, the label this device shows for them
+     * ([ContactTrust]), and their username (empty when unknown).
+     */
+    data class Candidate(val userId: String, val label: String, val username: String)
+
+    /**
+     * The token inserted for [c] (build 47): built from the USERNAME — short, already in the
+     * token's characters, what people type after '@' — and only without one from the label.
+     * How the mention RENDERS is never this text: it is the label this device has for the id.
+     */
+    fun tokenFor(c: Candidate): String = token(c.username.trim().ifEmpty { c.label })
+
+    /** Candidates whose label or username starts with (then contains) [query], case-insensitively. */
+    fun matches(query: String, candidates: List<Candidate>, limit: Int = 5): List<Candidate> {
+        val q = query.lowercase()
+        fun starts(c: Candidate) = c.label.lowercase().startsWith(q) || c.username.lowercase().startsWith(q)
+        fun contains(c: Candidate) = c.label.lowercase().contains(q) || c.username.lowercase().contains(q)
+        val first = candidates.filter(::starts).sortedBy { it.label.lowercase() }
+        val then = candidates.filter { !starts(it) && contains(it) }
+        return (first + then).take(limit)
+    }
+
     /** [text] with the "@query" at its end replaced by [label] and a space. */
     fun complete(text: String, label: String): String {
         val at = text.lastIndexOf('@')

@@ -30,6 +30,7 @@ trademark of Signal Messenger, LLC.
 | libcrux (`libcrux-ml-kem`, `libcrux-sha3`, …) | Apache-2.0 |
 | curve25519-dalek, x25519-dalek, ed25519-dalek | BSD-3-Clause |
 | RustCrypto: `aes`, `cbc`, `ctr`, `aes-gcm-siv`, `chacha20poly1305`, `hmac`, `hkdf`, `sha2`, `argon2`, `subtle`, `zeroize` | MIT OR Apache-2.0 |
+| RustCrypto, server push signing (jsonwebtoken's `rust_crypto` backend): `rsa`, `p256`, `p384`, `ecdsa`, `elliptic-curve`, `primefield`, `primeorder`, `wnaf`, `rfc6979`, `sec1`, `pkcs1`, `crypto-bigint`; with `crypto-primes` (entropyxyz), `ff` and `group` (zkcrypto) | MIT OR Apache-2.0 |
 | secp256k1 (rust-secp256k1 / libsecp256k1) | CC0-1.0 / MIT |
 | SQLCipher (via `rusqlite`, bundled) | BSD-3-Clause — Copyright Zetetic LLC |
 | OpenSSL (vendored, for SQLCipher) | Apache-2.0 |
@@ -65,7 +66,7 @@ n0, inc.) when no direct path exists; see `docs/P2P.md`.
 |---|---|
 | Arti (`arti-client`, `tor-*`) — The Tor Project | MIT OR Apache-2.0 |
 | tokio, hyper, reqwest, axum, tower, tungstenite | MIT (some MIT OR Apache-2.0) |
-| jsonwebtoken, qrcode, clap, nix (server) | MIT / MIT OR Apache-2.0 |
+| jsonwebtoken, pem, qrcode, clap, nix (server) | MIT / MIT OR Apache-2.0 |
 | aws-lc-rs / aws-lc-sys | ISC AND (Apache-2.0 OR ISC) AND OpenSSL-derived terms (see the crate's LICENSE) |
 | webpki-roots, webpki-root-certs (Mozilla CA list) | CDLA-Permissive-2.0 |
 | blake3 | CC0-1.0 OR Apache-2.0 |

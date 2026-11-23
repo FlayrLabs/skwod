@@ -148,6 +148,10 @@ extension AppState {
                 // one that erased itself, and what a re-keyed device held of ours is rotated.
                 let who = payload["user_id"] as? String ?? ""
                 if who == me { Task { await accountChanged() } } else if !who.isEmpty { Task { await contactDeviceRemoved(userId: who) } }
+            case "voice_state":
+                // Who is in this server's voice room: the whole roster of one room.
+                var next = voiceRoster
+                if next.apply(topic: topic, payload: payload) { voiceRoster = next }
             case "member_joined", "member_approved", "member_removed", "channels_changed":
                 NotificationCenter.default.post(name: .skwodServerChanged, object: serverId)
                 Task {
@@ -166,6 +170,8 @@ extension AppState {
     /// was none produced no event here, so catch up once and let open screens do the same.
     func realtimeConnected() {
         NotificationCenter.default.post(name: .skwodLiveConnected, object: nil)
+        // The rosters come again with the subscriptions; nothing from before the gap is kept.
+        voiceRoster.reset()
         Task {
             // Blocks first (a block made on another device hides its subject here before
             // anything is drawn), then whatever was queued while there was no connection.

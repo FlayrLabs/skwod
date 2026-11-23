@@ -647,7 +647,7 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
         // Typing "@…": this conversation's other people whose names match, to insert as a mention.
         MentionSuggestions(draft,
             candidates = (group?.others ?: listOf(dm.peerUserId)).filter { it.isNotEmpty() && it != me && !model.isBlockedUser(it) }
-                .map { it to shownAuthor(it) },
+                .map { Triple(it, shownAuthor(it), if (group != null) group.claimedNames[it].orEmpty() else dm.name) },
             onPick = { uid, label -> draft = Mentions.complete(draft, label); mentionPicks.add(uid to label) })
         // Only this conversation's other people can show as typing here.
         TypingLine(scopeName, accept = { uid -> if (group != null) uid in group.others else uid == dm.peerUserId },

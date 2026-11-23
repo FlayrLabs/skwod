@@ -48,6 +48,8 @@ class Realtime(private val model: AppModel) {
 
     /** userId → (status, learnedAtMs); live events override polled presence for 3 minutes. */
     val presence = mutableStateOf<Map<String, Pair<String, Long>>>(emptyMap())
+    /** Who is in each server's voice room (build 47; [VoiceRoster], fed by `voice_state`). */
+    val voiceRoster = mutableStateOf(VoiceRoster())
 
     /** channelId/conversationId → display name for notification titles. */
     @Volatile var chatNames: Map<String, String> = emptyMap()
@@ -196,6 +198,8 @@ class Realtime(private val model: AppModel) {
                 // Whatever was posted while the socket was down produced no event: look for it.
                 model.launchIO { model.notifier.catchUp() }
                 model.onRealtimeConnected()
+                // The rosters come again with the subscriptions; nothing from before the gap is kept.
+                voiceRoster.value = VoiceRoster()
                 webSocket.send(JSONObject().put("type", "presence").put("status", myStatus).toString())
                 wanted.forEach { webSocket.send(JSONObject().put("type", "subscribe").put("topic", it).toString()) }
             }
@@ -290,6 +294,8 @@ class Realtime(private val model: AppModel) {
             "join_denied" -> if (mine) model.launchIO { model.joins.onDenied(payload.optString("server_id")) }
             // The server's shape changed: new channels to list, a new member to hand keys to.
             "channels_changed" -> model.launchIO { model.chat.syncServerChannels() }
+            // Who is in a voice room of this server: the whole roster of one room.
+            "voice_state" -> voiceRoster.value.apply(topic, payload)?.let { voiceRoster.value = it }
             // A server I am in was deleted, or I was removed from one: only "go and check" —
             // the list of my servers is asked again and whatever is no longer in it leaves.
             "server_deleted", "revoke" -> if (mine) model.launchIO { model.refreshServerList() }

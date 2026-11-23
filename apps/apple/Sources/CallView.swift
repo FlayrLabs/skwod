@@ -386,6 +386,7 @@ final class CallSession: NSObject, ObservableObject {
         #endif
         let room = room
         Task { await room.disconnect() }
+        VoiceSpeaking.shared.update(serverId: serverId, speaking: [])
         if CallCoordinator.shared.session === self { CallCoordinator.shared.session = nil }
         CallCoordinator.shared.callViewClosed()
     }
@@ -635,6 +636,15 @@ extension CallSession: RoomDelegate {
     nonisolated func room(_ room: Room, participant: RemoteParticipant, didSubscribeTrack publication: RemoteTrackPublication) { bump() }
     nonisolated func room(_ room: Room, participant: RemoteParticipant, didUnsubscribeTrack publication: RemoteTrackPublication) { bump() }
     nonisolated func room(_ room: Room, participant: Participant, trackPublication: TrackPublication, didUpdateIsMuted isMuted: Bool) { bump() }
+
+    /// Who is speaking — known only to a device in the call (the sidebar's green ring).
+    nonisolated func room(_ room: Room, didUpdateSpeakingParticipants participants: [Participant]) {
+        let ids = Set(participants.compactMap { $0.identity?.stringValue })
+        Task { @MainActor [weak self] in
+            guard let self, !self.ended else { return }
+            VoiceSpeaking.shared.update(serverId: self.serverId, speaking: ids)
+        }
+    }
 
     nonisolated func room(_ room: Room, trackPublication: TrackPublication, didUpdateE2EEState state: E2EEState) {
         #if DEBUG

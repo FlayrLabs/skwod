@@ -14,7 +14,8 @@ path = "src/main.rs"
 axum = { version = "0.7", features = ["ws"] }
 # APNs delivery: HTTP/2 client + ES256 JWT provider auth (token-based, .p8 key).
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
-jsonwebtoken = "9"
+# Signing only (APNs ES256 provider token, FCM RS256 assertion); never decodes or validates a JWT.
+jsonwebtoken = { version = "12", default-features = false, features = ["use_pem", "rust_crypto"] }
 tokio = { version = "1", features = ["full"] }
 tokio-util = { version = "0.7", features = ["io"] }   # ReaderStream: stream release artifacts, don't buffer
 futures-util = "0.3"         # WebSocket sink/stream split
@@ -49,6 +50,10 @@ tower = { version = "0.5", features = ["util"] }
 http-body-util = "0.1"
 tokio-tungstenite = "0.24"   # real-socket WebSocket tests
 tempfile = "3"
+# APNs/FCM JWT tests: make an ES256 .p8 and an RS256 service-account key at test time (no key
+# material is committed) and verify the signatures independently of jsonwebtoken.
+p256 = { version = "0.14", default-features = false, features = ["ecdsa", "pkcs8", "alloc"] }
+rsa09 = { package = "rsa", version = "0.9", features = ["sha2"] }
 
 # Proof-of-work stamps (skwod-net `pow.rs`) are ~1M SHA-256 per p2p signup/login; optimize just
 # the hashing path so dev/test builds don't take seconds per stamp.
@@ -58,6 +63,9 @@ opt-level = 3
 # under load). Tests that sign up a dozen accounts or run 35 logins then outlast the timeouts
 # they are about — the pool's 30 s acquire timeout, the 60 s login window — and fail for
 # reasons that have nothing to do with what they check.
+# RSA key generation for the FCM JWT test (seconds, not minutes, in a debug build).
+[profile.dev.package.num-bigint-dig]
+opt-level = 3
 [profile.dev.package.argon2]
 opt-level = 3
 [profile.dev.package.blake2]

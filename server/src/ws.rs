@@ -11,7 +11,9 @@
 //!                    {"type":"error","message":...} · {"type":"pong"}
 //!
 //! Subscribing to your own `user:<id>` topic also replays any call still ringing for you
-//! (`ring`, payload `replay: true` — see `voice.rs`).
+//! (`ring`, payload `replay: true` — see `voice.rs`). Subscribing to a `server:<id>` topic
+//! hands over who is in that server's voice rooms right now (`voice_state`, one per non-empty
+//! room — see `voice_state.rs`).
 //!
 //! Push reachability ("is this install woken through the push gateway, or does it have the event
 //! already?") is decided here, per socket, and never by the socket merely being open:
@@ -536,6 +538,13 @@ async fn connection(state: AppState, user_id: String, session_hash: Vec<u8>, soc
                             Ok(true) => {
                                 reach.subscribe(&state, &session_hash, topic);
                                 let _ = sink.send(Message::Text(json!({"type":"subscribed","topic":topic}).to_string())).await;
+                                // A server's topic: who is in its voice rooms right now.
+                                if let Some(server_id) = topic.strip_prefix("server:") {
+                                    for payload in crate::voice_state::visible_snapshot(&state, server_id, &user_id).await {
+                                        let frame = json!({ "type": "event", "topic": topic, "event": "voice_state", "payload": payload });
+                                        let _ = sink.send(Message::Text(frame.to_string())).await;
+                                    }
+                                }
                                 // A call that started ringing before this socket existed (the
                                 // device was asleep and a push woke it) is replayed now, so
                                 // answering joins the right room. Only on the user's own topic.
@@ -723,6 +732,12 @@ async fn connection(state: AppState, user_id: String, session_hash: Vec<u8>, soc
                                 break;
                             }
                             continue;
+                        }
+                        // A voice room's roster: only for someone who may see that channel.
+                        if let Some(channel_id) = &ev.gate_channel {
+                            if !crate::voice_state::may_see(&state, &user_id, channel_id).await {
+                                continue;
+                            }
                         }
                         // Delivery ack: a socket that counts as reachable owes proof that it read
                         // this (not the author's own sockets — nobody is woken for their own

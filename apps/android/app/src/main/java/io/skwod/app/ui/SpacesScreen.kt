@@ -440,8 +440,9 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
         sendError?.let { Text(it, color = MaterialTheme.colorScheme.error, modifier = Modifier.padding(4.dp)) }
         // Typing "@…": the members whose names match, to insert as a mention.
         Mentions.query(draft)?.let { q ->
-            val matches = memberNames.entries.filter { (uid, name) -> uid != model.session?.userId && !model.isBlockedUser(uid) && name.startsWith(q, ignoreCase = true) }
-                .sortedBy { it.value }.take(5)
+            // Matched on the shown label or the username; the token is the username's.
+            val matches = Mentions.matches(q, memberNames.entries.filter { (uid, _) -> uid != model.session?.userId && !model.isBlockedUser(uid) }
+                .map { (uid, name) -> Mentions.Candidate(uid, model.contacts.shown(uid, name).label, name) })
             // @everyone is offered to those whose @everyone counts (the pinned owner and admins).
             val offerEveryone = Mentions.everyoneHonoured(model.session?.userId, everyoneAllowed, pinnedOwner) && "everyone".startsWith(q, ignoreCase = true)
             if (offerEveryone) Row(Modifier.fillMaxWidth().padding(horizontal = 4.dp).clip(RoundedCornerShape(10.dp)).clickable {
@@ -452,10 +453,11 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
                 Text("notify everyone here", color = Color.White.copy(alpha = 0.5f), fontSize = 12.sp)
             }
             if (matches.isNotEmpty()) Column(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) {
-                matches.forEach { (uid, name) ->
-                    val shown = model.contacts.shown(uid, name)
+                matches.forEach { c ->
+                    val uid = c.userId
+                    val shown = model.contacts.shown(uid, memberNames[uid])
                     Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).clickable {
-                        val label = Mentions.token(name)
+                        val label = Mentions.tokenFor(c)
                         draft = Mentions.complete(draft, label); mentionPicks.add(uid to label)
                     }.padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                         AvatarImage(AvatarStore.userKey(uid), shown.label, size = 24)

@@ -454,7 +454,7 @@ final class Build46Tests: XCTestCase {
         XCTAssertEqual(MentionAutocomplete.activeQuery(in: "@")?.query, "")
         XCTAssertNil(MentionAutocomplete.activeQuery(in: "mail@host"), "not inside a word")
         XCTAssertNil(MentionAutocomplete.activeQuery(in: "hey @sam done"))
-        let members = [(userId: "1", name: "Sam"), (userId: "2", name: "Robin"), (userId: "3", name: "Isam")]
+        let members: [MentionCandidate] = [(userId: "1", name: "Sam", username: ""), (userId: "2", name: "Robin", username: ""), (userId: "3", name: "Isam", username: "")]
         XCTAssertEqual(MentionAutocomplete.matches("sa", in: members).map(\.userId), ["1", "3"])
         var p = MentionPayload()
         let text = MentionAutocomplete.insert(name: "Sam", userId: "1", into: "hey @sa", at: 4, payload: &p)

@@ -395,9 +395,10 @@ class AppChat(private val model: AppModel) {
     }
 
     /** Forget in-memory lists when the workspace switches so the next load re-reads its cache. */
-    fun reset() { synchronized(storeLock) { park(); storeRef = null }; loadedFor = null; spacesRead = false; feedChannels.clear(); spaces.clear(); dms.clear(); selection = null; homeMode = false; touched() }
+    fun reset() { synchronized(storeLock) { park(); storeRef = null }; tombstones.clear(); loadedFor = null; spacesRead = false; feedChannels.clear(); spaces.clear(); dms.clear(); selection = null; homeMode = false; touched() }
 
     fun addSpace(s: RealSpace) {
+        if (tombstones.hides(s.serverId)) return
         if (spaces.none { it.channelId == s.channelId }) spaces.add(0, s)
         homeMode = false
         selection = SidebarItem.Space(s)
@@ -406,7 +407,7 @@ class AppChat(private val model: AppModel) {
     }
 
     private fun addSpaceQuietly(s: RealSpace) {
-        if (spaces.any { it.channelId == s.channelId }) return
+        if (spaces.any { it.channelId == s.channelId } || tombstones.hides(s.serverId)) return
         val wasEmpty = spaces.isEmpty()
         spaces.add(s); touched(); persistSpaces()
         // First channels to arrive after an empty load (re-login recovery) — open one so the skwod
@@ -416,8 +417,35 @@ class AppChat(private val model: AppModel) {
         }
     }
 
-    /** A server the user left or deleted: every channel of it goes from the list. */
+    /**
+     * Left, deleted, or no longer listed (build 47, [LeaveTombstones]): a leave in progress, or a
+     * server gone for good on this phone. Every path that adds channels asks it first.
+     */
+    val tombstones = LeaveTombstones()
+
+    /** The user confirmed Leave: the server goes NOW. Returns what to put back if it fails. */
+    fun beginLeave(serverId: String): List<RealSpace>? {
+        if (!tombstones.begin(serverId)) return null
+        val before = spaces.toList()
+        hideServer(serverId)
+        return before
+    }
+
+    /** The host refused the leave: its channels come back where they were. */
+    fun leaveFailed(serverId: String, before: List<RealSpace>) {
+        if (!tombstones.failed(serverId)) return
+        val restored = LeaveTombstones.restore(before, spaces.toList(), serverId, { it.serverId }, { it.channelId })
+        spaces.clear(); spaces.addAll(restored)
+        touched(); persistSpaces()
+    }
+
+    /** A server the user left or deleted: every channel of it goes from the list, for good. */
     fun removeServer(serverId: String) {
+        tombstones.dropped(listOf(serverId))
+        hideServer(serverId)
+    }
+
+    private fun hideServer(serverId: String) {
         spaces.removeAll { it.serverId == serverId }
         if ((selection as? SidebarItem.Space)?.space?.serverId == serverId) selection = null
         if (railServerId == serverId) railServerId = null
@@ -601,7 +629,7 @@ class AppChat(private val model: AppModel) {
             // The list is the workspace's that was asked: stop once another one is in use.
             if (model.bound !== asked) return
             val sid = srv.optString("server_id", ""); if (sid.isEmpty()) continue
-            if (spaces.any { it.serverId == sid }) continue
+            if (spaces.any { it.serverId == sid } || tombstones.hides(sid)) continue
             val asked = askForKeys(sid, srv.optString("owner_id", ""))
             discover(sid, asked.peerUserId, asked.peerDeviceId, quiet = true)
         }
@@ -618,6 +646,8 @@ class AppChat(private val model: AppModel) {
             // A server can hold its answer across a workspace switch: what it lists then is not
             // written into the other skwod's sidebar (nor subscribed to on the other's server).
             if (model.bound !== asked) return
+            // Left or deleted while that listing was in flight: it stays out.
+            if (tombstones.hides(group.serverId)) continue
             for (ch in channels) {
                 val name = ch.name ?: continue
                 if (ch.kind == "voice") continue          // the call room has its own entry, not a chat
@@ -648,6 +678,8 @@ class AppChat(private val model: AppModel) {
             if (named.isNotEmpty()) {
                 val spaceName = (try { client.serverName(serverId) } catch (_: Exception) { null }) ?: "Server"
                 if (model.bound !== asked) return false
+                // Left or deleted while this was being watched: it stays out.
+                if (tombstones.hides(serverId)) return false
                 for (ch in named) {
                     val space = RealSpace(spaceName, ch.name ?: "channel", serverId, ch.channelId)
                     if (quiet) addSpaceQuietly(space) else addSpace(space)
@@ -725,9 +757,9 @@ class AppChat(private val model: AppModel) {
             SpaceCodec.salvage(json)
         }
         if (model.bound !== bound || loadedFor != wid || spacesRead) return
-        // (Spaces joined while the list could not be read are kept.)
+        // (Spaces joined while the list could not be read are kept; a server left since is not read back.)
         val joinedMeanwhile = spaces.filter { j -> stored.none { it.channelId == j.channelId } }
-        spaces.clear(); spaces.addAll(joinedMeanwhile + stored)
+        spaces.clear(); spaces.addAll((joinedMeanwhile + stored).filter { !tombstones.hides(it.serverId) })
         spacesRead = true
         if (keptAs != null || joinedMeanwhile.isNotEmpty()) persistSpaces()
         keptAs?.let { model.account.log("spaces_unreadable", "Your list of servers could not be read",

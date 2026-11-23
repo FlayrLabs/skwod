@@ -262,10 +262,10 @@ struct SpaceChannelView: View {
             // @everyone counts from the server's PINNED owner and its admins (`EveryoneRule`).
             everyoneAllowed: { sender in chat.everyoneHonoured(sender, in: space.serverId) },
             mentionable: memberNames.filter { $0.key != app.session?.userId && !BlockList.shared.contains($0.key) }
-                .map { (userId: $0.key, name: authorLabel($0.key)) }
+                .map { (userId: $0.key, name: authorLabel($0.key), username: $0.value) }
                 .sorted { $0.name.lowercased() < $1.name.lowercased() }
                 + (chat.everyoneHonoured(app.session?.userId, in: space.serverId)
-                   ? [(userId: MentionComposer.everyoneId, name: "everyone")] : []),
+                   ? [(userId: MentionComposer.everyoneId, name: "everyone", username: "")] : []),
             typingFrom: Set(memberNames.keys)))
         .safetyActions(blocking: $blocking, reporting: $reporting)
         .onReceive(NotificationCenter.default.publisher(for: .skwodServerChanged)) { note in

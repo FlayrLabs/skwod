@@ -18,6 +18,8 @@ struct SidebarView: View {
     @State private var showVoiceSetup = false
     @State private var voiceNote: String?
     @State private var voiceChecking = false
+    /// Servers whose voice list is folded (the row then shows how many are in it).
+    @State private var voiceFolded: Set<String> = []
     /// Item-driven sheets: the space being invited into / configured (from header or row actions).
     @State private var inviteTarget: RealSpace?
     @State private var settingsTarget: RealSpace?
@@ -229,18 +231,48 @@ struct SidebarView: View {
                     Text("Voice Channels").font(.system(size: 11, weight: .semibold)).textCase(.uppercase)
                         .foregroundStyle(.secondary)
                         .padding(.horizontal, 8).padding(.top, 12).padding(.bottom, 4)
-                    Button { Task { await handleVoiceTap() } } label: {
-                        HStack(spacing: 8) {
-                            Image(systemName: "speaker.wave.2.fill").font(.system(size: 13))
-                                .foregroundStyle(Color(white: 0.6)).frame(width: 20)
-                            Text("General").font(.system(size: 14)).foregroundStyle(Color(white: 0.78))
-                            Spacer()
-                            if voiceChecking { ProgressView().controlSize(.small) }
+                    let inVoice = app.voiceRoster.participants(serverId: group.serverId, hidden: BlockList.shared.ids)
+                    let folded = voiceFolded.contains(group.serverId)
+                    HStack(spacing: 0) {
+                        Button { Task { await handleVoiceTap() } } label: {
+                            HStack(spacing: 8) {
+                                Image(systemName: "speaker.wave.2.fill").font(.system(size: 13))
+                                    .foregroundStyle(Color(white: inVoice.isEmpty ? 0.6 : 0.85)).frame(width: 20)
+                                Text("General").font(.system(size: 14)).foregroundStyle(Color(white: 0.78))
+                                Spacer()
+                                if voiceChecking { ProgressView().controlSize(.small) }
+                            }
+                            .padding(.leading, 8).padding(.trailing, inVoice.isEmpty ? 8 : 2).padding(.vertical, 7)
+                            .contentShape(Rectangle())
                         }
-                        .padding(.horizontal, 8).padding(.vertical, 7)
-                        .contentShape(Rectangle())
+                        .buttonStyle(.plain)
+                        if !inVoice.isEmpty {
+                            // Who is in it folds away; the count stays. (Beside the join button,
+                            // not inside it: folding never starts a call.)
+                            Button {
+                                if folded { voiceFolded.remove(group.serverId) } else { voiceFolded.insert(group.serverId) }
+                            } label: {
+                                HStack(spacing: 3) {
+                                    if folded {
+                                        Image(systemName: "person.2.fill").font(.system(size: 10))
+                                        Text("\(inVoice.count)").font(.system(size: 11, weight: .semibold)).monospacedDigit()
+                                    }
+                                    Image(systemName: folded ? "chevron.right" : "chevron.down").font(.system(size: 9, weight: .bold))
+                                }
+                                .foregroundStyle(Color(white: 0.6))
+                                .padding(.horizontal, 6).padding(.vertical, 7)
+                                .contentShape(Rectangle())
+                            }
+                            .buttonStyle(.plain)
+                            .help(folded ? "Show who's in voice" : "Hide who's in voice")
+                            .accessibilityLabel(VoiceRoster.countLabel(inVoice.count) ?? "")
+                        }
                     }
-                    .buttonStyle(.plain)
+                    if !folded {
+                        ForEach(inVoice) { p in
+                            VoiceParticipantRow(participant: p, serverId: group.serverId)
+                        }
+                    }
                 }
             }
             .padding(.horizontal, 8).padding(.top, 10).padding(.bottom, listBottomInset)
@@ -295,7 +327,8 @@ struct SidebarView: View {
                     .buttonStyle(.plain)
                     ForEach(chat.serverGroups) { g in
                         Button { chat.showServerBoxes(g.serverId) } label: {
-                            ServerListRow(name: g.name, channels: g.channels.count, selected: chat.isServerActive(g))
+                            ServerListRow(name: g.name, channels: g.channels.count, selected: chat.isServerActive(g),
+                                          inVoice: app.voiceRoster.count(serverId: g.serverId, hidden: BlockList.shared.ids))
                         }
                         .buttonStyle(.plain)
                         .contextMenu {
@@ -492,11 +525,49 @@ struct ChannelRow: View {
 
 /// A server row in the middle overview column: monogram + name + channel count. Selecting it shows
 /// the server's channels as boxes in the main pane.
+/// One person in a voice room, under the voice channel (build 47): a small avatar (a green ring
+/// while they speak — known only for the call this device is in), the name this device has for
+/// them, and muted / camera / screen-share marks. Tapping it shows their card.
+struct VoiceParticipantRow: View {
+    @EnvironmentObject private var app: AppState
+    @ObservedObject private var speaking = VoiceSpeaking.shared
+    let participant: VoiceParticipant
+    let serverId: String
+    @State private var showCard = false
+
+    private var label: String {
+        if participant.userId == app.session?.userId { return "You" }
+        return app.contacts.authorLabel(participant.userId, claimedName: app.contacts.roster[participant.userId])
+    }
+
+    var body: some View {
+        let talking = speaking.isSpeaking(participant.userId, in: serverId)
+        Button { showCard = true } label: {
+            HStack(spacing: 7) {
+                AvatarImage(key: AvatarStore.userKey(participant.userId), name: label, size: 20)
+                    .overlay(Circle().strokeBorder(talking ? Color.green : .clear, lineWidth: 2))
+                Text(label).font(.system(size: 13)).foregroundStyle(Color(white: talking ? 0.95 : 0.72)).lineLimit(1)
+                Spacer(minLength: 0)
+                if participant.screen { Image(systemName: "rectangle.on.rectangle").font(.system(size: 10)).foregroundStyle(Color(white: 0.6)) }
+                if participant.video { Image(systemName: "video.fill").font(.system(size: 10)).foregroundStyle(Color(white: 0.6)) }
+                if participant.muted { Image(systemName: "mic.slash.fill").font(.system(size: 10)).foregroundStyle(Color(white: 0.5)) }
+            }
+            .padding(.leading, 36).padding(.trailing, 8).padding(.vertical, 3)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(label)\(participant.muted ? ", muted" : "")\(participant.video ? ", camera on" : "")\(participant.screen ? ", sharing screen" : "")\(talking ? ", speaking" : "")")
+        .popover(isPresented: $showCard) { MentionProfileCard(userId: participant.userId, label: label) }
+    }
+}
+
 private struct ServerListRow: View {
     let name: String
     let channels: Int
     var selected: Bool = false
     var glyph: String? = nil
+    /// People in the server's voice room (shown while its channels are folded away).
+    var inVoice: Int = 0
     @State private var hovering = false
 
     var body: some View {
@@ -516,6 +587,14 @@ private struct ServerListRow: View {
                 Text("\(channels) channel\(channels == 1 ? "" : "s")").font(.system(size: 11)).foregroundStyle(.secondary)
             }
             Spacer()
+            if inVoice > 0 {
+                HStack(spacing: 3) {
+                    Image(systemName: "speaker.wave.2.fill").font(.system(size: 10))
+                    Text("\(inVoice)").font(.system(size: 11, weight: .semibold)).monospacedDigit()
+                }
+                .foregroundStyle(Color.green.opacity(0.85))
+                .accessibilityLabel(VoiceRoster.countLabel(inVoice) ?? "")
+            }
         }
         .padding(.horizontal, 8).padding(.vertical, 6)
         .background(

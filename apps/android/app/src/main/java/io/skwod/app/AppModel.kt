@@ -2069,9 +2069,22 @@ class AppModel private constructor(private val ctx: Context) {
     suspend fun leaveServer(serverId: String): String? {
         val c = client ?: return "Not connected — try again."
         val me = session?.userId ?: return "Not connected — try again."
+        // Authoritative here from the confirmation on ([LeaveTombstones]): the server goes now,
+        // and nothing already in flight can bring it back while the host answers.
+        val asked = bound
+        val before = chat.beginLeave(serverId) ?: return null
         val status = httpSend("api/servers/$serverId/members/$me", "DELETE")
+        // Another skwod (or account) is in use now: its list is not touched.
+        if (bound !== asked) {
+            if (status == 200 || status == 404) try { withContext(Dispatchers.IO) { c.forgetSpace(serverId) } } catch (_: Exception) {}
+            return null
+        }
         // 404: not a member any more (already left, or removed) — still drop it here.
-        if (status != 200 && status != 404) return if (status == 400) "You own this server — delete it instead." else "Couldn't leave the server — try again."
+        if (status != 200 && status != 404) {
+            chat.leaveFailed(serverId, before)
+            return if (status == 400) "You own this server — delete it instead." else "Couldn't leave the server — try again."
+        }
+        chat.tombstones.confirm(serverId)
         try { withContext(Dispatchers.IO) { c.forgetSpace(serverId) } } catch (_: Exception) {}
         chat.removeServer(serverId)
         return null

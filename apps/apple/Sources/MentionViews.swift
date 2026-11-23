@@ -6,21 +6,21 @@ enum MentionComposer {
     static let everyoneId = "*everyone*"
 
     /// Pick `member` for the "@query" at `at`.
-    static func pick(_ member: (userId: String, name: String), draft: String, at: Int, payload: inout MentionPayload) -> String {
+    static func pick(_ member: MentionCandidate, draft: String, at: Int, payload: inout MentionPayload) -> String {
         if member.userId == everyoneId {
             let ns = draft as NSString
             payload.everyone = true
             return ns.replacingCharacters(in: NSRange(location: at, length: ns.length - at), with: "@everyone ")
         }
-        return MentionAutocomplete.insert(name: member.name, userId: member.userId, into: draft, at: at, payload: &payload)
+        return MentionAutocomplete.insert(name: member.name, username: member.username, userId: member.userId, into: draft, at: at, payload: &payload)
     }
 }
 
 /// The popup above the composer while typing "@…": avatar, name (already the trust label).
 struct MentionSuggestions: View {
-    let matches: [(userId: String, name: String)]
+    let matches: [MentionCandidate]
     var highlighted: Int
-    let onPick: ((userId: String, name: String)) -> Void
+    let onPick: (MentionCandidate) -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {

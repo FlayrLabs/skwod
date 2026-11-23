@@ -385,6 +385,10 @@ enum MentionAlertRule {
     }
 }
 
+/// Someone the composer may @mention: user id, the label shown for them (`ContactTrust`), and
+/// their username (empty when unknown).
+typealias MentionCandidate = (userId: String, name: String, username: String)
+
 /// While typing "@…": which members match, best first.
 enum MentionAutocomplete {
     /// The "@query" the caret is in, if any: the text after the last "@" that starts a word and
@@ -402,26 +406,39 @@ enum MentionAutocomplete {
         return (query, at.location)
     }
 
-    /// Members whose shown name starts with (then contains) the query, case-insensitively.
-    static func matches(_ query: String, in members: [(userId: String, name: String)], limit: Int = 8) -> [(userId: String, name: String)] {
+    /// Members whose shown name or username starts with (then contains) the query,
+    /// case-insensitively.
+    static func matches(_ query: String, in members: [MentionCandidate], limit: Int = 8) -> [MentionCandidate] {
         let q = query.lowercased()
         guard !q.isEmpty else { return Array(members.prefix(limit)) }
-        let starts = members.filter { $0.name.lowercased().hasPrefix(q) }
-        let contains = members.filter { !$0.name.lowercased().hasPrefix(q) && $0.name.lowercased().contains(q) }
-        return Array((starts + contains).prefix(limit))
+        func starts(_ m: MentionCandidate) -> Bool { m.name.lowercased().hasPrefix(q) || m.username.lowercased().hasPrefix(q) }
+        func contains(_ m: MentionCandidate) -> Bool { m.name.lowercased().contains(q) || m.username.lowercased().contains(q) }
+        let first = members.filter(starts)
+        let then = members.filter { !starts($0) && contains($0) }
+        return Array((first + then).prefix(limit))
     }
 
-    /// Replace the "@query" at `at` with "@name " and record its mention range.
-    static func insert(name: String, userId: String, into text: String, at: Int, payload: inout MentionPayload) -> String {
+    /// What the visible token is built from: the person's USERNAME (build 47) — short, already
+    /// in the token's characters, and what people type after "@". Only when there is none
+    /// (an older listing) the shown label. How the mention RENDERS is never this text: it is
+    /// the label this device has for the user id (`MentionRender`).
+    static func tokenSource(name: String, username: String) -> String {
+        let u = username.trimmingCharacters(in: .whitespacesAndNewlines)
+        return u.isEmpty ? name : u
+    }
+
+    /// Replace the "@query" at `at` with "@username " and record its mention range.
+    static func insert(name: String, username: String = "", userId: String, into text: String, at: Int, payload: inout MentionPayload) -> String {
         let ns = text as NSString
         // A token every app accepts (`MentionCodec.token`): a name with spaces is still one.
-        let token = MentionCodec.token(name)
+        let token = MentionCodec.token(tokenSource(name: name, username: username))
         let replaced = ns.replacingCharacters(in: NSRange(location: at, length: ns.length - at), with: token + " ")
         payload.mentions.append(.init(userId: userId, start: at, length: (token as NSString).length))
         return replaced
     }
 
     /// After the user edited the draft: keep only mentions whose token is still exactly there.
+    /// `names`: user id → what the token was built from (`tokenSource`).
     static func reconcile(_ payload: MentionPayload, draft: String, names: [String: String]) -> MentionPayload {
         let ns = draft as NSString
         var out = payload

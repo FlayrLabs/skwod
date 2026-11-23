@@ -163,6 +163,7 @@ class JoinFlow(private val model: AppModel) {
             return null
         }
         r = r.copy(serverId = result.serverId, stage = if (result.pending) PendingJoinRecord.Stage.REQUESTED else PendingJoinRecord.Stage.ADMITTED)
+        model.chat.tombstones.rejoined(result.serverId)   // joined (again) on purpose
         put(r); start(r)
         return null
     }
@@ -223,6 +224,7 @@ class JoinFlow(private val model: AppModel) {
                 return
             }
             r = r.copy(serverId = joined.serverId, stage = if (joined.pending) PendingJoinRecord.Stage.REQUESTED else PendingJoinRecord.Stage.ADMITTED)
+            model.chat.tombstones.rejoined(joined.serverId)   // joined (again) on purpose
             put(r)
         }
         val serverId = r.serverId ?: run { forget(r); status = null; return }

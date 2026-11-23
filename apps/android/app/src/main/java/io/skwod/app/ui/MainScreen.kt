@@ -1,6 +1,7 @@
 package io.skwod.app
 
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.*
@@ -22,7 +23,9 @@ import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
 import androidx.compose.ui.window.Dialog
 import androidx.compose.ui.window.DialogProperties
 import android.widget.Toast
@@ -414,6 +417,9 @@ private fun DrawerList(chat: AppChat, onSignOut: () -> Unit) {
     var voiceCallServer by remember { mutableStateOf<String?>(null) }
     var showVoiceSetup by remember { mutableStateOf(false) }
     var voiceChecking by remember { mutableStateOf(false) }
+    // Build 47: servers whose voice list is folded, and the person whose card is open.
+    var voiceFolded by remember { mutableStateOf(setOf<String>()) }
+    var voiceCard by remember { mutableStateOf<Pair<String, String>?>(null) }
     val voiceCtx = LocalContext.current
 
     // The space to invite into / manage: the selected one, else the first.
@@ -583,6 +589,8 @@ private fun DrawerList(chat: AppChat, onSignOut: () -> Unit) {
                         style = MaterialTheme.typography.labelMedium,
                         modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp))
                     val voiceServerId = group.serverId
+                    val inVoice = model.realtime.voiceRoster.value.participants(voiceServerId, BlockList.ids)
+                    val folded = voiceServerId in voiceFolded
                     Row(
                         Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp)
                             .clip(RoundedCornerShape(12.dp))
@@ -604,10 +612,27 @@ private fun DrawerList(chat: AppChat, onSignOut: () -> Unit) {
                             .padding(horizontal = 14.dp, vertical = 13.dp),
                         verticalAlignment = Alignment.CenterVertically
                     ) {
-                        Icon(Icons.Filled.VolumeUp, null, tint = Color.White.copy(alpha = 0.6f))
+                        Icon(Icons.Filled.VolumeUp, null, tint = Color.White.copy(alpha = if (inVoice.isEmpty()) 0.6f else 0.9f))
                         Spacer(Modifier.width(12.dp))
-                        Text("General", color = Color.White.copy(alpha = 0.8f))
+                        Text("General", color = Color.White.copy(alpha = 0.8f), modifier = Modifier.weight(1f))
+                        if (inVoice.isNotEmpty()) {
+                            // Who is in it folds away; the count stays.
+                            Row(Modifier.clip(RoundedCornerShape(8.dp))
+                                .clickable { voiceFolded = if (folded) voiceFolded - voiceServerId else voiceFolded + voiceServerId }
+                                .semantics { contentDescription = VoiceRoster.countLabel(inVoice.size) ?: "" }
+                                .padding(horizontal = 6.dp, vertical = 2.dp),
+                                verticalAlignment = Alignment.CenterVertically) {
+                                if (folded) {
+                                    Icon(Icons.Filled.People, null, tint = Color.White.copy(alpha = 0.55f), modifier = Modifier.size(14.dp))
+                                    Spacer(Modifier.width(3.dp))
+                                    Text("${inVoice.size}", color = Color.White.copy(alpha = 0.55f), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+                                }
+                                Icon(if (folded) Icons.Filled.ChevronRight else Icons.Filled.ExpandMore, null,
+                                    tint = Color.White.copy(alpha = 0.55f), modifier = Modifier.size(18.dp))
+                            }
+                        }
                     }
+                    if (!folded) inVoice.forEach { p -> VoiceParticipantRow(p, voiceServerId, onOpen = { voiceCard = it }) }
                 }
             } else {
                 // Skwod overview: the list of servers. Tapping one opens its channels.
@@ -616,7 +641,8 @@ private fun DrawerList(chat: AppChat, onSignOut: () -> Unit) {
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp))
                 chat.serverGroups().forEach { g ->
                     Box {
-                        ServerRow(g.name, g.channels.size, onClick = { chat.openServer(g) }, onLongClick = { serverMenuFor = g.serverId })
+                        ServerRow(g.name, g.channels.size, onClick = { chat.openServer(g) }, onLongClick = { serverMenuFor = g.serverId },
+                            inVoice = model.realtime.voiceRoster.value.count(g.serverId, BlockList.ids))
                         MentionBadge(model.mentionCount(g.channels.map { "channel:${it.channelId}" }), Modifier.align(Alignment.CenterEnd).padding(end = 36.dp))
                         ServerActionsMenu(serverMenuFor == g.serverId, g, onDismiss = { serverMenuFor = null },
                             onInvite = { inviteFor = g.channels.firstOrNull() }, onIcon = { serverIconFor = g.channels.firstOrNull() },
@@ -638,6 +664,7 @@ private fun DrawerList(chat: AppChat, onSignOut: () -> Unit) {
         }
     }
     if (showVoiceSetup) VoiceSetupDialog(onClose = { showVoiceSetup = false })
+    voiceCard?.let { (uid, label) -> MentionCard(uid, label, onClose = { voiceCard = null }) }
     serverIconFor?.let { sp ->
         AvatarPickerDialog(
             title = "Server icon",
@@ -703,7 +730,7 @@ private fun ChannelRow(model: AppModel, muteKey: String, name: String, selected:
 /** A server row in the mobile skwod overview: monogram + name + channel count. Tapping opens it. */
 @OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-private fun ServerRow(name: String, channels: Int, onClick: () -> Unit, onLongClick: (() -> Unit)? = null) {
+private fun ServerRow(name: String, channels: Int, onClick: () -> Unit, onLongClick: (() -> Unit)? = null, inVoice: Int = 0) {
     Row(
         Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp)
             .clip(RoundedCornerShape(12.dp))
@@ -722,7 +749,52 @@ private fun ServerRow(name: String, channels: Int, onClick: () -> Unit, onLongCl
             Text("$channels channel${if (channels == 1) "" else "s"}",
                 color = Color.White.copy(alpha = 0.5f), style = MaterialTheme.typography.bodySmall)
         }
+        if (inVoice > 0) {
+            Row(verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.semantics { contentDescription = VoiceRoster.countLabel(inVoice) ?: "" }) {
+                Icon(Icons.Filled.VolumeUp, null, tint = Color(0xFF4ADE80), modifier = Modifier.size(14.dp))
+                Spacer(Modifier.width(3.dp))
+                Text("$inVoice", color = Color(0xFF4ADE80), fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            }
+            Spacer(Modifier.width(8.dp))
+        }
         Icon(Icons.Filled.ChevronRight, null, tint = Color.White.copy(alpha = 0.35f))
+    }
+}
+
+/**
+ * One person in a voice room, under the voice channel (build 47): a small avatar (a green ring
+ * while they speak — known only for the call this phone is in), the label this phone has for
+ * them, and muted / camera / screen-share marks. Tapping shows their card.
+ */
+@Composable
+private fun VoiceParticipantRow(p: VoiceParticipant, serverId: String, onOpen: (Pair<String, String>) -> Unit) {
+    val model = AppModel.get(LocalContext.current)
+    val me = model.session?.userId
+    val label = if (p.userId == me) "You" else model.contacts.shown(p.userId, model.contacts.roster[p.userId]).label
+    val (speakingIn, speakers) = CallState.speaking.value
+    val talking = speakingIn == serverId && p.userId in speakers
+    val marks = listOfNotNull(if (p.muted) "muted" else null, if (p.video) "camera on" else null,
+        if (p.screen) "sharing screen" else null, if (talking) "speaking" else null)
+    Row(
+        Modifier.fillMaxWidth().padding(start = 40.dp, end = 4.dp, top = 1.dp, bottom = 1.dp)
+            .clip(RoundedCornerShape(10.dp))
+            .clickable { onOpen(p.userId to label) }
+            .semantics(mergeDescendants = true) { contentDescription = (listOf(label) + marks).joinToString(", ") }
+            .padding(horizontal = 8.dp, vertical = 5.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(Modifier.size(24.dp).border(2.dp, if (talking) Color(0xFF4ADE80) else Color.Transparent, CircleShape),
+            contentAlignment = Alignment.Center) {
+            AvatarImage(AvatarStore.userKey(p.userId), label, size = 20)
+        }
+        Spacer(Modifier.width(8.dp))
+        Text(label, color = Color.White.copy(alpha = if (talking) 0.95f else 0.72f), fontSize = 14.sp, maxLines = 1,
+            overflow = TextOverflow.Ellipsis, modifier = Modifier.weight(1f))
+        val dim = Color.White.copy(alpha = 0.5f)
+        if (p.screen) Icon(Icons.Filled.ScreenShare, null, tint = dim, modifier = Modifier.size(14.dp).padding(start = 2.dp))
+        if (p.video) Icon(Icons.Filled.Videocam, null, tint = dim, modifier = Modifier.size(14.dp).padding(start = 2.dp))
+        if (p.muted) Icon(Icons.Filled.MicOff, null, tint = dim, modifier = Modifier.size(14.dp).padding(start = 2.dp))
     }
 }
 

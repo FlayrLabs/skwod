@@ -18,7 +18,7 @@ settings:
   base:
     SWIFT_VERSION: "5.0"
     MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "46"
+    CURRENT_PROJECT_VERSION: "47"
     ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     # --- build-time switches (docs/APPLE.md) -------------------------------------------------
     # Blind push gateway base URL (https://…). Empty = remote push disabled; the app then only
@@ -216,6 +216,9 @@ targets:
       - path: Sources/MenuRules.swift
       - path: Sources/TypingRules.swift
       - path: Sources/Mentions.swift
+      # Build 47: who is in a voice room, and a left server staying gone.
+      - path: Sources/VoiceRoster.swift
+      - path: Sources/LeaveRules.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.skwod.logic-tests

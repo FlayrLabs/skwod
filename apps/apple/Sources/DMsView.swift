@@ -162,7 +162,7 @@ struct DMChatView: View {
             mentionLabel: { uid in uid == convo.peerUserId ? shown.text : app.contacts.authorLabel(uid, claimedName: nil) },
             everyoneAllowed: { _ in false },
             mentionable: BlockList.shared.contains(convo.peerUserId) || convo.peerUserId.isEmpty
-                ? [] : [(userId: convo.peerUserId, name: shown.text)],
+                ? [] : [(userId: convo.peerUserId, name: shown.text, username: convo.name)],
             typingFrom: convo.peerUserId.isEmpty ? [] : [convo.peerUserId]))
         .task(id: convo.conversationId) { await load() }
         // Queued / delivered / failed, or a block: redraw from the cache.

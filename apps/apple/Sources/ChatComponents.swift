@@ -101,7 +101,7 @@ struct ChatSurface: View {
         .onChange(of: draft) { _, now in
             typing?.draftChanged(now)
             // Edited around a mention: keep only the ones still exactly in the text.
-            let names = Dictionary(surfaceExtras.mentionable.map { ($0.userId, $0.name) }, uniquingKeysWith: { a, _ in a })
+            let names = Dictionary(surfaceExtras.mentionable.map { ($0.userId, MentionAutocomplete.tokenSource(name: $0.name, username: $0.username)) }, uniquingKeysWith: { a, _ in a })
             mentionPayload = MentionAutocomplete.reconcile(mentionPayload, draft: now, names: names)
             mentionHighlight = 0
         }
@@ -134,12 +134,12 @@ struct ChatSurface: View {
     private var acceptsAttachments: Bool { onSendFile != nil || onSendImage != nil }
 
     /// Members matching the "@…" being typed (nothing when not in one, or none to mention).
-    private var mentionMatches: [(userId: String, name: String)] {
+    private var mentionMatches: [MentionCandidate] {
         guard !surfaceExtras.mentionable.isEmpty, let q = MentionAutocomplete.activeQuery(in: draft) else { return [] }
         return MentionAutocomplete.matches(q.query, in: surfaceExtras.mentionable)
     }
 
-    private func pickMention(_ m: (userId: String, name: String)) {
+    private func pickMention(_ m: MentionCandidate) {
         guard let q = MentionAutocomplete.activeQuery(in: draft) else { return }
         draft = MentionComposer.pick(m, draft: draft, at: q.at, payload: &mentionPayload)
         mentionHighlight = 0
@@ -161,7 +161,7 @@ struct ChatSurface: View {
     /// The text goes out with who it mentions inside it (`MentionCodec`; end to end).
     private func sendWithMentions() {
         typing?.stoppedTyping()
-        let names = Dictionary(surfaceExtras.mentionable.map { ($0.userId, $0.name) }, uniquingKeysWith: { a, _ in a })
+        let names = Dictionary(surfaceExtras.mentionable.map { ($0.userId, MentionAutocomplete.tokenSource(name: $0.name, username: $0.username)) }, uniquingKeysWith: { a, _ in a })
         let payload = MentionAutocomplete.reconcile(mentionPayload, draft: draft, names: names)
         if !payload.isEmpty { draft = MentionCodec.encode(draft, payload) }
         mentionPayload = MentionPayload()

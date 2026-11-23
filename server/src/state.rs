@@ -56,6 +56,8 @@ pub struct AppState {
     /// Calls that are ringing right now (one per voice channel, ~45 s), so a device that
     /// connects late — woken by a push — still learns which room to join (`voice.rs`).
     pub rings: crate::voice::Rings,
+    /// Who is in which voice room right now (in memory; `voice_state.rs`).
+    pub voice_states: crate::voice_state::VoiceStates,
     /// Serializes "a member opens a server's first voice room" so two members arriving at once
     /// get the same room instead of two (`structure.rs`).
     pub voice_room_lock: Arc<Mutex<()>>,
@@ -149,6 +151,7 @@ impl AppState {
             lan_key: Arc::default(),
             p2p: Arc::default(),
             rings: crate::voice::Rings::default(),
+            voice_states: crate::voice_state::VoiceStates::default(),
             voice_room_lock: Arc::default(),
             public_urls: Arc::new(
                 std::env::var("SKWOD_PUBLIC_URL").map(|v| v.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default(),

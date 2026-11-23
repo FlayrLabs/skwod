@@ -84,6 +84,7 @@ pub fn router(state: AppState) -> Router {
                 .merge(crate::limits::routes())
                 .merge(crate::music::routes())
                 .merge(crate::voice::routes())
+                .merge(crate::voice_state::routes())
                 .merge(crate::push::routes())
                 .merge(crate::safety::routes())
                 .merge(crate::updates::routes())

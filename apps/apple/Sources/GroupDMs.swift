@@ -530,7 +530,7 @@ struct GroupChatView: View {
             mentionLabel: { name($0) },
             everyoneAllowed: { _ in false },
             mentionable: group.memberUserIds.filter { !BlockList.shared.contains($0) }
-                .map { (userId: $0, name: name($0)) },
+                .map { (userId: $0, name: name($0), username: group.claimedNames[$0] ?? "") },
             typingFrom: Set(group.memberUserIds)))
         .task(id: group.conversationId) { await load() }
         .onReceive(NotificationCenter.default.publisher(for: .skwodOutboxChanged)) { _ in Task { await reloadFromCache() } }

@@ -24,9 +24,11 @@ ignore = [
     # 0.10) is not selectable. The Tor client only VERIFIES RSA signatures on directory
     # documents and relay certificates (public-key operations); Skwod never builds arti's
     # relay features and never loads or uses an RSA private key, so there is no secret-dependent
-    # timing to observe. The server and host do not link rsa at all.
+    # timing to observe. The server signs its FCM OAuth assertion (RS256) through jsonwebtoken
+    # with rsa 0.10, the patched constant-time series, so this ignore does not cover it; the
+    # host does not link rsa at all.
     # Expires 2027-02-28, or when tor-llcrypto moves to rsa 0.10.
-    { id = "RUSTSEC-2023-0071", reason = "arti client verifies RSA signatures only; no RSA private-key operation exists in Skwod" },
+    { id = "RUSTSEC-2023-0071", reason = "core's rsa 0.9 (arti) only verifies RSA signatures; the server's RSA signing uses patched rsa 0.10" },
 
     # Bundled SQLite < 3.54.0 (CVE-2026-119375): uninitialised page-cache memory is returned when
     # a database is opened next to a crafted -wal file with a different page size. Local vector;

@@ -270,6 +270,8 @@ final class ChatModel: ObservableObject {
             // (A new bind of the SAME workspace leaves what is on screen where it is.)
             selection = nil
             railServerId = nil
+            // What was left is another workspace's (account's) business.
+            tombstones = LeaveTombstones()
             spaces = []
             spacesRead = false
         }
@@ -388,6 +390,7 @@ final class ChatModel: ObservableObject {
     }
 
     func addSpace(_ s: RealSpace) {
+        guard !tombstones.hides(s.serverId) else { return }
         if !spaces.contains(where: { $0.channelId == s.channelId }) { spaces.insert(s, at: 0) }
         homeMode = false
         selection = .space(s)
@@ -574,7 +577,7 @@ final class ChatModel: ObservableObject {
                 added = true
             }
             // Left or deleted while that listing was in flight: it stays out.
-            if droppedServers.contains(group.serverId) { continue }
+            if tombstones.hides(group.serverId) { continue }
             for ch in channels where ch.kind != "voice" {
                 guard let name = ch.name, !spaces.contains(where: { $0.channelId == ch.channelId }) else { continue }
                 spaces.append(RealSpace(name: group.name, channelName: name, serverId: group.serverId,
@@ -709,14 +712,33 @@ final class ChatModel: ObservableObject {
     func leaveServer(_ serverId: String) async -> String? {
         guard let app, let client = app.client, let me = app.session?.userId, let token = app.session?.token,
               let base = URL(string: app.serverURL), !app.serverURL.isEmpty else { return "Not connected — try again in a moment." }
+        // Authoritative here from the moment it is confirmed (`LeaveTombstones`): the server goes
+        // now, and nothing already in flight can bring it back while the host answers.
+        guard let asked = app.bindTicket(), tombstones.begin(serverId) else { return nil }
+        let before = spaces
+        let openBefore = selection
+        hideServers([serverId])
         var req = URLRequest(url: base.appendingPathComponent("api/servers/\(serverId)/members/\(me)"))
         req.httpMethod = "DELETE"
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         let code = ((try? await URLSession.shared.data(for: req))?.1 as? HTTPURLResponse)?.statusCode ?? 0
+        // Another skwod (or account) is on screen now: its sidebar is not touched. (Its
+        // tombstones were reset by the switch; this one's list is read afresh next time.)
+        guard app.holds(asked) else {
+            if code == 200 || code == 404 { await client.forgetSpace(serverId: serverId) }
+            return nil
+        }
         // 404: not a member any more — the same outcome.
         guard code == 200 || code == 404 else {
+            // It did not happen: the channels come back where they were.
+            if tombstones.failed(serverId) {
+                spaces = LeaveTombstones.restore(before: before, now: spaces, serverId: serverId, server: \.serverId, key: \.channelId)
+                if selection == nil, case .space(let open) = openBefore, open.serverId == serverId { selection = openBefore }
+                Task { await persist(spaces, key: "sidebar.spaces") }
+            }
             return code == 400 ? "You own this server: delete it instead." : "Couldn't leave the server — check your connection and try again."
         }
+        tombstones.confirm(serverId)
         await client.forgetSpace(serverId: serverId)
         dropServers([serverId])
         return nil
@@ -737,10 +759,16 @@ final class ChatModel: ObservableObject {
     /// Servers dropped from the sidebar (left, deleted, or no longer listed for this account):
     /// work that was already in flight when it happened (a channel listing, a quiet discovery)
     /// must not put them back. Only a new join of that server (`joinByCode`) clears the mark.
-    private var droppedServers: Set<String> = []
+    /// (`LeaveTombstones`: a leave in progress, or a server gone for good on this device.)
+    private var tombstones = LeaveTombstones()
 
     private func dropServers(_ ids: Set<String>) {
-        droppedServers.formUnion(ids)
+        tombstones.dropped(ids)
+        hideServers(ids)
+    }
+
+    /// Take these servers' channels out of the sidebar (and the selection) now.
+    private func hideServers(_ ids: Set<String>) {
         // A join still being watched for one of them (waiting for keys) stops here.
         for id in ids { discoveries[id]?.cancel(); discoveries[id] = nil }
         if case .space(let open) = selection, ids.contains(open.serverId) { selection = nil }
@@ -806,7 +834,7 @@ final class ChatModel: ObservableObject {
             return message
         }
         record.serverId = result.serverId
-        droppedServers.remove(result.serverId)   // joined (again) on purpose
+        tombstones.rejoined(result.serverId)   // joined (again) on purpose
         record.hostUserId = result.hostUserId
         record.hostDeviceId = result.hostDeviceId
         record.awaitingApproval = result.pending
@@ -848,7 +876,7 @@ final class ChatModel: ObservableObject {
         var record = PendingJoinStore.get(address: address)
         if approved {
             // A late decision about a server this device has since left or seen deleted.
-            if droppedServers.contains(serverId) && record?.serverId != serverId { return }
+            if tombstones.hides(serverId) && record?.serverId != serverId { return }
             if record?.serverId == serverId {
                 record?.awaitingApproval = false
                 if let record { PendingJoinStore.set(record, address: address) }
@@ -935,7 +963,7 @@ final class ChatModel: ObservableObject {
                     let spaceName = (try? await client.serverName(serverId: serverId)).flatMap { $0 } ?? "Server"
                     guard stillThere(), app.bound?.workspaceId == origin else { return }
                     // Left or deleted meanwhile (the watch was cancelled): it stays out.
-                    if Task.isCancelled || droppedServers.contains(serverId) { return }
+                    if Task.isCancelled || tombstones.hides(serverId) { return }
                     for ch in named {
                         let space = RealSpace(name: spaceName, channelName: ch.name ?? "channel", serverId: serverId,
                                               channelId: ch.channelId, inviteCode: "", spaceKeyHex: "")
@@ -991,7 +1019,7 @@ final class ChatModel: ObservableObject {
 
     /// Append a channel without touching selection/homeMode — for background discovery.
     private func addSpaceQuietly(_ s: RealSpace) {
-        guard !spaces.contains(where: { $0.channelId == s.channelId }), !droppedServers.contains(s.serverId) else { return }
+        guard !spaces.contains(where: { $0.channelId == s.channelId }), !tombstones.hides(s.serverId) else { return }
         let wasEmpty = spaces.isEmpty
         spaces.append(s)
         // First channels to arrive after an empty load (re-login recovery) — open one so the skwod
@@ -1224,7 +1252,7 @@ final class ChatModel: ObservableObject {
             }
         }
         // (A server dropped since — left, deleted — is not read back from a list saved before.)
-        stored.removeAll { droppedServers.contains($0.serverId) }
+        stored.removeAll { tombstones.hides($0.serverId) }
         spaces = joinedMeanwhile.filter { j in !stored.contains(where: { $0.channelId == j.channelId }) } + stored
         spacesRead = true
         if keptAs != nil || !joinedMeanwhile.isEmpty { await persist(spaces, key: "sidebar.spaces") }

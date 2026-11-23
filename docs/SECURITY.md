@@ -301,6 +301,19 @@ only, to the devices of the people in the call. When someone it was sent to leav
 stops being a member), a new key is generated at the next key index and sent only to those who
 remain. If keys cannot be set up the client refuses to join (ADR-007).
 
+**Who is in a call is visible to the server's members (build 47).** The host
+always knew it: it mints the room tokens and runs (or configured) the SFU. The server now reads
+each voice room's participants from LiveKit's room service (loopback for the managed SFU;
+nothing is written to the database) and publishes them — user id, microphone muted, camera and
+screen share on, join time — as `voice_state` events on the `server:<id>` topic. Each one is
+handed only to a member who may see that voice channel (Read Messages and Connect on it),
+checked before every delivery; the same rule filters the rosters handed to a socket when it
+subscribes and `GET /api/servers/:id/voice-state`. A private voice channel's participants are
+therefore never sent to members who cannot see it. A permission change applies from the next
+event and the next subscribe: a client that just lost access keeps what it was already shown
+until it reconnects. Media, media keys and who is speaking never pass through the server.
+Identities the SFU lists that are not members of the server are dropped.
+
 ## Key storage
 
 - **Apple:** the SQLCipher key is a `ThisDeviceOnly` Keychain item (not synced, not in backups),

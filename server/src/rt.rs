@@ -26,6 +26,10 @@ pub struct RtEvent {
     /// `device_removed`, `sessions_revoked`): each open socket of that account re-checks its
     /// own session before anything else is written to it (`ws.rs`).
     pub security: bool,
+    /// Delivered only to a subscriber who may see this channel (`voice_state::may_see`): a
+    /// `voice_state` goes on the server's topic, but who is in a private voice channel is not
+    /// every member's to know.
+    pub gate_channel: Option<String>,
     /// The same count for `ring` events alone: a socket that lagged can tell whether a ring
     /// may be among what it missed.
     pub call_no: u64,
@@ -86,7 +90,8 @@ impl RealtimeHub {
             wake_no.1 += 1;
         }
         let security = matches!(event, "device_rekeyed" | "device_removed" | "sessions_revoked" | "account_restored");
-        let _ = self.tx.send(RtEvent { topic: topic.to_string(), frame, wake, author, wake_no: wake_no.0, call_no: wake_no.1, security });
+        let gate_channel = (event == "voice_state").then(|| payload["channel_id"].as_str().unwrap_or_default().to_string());
+        let _ = self.tx.send(RtEvent { topic: topic.to_string(), frame, wake, author, wake_no: wake_no.0, call_no: wake_no.1, security, gate_channel });
     }
 }
 

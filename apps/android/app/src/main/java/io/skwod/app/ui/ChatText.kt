@@ -487,19 +487,21 @@ fun NameTrustMark(shown: ContactTrust.Shown) {
 }
 
 /**
- * While the composer ends in "@…": the people (user id, how this device shows them) whose name
- * matches, best first; a tap inserts the name's token ([Mentions.token], [Mentions.complete]) and reports the pick.
+ * While the composer ends in "@…": the people (user id, how this device shows them, username)
+ * whose label or username matches, best first; a tap inserts the USERNAME's token
+ * ([Mentions.tokenFor], [Mentions.complete]) and reports the pick.
  */
 @Composable
-fun MentionSuggestions(draft: String, candidates: List<Pair<String, ContactTrust.Shown>>, onPick: (String, String) -> Unit) {
+fun MentionSuggestions(draft: String, candidates: List<Triple<String, ContactTrust.Shown, String>>, onPick: (String, String) -> Unit) {
     val q = Mentions.query(draft) ?: return
-    val starts = candidates.filter { it.second.label.startsWith(q, ignoreCase = true) }
-    val contains = candidates.filter { !it.second.label.startsWith(q, ignoreCase = true) && it.second.label.contains(q, ignoreCase = true) }
-    val matches = (starts.sortedBy { it.second.label.lowercase() } + contains).take(5)
+    val byId = candidates.associateBy { it.first }
+    val matches = Mentions.matches(q, candidates.map { Mentions.Candidate(it.first, it.second.label, it.third) })
     if (matches.isEmpty()) return
     Column(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) {
-        matches.forEach { (uid, shown) ->
-            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).clickable { onPick(uid, Mentions.token(shown.label)) }
+        matches.forEach { c ->
+            val uid = c.userId
+            val shown = byId[uid]?.second ?: return@forEach
+            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).clickable { onPick(uid, Mentions.tokenFor(c)) }
                 .padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
                 AvatarImage(AvatarStore.userKey(uid), shown.label, size = 24)
                 Spacer(Modifier.width(8.dp))

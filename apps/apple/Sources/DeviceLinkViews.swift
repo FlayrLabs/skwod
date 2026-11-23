@@ -132,7 +132,9 @@ struct DeviceLinkApproveSheet: View {
             Text("1. On the new device, open Skwod and log in to this Skwod with your username and password. 2. It then shows a code. Scan it here, or type it. Only link a device you are holding: it will be able to read your new messages.")
                 .font(.subheadline).foregroundStyle(.white.opacity(0.65)).multilineTextAlignment(.center)
                 .fixedSize(horizontal: false, vertical: true)
-            if let address = app.current?.server, !done {
+            // A p2p skwod gets its share link, which carries the host's home relay (`&r=`) so the
+            // new device can dial at once instead of waiting on a lookup.
+            if let address = app.current.map({ w in w.nodeId.flatMap { InviteLink.shareLink(nodeId: $0, joinCode: nil) } ?? w.server }), !done {
                 // Step 1 made easy: the new device scans this to land on the right skwod's log-in
                 // screen. It is the skwod's address only — no code, no credentials.
                 DisclosureGroup("Show this Skwod's address for the new device") {

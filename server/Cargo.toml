@@ -1,7 +1,7 @@
 [package]
 name = "skwod-server"
 description = "Self-hostable, E2EE skwod server — stores only ciphertext, public keys, and routing metadata."
-version = "0.0.0"
+version = "0.48.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 rust-version = "1.93.1"
@@ -33,9 +33,9 @@ uuid = { version = "1", features = ["v4"] }
 base64 = "0.22"              # binary key material in JSON bodies
 subtle = "2"                 # constant-time PIN-hash comparison
 hmac = "0.12"                # LiveKit access-token signing (HS256)
-skwod-crypto = { path = "../core/skwod-crypto", version = "0.0.0" }   # libsignal key/certificate validation + issuing (AGPL-3.0-only)
+skwod-crypto = { path = "../core/skwod-crypto", version = "0.48.0" }   # libsignal key/certificate validation + issuing (AGPL-3.0-only)
 # p2p front door (iroh): the host is addressed by its key; the same router is served over QUIC streams.
-skwod-net = { path = "../core/skwod-net", version = "0.0.0" }
+skwod-net = { path = "../core/skwod-net", version = "0.48.0" }
 url = "2"                    # push-gateway URL validation (same crate reqwest uses)
 qrcode = { version = "0.14", default-features = false, features = ["svg"] }   # invite QR on the admin page
 hyper = { version = "1", features = ["server", "http1"] }

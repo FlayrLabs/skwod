@@ -60,7 +60,9 @@ impl Upstream for Member {
 
 /// Requests that test a credential without a session — the ones the host wants a stamp on.
 fn needs_pow(method: &hyper::Method, path: &str) -> bool {
-    method == hyper::Method::POST && matches!(path, "/api/auth/signup" | "/api/auth/login")
+    // Plus the session-less QR pair request (first contact, it stores a row). Its claim is not
+    // stamped: it is polled, and the host asks no work for it.
+    method == hyper::Method::POST && matches!(path, "/api/auth/signup" | "/api/auth/login" | "/api/e2ee/pair-requests")
 }
 
 /// Bodies of stamped requests are buffered (so a clock-skew retry can resend them); they are
@@ -210,7 +212,7 @@ async fn handle(upstream: Arc<dyn Upstream>, prefix: Arc<str>, mut req: Request<
         req.headers_mut().insert(CONNECTION, HeaderValue::from_static("close"));
     }
 
-    // Unauthenticated first contact (signup/login): attach a proof-of-work stamp. The app never
+    // Unauthenticated first contact (signup/login/QR pair request): attach a proof-of-work stamp. The app never
     // sees this; a stamp sent by the app itself is discarded.
     let pow = upstream.pow_identity().filter(|_| !livekit && needs_pow(req.method(), &path));
     let res = match pow {
@@ -321,5 +323,7 @@ mod tests {
         assert!(!needs_pow(&Method::GET, "/api/auth/login"));
         assert!(!needs_pow(&Method::POST, "/api/auth/logout"), "authenticated requests are exempt");
         assert!(!needs_pow(&Method::POST, "/api/channels/x/messages"));
+        assert!(needs_pow(&Method::POST, "/api/e2ee/pair-requests"), "the QR pair request is first contact");
+        assert!(!needs_pow(&Method::POST, "/api/e2ee/pair-requests/r1/claim"), "the polled claim asks no work");
     }
 }

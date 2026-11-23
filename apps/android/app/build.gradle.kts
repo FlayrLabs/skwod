@@ -27,8 +27,8 @@ android {
         applicationId = "com.skwod.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 47   // bump on every new build; mirrors iOS CURRENT_PROJECT_VERSION
-        versionName = "0.1.0"
+        versionCode = 48   // bump on every new build; mirrors iOS CURRENT_PROJECT_VERSION
+        versionName = "0.48"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         // Paywall: OFF by default — nothing checks billing and nothing gates the app (same as the

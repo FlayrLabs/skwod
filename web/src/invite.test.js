@@ -47,3 +47,22 @@ test('platform detection', () => {
   assert.equal(detectPlatform({ userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)', maxTouchPoints: 0 }), 'other')
   assert.equal(detectPlatform(undefined), 'other')
 })
+
+test('the home-relay hint is kept only for allow-listed n0 relays, in canonical form', () => {
+  const id = 'moesz7u65pdf6ps6r8znrmg54rc7jgk59xa9d8xurstbjew3xbmo'
+  const ok = parseFragment('#' + id + '.abc&r=https://use1-1.relay.n0.iroh.link./')
+  assert.equal(ok.appLink, 'skwod://join/' + id + '?r=https://use1-1.relay.n0.iroh.link/#abc')
+  for (const bad of [
+    'http://use1-1.relay.n0.iroh.link/',
+    'https://relay.n0.iroh.link/',
+    'https://evil.example/',
+    'https://use1-1.relay.n0.iroh.link.evil.example/',
+    'https://use1-1.relay.n0.iroh.link:8443/',
+    'https://use1-1.relay.n0.iroh.link/x',
+    'https://-x.relay.n0.iroh.link/',
+  ]) {
+    const r = parseFragment('#' + id + '&r=' + bad)
+    assert.equal(r.ok, true, bad)
+    assert.equal(r.appLink, 'skwod://join/' + id, bad)
+  }
+})

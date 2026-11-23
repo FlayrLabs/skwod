@@ -32,6 +32,12 @@ use iroh_mainline_address_lookup::DhtAddressLookup;
 
 use crate::NetError;
 
+/// How often the host re-puts its DHT record. iroh's default is an hour, and that hour also
+/// applies after a FAILED put (for example "Could not bootstrap the routing table" at start-up):
+/// members without public fallback then cannot find the host for up to an hour. Ten minutes
+/// recovers quickly and is still far inside the record's DHT lifetime.
+pub const DHT_REPUBLISH: std::time::Duration = std::time::Duration::from_secs(10 * 60);
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Role {
     /// Accepts `skwod/1`, publishes its addresses under its key, asks the router for a port mapping.
@@ -224,7 +230,7 @@ pub async fn bind(cfg: &NetConfig) -> Result<Endpoint, NetError> {
     }
     match &cfg.discovery {
         Discovery::Dht => {
-            let dht = DhtAddressLookup::builder().addr_filter(publish_filter());
+            let dht = DhtAddressLookup::builder().addr_filter(publish_filter()).republish_delay(DHT_REPUBLISH);
             b = b.address_lookup(if plan.dht_publish { dht } else { dht.no_publish() });
             if plan.n0_dns_publish {
                 b = b.address_lookup(PkarrPublisher::n0_dns());

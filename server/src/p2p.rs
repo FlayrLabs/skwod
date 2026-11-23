@@ -43,6 +43,18 @@ pub struct P2pStatus {
     pub public_fallback: bool,
 }
 
+/// The host's current home relay, if it uses public fallback and the relay is one an invite may
+/// name (`skwod_net::invite::is_allowed_relay`). Apps put it in share links (`&r=`) so a brand-new
+/// device can dial at once, without waiting on a DHT or DNS lookup.
+fn home_relay(state: &AppState, public_fallback: bool) -> Option<String> {
+    if !public_fallback {
+        return None;
+    }
+    let addr = state.p2p_endpoint.lock().expect("p2p endpoint lock").as_ref()?.addr();
+    let relay = addr.relay_urls().find_map(|u| skwod_net::invite::is_allowed_relay(u.as_str()));
+    relay
+}
+
 /// The LAN-discovery secret: `<data>/lan.key`, 0600, created when local discovery is first
 /// turned on. Members get it in invites and from `/api/instance/p2p`; nobody else does.
 pub const LAN_KEY_FILE: &str = "lan.key";
@@ -380,7 +392,12 @@ pub async fn start_with(state: AppState, router: Router, cfg: &NetConfig) -> Res
         .map_err(|e| e.to_string())?;
     state.p2p_authenticated.set_promoter(host.promoter());
     *state.lan_key.lock().expect("lan key lock") = if host.lan_advertising() { cfg.lan_key } else { None };
-    let _ = state.p2p.set(P2pStatus { node_id: host.node_id().to_z32(), node_bytes: *host.node_id().as_bytes(), public_fallback: cfg.public_fallback });
+    let _ = state.p2p.set(P2pStatus {
+        node_id: host.node_id().to_z32(),
+        node_bytes: *host.node_id().as_bytes(),
+        public_fallback: cfg.public_fallback,
+    });
+    *state.p2p_endpoint.lock().expect("p2p endpoint lock") = Some(host.endpoint().clone());
     Ok(host)
 }
 
@@ -393,6 +410,9 @@ async fn p2p_info(State(state): State<AppState>, _auth: AuthUser) -> Result<Json
     Ok(Json(match state.p2p.get() {
         Some(s) => json!({
             "enabled": true, "node_id": s.node_id, "public_fallback": s.public_fallback,
+            // The home relay right now (allow-listed n0 relays only), for `&r=` in share links.
+            "relay_url": home_relay(&state, s.public_fallback),
+            "qr_pairing": state.qr_pairing,
             // Present only while the host announces itself on its LAN (opt-in).
             "lan_key": state.lan_key.lock().expect("lan key lock").map(|k| k.to_hex()),
         }),

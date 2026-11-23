@@ -30,6 +30,7 @@ mod messages;
 mod music;
 mod oldbuilds;
 mod p2p;
+mod pairing;
 mod perms;
 mod privs;
 mod push;
@@ -61,6 +62,8 @@ mod audit_tests;
 mod audit2_tests;
 #[cfg(test)]
 mod build46_tests;
+#[cfg(test)]
+mod pairing_tests;
 #[cfg(test)]
 mod build47_tests;
 

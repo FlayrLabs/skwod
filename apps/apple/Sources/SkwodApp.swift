@@ -1026,7 +1026,9 @@ final class AppState: ObservableObject {
     /// persist, activate. `liveBase` is the URL the session was obtained through (the https
     /// address itself, or this launch's loopback proxy for a p2p host) — used here only to read
     /// and pin the server's identity; it is never stored.
-    func signIn(_ s: AuthSession, address: SkwodAddress, liveBase: String) async {
+    /// `pairedLocalId`: a device that paired by QR (build 48) already set up its cache under this
+    /// id; a new workspace for it must use the same one.
+    func signIn(_ s: AuthSession, address: SkwodAddress, liveBase: String, pairedLocalId: String? = nil) async {
         // Pin the server's cryptographic identity (the E2EE trust root hangs off it).
         let identity = try? await fetchServerIdentity(baseUrl: liveBase)
         // The instance id is the SERVER's string, and for a new skwod it becomes the workspace
@@ -1073,7 +1075,7 @@ final class AppState: ObservableObject {
         }
         // An unproven newcomer must never take a localId an existing workspace already uses.
         let takenIds = Set(workspaces.filter { $0.id != existing?.id }.map { $0.id })
-        var localId = existing?.localId ?? reportedInstanceId ?? Workspace.slug(for: stored)
+        var localId = existing?.localId ?? pairedLocalId ?? reportedInstanceId ?? Workspace.slug(for: stored)
         if existing == nil && (takenIds.contains(localId) || !WorkspaceIdRule.isSafe(localId)) { localId = UUID().uuidString.lowercased() }
         // A key that was pinned STAYS pinned. `existing` is only ever set on proof (the p2p
         // node id authenticated by the transport, or a pinned-key challenge above), so what this

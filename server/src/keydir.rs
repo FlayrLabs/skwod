@@ -95,6 +95,13 @@ pub fn routes() -> Router<AppState> {
         .route("/link-requests", post(create_link_request).get(list_link_requests))
         .route("/link-requests/:request_id", get(get_link_request))
         .route("/link-requests/:request_id/approve", post(approve_link_request))
+        .route("/pair-offers", post(crate::pairing::register_offer))
+        .route("/pair-requests", post(crate::pairing::create))
+        .route("/pair-requests/by-offer/:offer_id", get(crate::pairing::by_offer))
+        .route("/pair-requests/:request_id", delete(crate::pairing::deny))
+        .route("/pair-requests/:request_id/reveal", post(crate::pairing::reveal))
+        .route("/pair-requests/:request_id/approve", post(crate::pairing::approve))
+        .route("/pair-requests/:request_id/claim", post(crate::pairing::claim))
         .route("/users/:user_id/devices", get(user_devices))
         .route("/member-devices", get(member_devices))
         .route("/prekey-bundle", post(prekey_bundle))
@@ -116,12 +123,12 @@ pub fn routes() -> Router<AppState> {
 
 // ---- helpers ----
 
-fn b64_decode(s: &str) -> Result<Vec<u8>, ApiError> {
+pub(crate) fn b64_decode(s: &str) -> Result<Vec<u8>, ApiError> {
     B64.decode(s).map_err(|_| ApiError::BadRequest("invalid base64"))
 }
 
 /// Ensure `device_id` belongs to `user_id`; returns the device's identity key.
-async fn own_device_identity(state: &AppState, user_id: &str, device_id: &str) -> Result<Vec<u8>, ApiError> {
+pub(crate) async fn own_device_identity(state: &AppState, user_id: &str, device_id: &str) -> Result<Vec<u8>, ApiError> {
     sqlx::query_scalar("SELECT identity_key FROM user_devices WHERE user_id = $1 AND device_id = $2")
         .bind(user_id)
         .bind(device_id)
@@ -496,13 +503,18 @@ pub(crate) async fn destructive_authority(
 /// Point the calling session at `device_id` at `generation` (it registered, restored or proved
 /// that install of the device).
 async fn bind_session_to(db: impl sqlx::Executor<'_, Database = sqlx::Any>, auth: &AuthUser, device_id: &str, generation: i64) -> Result<(), ApiError> {
-    sqlx::query("UPDATE sessions SET device_id = $1, device_generation = $2 WHERE token_hash = $3 AND user_id = $4")
+    let bound = sqlx::query("UPDATE sessions SET device_id = $1, device_generation = $2 WHERE token_hash = $3 AND user_id = $4")
         .bind(device_id)
         .bind(generation)
         .bind(&auth.session_hash)
         .bind(&auth.user_id)
         .execute(db)
-        .await?;
+        .await?
+        .rows_affected();
+    // The session was revoked (or expired away) while the request was in flight: bind nothing.
+    if bound != 1 {
+        return Err(ApiError::Unauthorized);
+    }
     Ok(())
 }
 
@@ -797,6 +809,8 @@ async fn register_device(
         ResetAfterHold(i64, Vec<u8>),
     }
     let mut recovery_key_consumed = false;
+    // The QR pair request this registration rides on (build 48), claimed again atomically below.
+    let mut pair_request: Option<String> = None;
     let admission = match (&account, req.link.as_ref()) {
         (None, _) if count == 0 => Admission::First,
         // A link from a device CURRENTLY on the account.
@@ -826,8 +840,35 @@ async fn register_device(
             .bind(now - LINK_REQUEST_TTL_MS)
             .fetch_optional(&state.db)
             .await?;
-            if approved.as_deref() != Some(signature.as_slice()) {
+            // Or (build 48) a QR pair request the linker approved for this key, uncontested,
+            // whose one session was claimed by the holder of this identity key.
+            let paired: Option<(String, Vec<u8>)> = if approved.is_none() && state.qr_pairing {
+                // ...by THIS session (the one the claim issued), before its offer expired, once.
+                sqlx::query_as(
+                    "SELECT r.id, r.link_sig FROM device_pair_requests r
+                     JOIN device_pair_offers o ON o.offer_id = r.offer_id AND o.user_id = r.user_id
+                     WHERE r.user_id = $1 AND r.identity_key = $2 AND r.approver_device_id = $3 AND r.link_sig IS NOT NULL
+                       AND r.contested = 0 AND r.claimed = 1 AND r.registered = 0 AND r.session_hash = $4
+                       AND r.created_at >= $5 AND o.expires_at >= $6",
+                )
+                .bind(&auth.user_id)
+                .bind(&identity_key)
+                .bind(&proof.device_id)
+                .bind(&auth.session_hash)
+                .bind(now - LINK_REQUEST_TTL_MS)
+                .bind(now)
+                .fetch_optional(&state.db)
+                .await?
+            } else {
+                None
+            };
+            let via_pair = approved.is_none() && paired.is_some();
+            let (paired_id, paired_sig) = paired.map_or((None, None), |(id, sig)| (Some(id), Some(sig)));
+            if approved.or(paired_sig).as_deref() != Some(signature.as_slice()) {
                 return Err(ApiError::LinkRequired);
+            }
+            if via_pair {
+                pair_request = paired_id;
             }
             Admission::Linked(proof.device_id.clone(), signature)
         }
@@ -936,7 +977,7 @@ async fn register_device(
     if matches!(admission, Admission::ResetByPin | Admission::ResetAfterHold(..)) {
         // The account starts its device list over: every previous device, its prekeys and its
         // mailbox go, so every peer sees a new device with a new identity (safety number changes).
-        for table in ["user_devices", "one_time_prekeys", "sealed_envelopes", "device_link_requests", "device_recoveries", "push_registrations", "push_tokens"] {
+        for table in ["user_devices", "one_time_prekeys", "sealed_envelopes", "device_link_requests", "device_pair_requests", "device_recoveries", "push_registrations", "push_tokens"] {
             sqlx::query(&format!("DELETE FROM {table} WHERE user_id = $1")).bind(&auth.user_id).execute(&mut *tx).await?;
         }
         // Every session of the old device set ends with it; only the resetting session stays.
@@ -1029,11 +1070,38 @@ async fn register_device(
     .execute(&mut *tx)
     .await?;
     insert_one_time_keys(&mut tx, &auth.user_id, &device_id, &one_time, now).await?;
-    sqlx::query("DELETE FROM device_link_requests WHERE user_id = $1 AND identity_key = $2")
+    sqlx::query("DELETE FROM device_link_requests WHERE user_id = $1 AND identity_key = $2").bind(&auth.user_id).bind(&identity_key).execute(&mut *tx).await?;
+    // A QR pair request is marked, never deleted, and its offer consumed: a deleted row let a
+    // later request for the same (still unexpired) offer start afresh.
+    sqlx::query(
+        "UPDATE device_pair_offers SET consumed = 1
+         WHERE offer_id IN (SELECT offer_id FROM device_pair_requests WHERE user_id = $1 AND identity_key = $2)",
+    )
+    .bind(&auth.user_id)
+    .bind(&identity_key)
+    .execute(&mut *tx)
+    .await?;
+    if let Some(id) = &pair_request {
+        // Everything checked above, checked again in the one statement that takes the row, so a
+        // contest, revocation or expiry in between cannot slip through.
+        let took = sqlx::query(
+            "UPDATE device_pair_requests SET registered = 1
+             WHERE id = $1 AND user_id = $2 AND identity_key = $3 AND contested = 0 AND claimed = 1 AND registered = 0 AND session_hash = $4
+               AND offer_id IN (SELECT offer_id FROM device_pair_offers WHERE expires_at >= $5)",
+        )
+        .bind(id)
         .bind(&auth.user_id)
         .bind(&identity_key)
+        .bind(&auth.session_hash)
+        .bind(now)
         .execute(&mut *tx)
-        .await?;
+        .await?
+        .rows_affected();
+        if took != 1 {
+            return Err(ApiError::LinkRequired);
+        }
+    }
+    sqlx::query("UPDATE device_pair_requests SET registered = 1 WHERE user_id = $1 AND identity_key = $2").bind(&auth.user_id).bind(&identity_key).execute(&mut *tx).await?;
     bind_session_to(&mut *tx, &auth, &device_id, 0).await?;
     tx.commit().await?;
     // Tell the account's other devices right away that a device was added.
@@ -1937,7 +2005,7 @@ async fn list_devices(State(state): State<AppState>, auth: AuthUser) -> Result<J
 
 // ---- device linking ----
 
-const LINK_REQUEST_TTL_MS: i64 = 10 * 60 * 1000;
+pub(crate) const LINK_REQUEST_TTL_MS: i64 = 10 * 60 * 1000;
 
 #[derive(Deserialize)]
 pub struct LinkRequestCreate {
@@ -2007,7 +2075,7 @@ pub struct LinkApproval {
     pub bundle: Option<String>,
 }
 
-const MAX_LINK_BUNDLE: usize = 256 * 1024;
+pub(crate) const MAX_LINK_BUNDLE: usize = 256 * 1024;
 
 /// An existing device approves a link request. The server checks the signature really is that
 /// device's vouching for the requested identity (it cannot check the MAC — it has no code).

@@ -29,6 +29,10 @@ struct AuthView: View {
     @State private var password = ""
     @State private var busy = false
     @State private var errorText = ""
+    /// The last attempt could not reach a p2p host: the button says "Try again" and tips show.
+    @State private var hostUnreachable = false
+    /// A device pairing by a scanned QR (build 48).
+    @State private var pairing: NewDevicePairing?
     @State private var showHost = false
     /// If the pasted address is a skwod you already belong to (it just moved), its name — for a
     /// credential-free Reconnect instead of making you sign in again.
@@ -94,16 +98,19 @@ struct AuthView: View {
             adoptIncomingInvite()
             #if DEBUG
             if let invite = E2E.env("SKWOD_E2E_INVITE"), inviteLink.isEmpty, server.isEmpty { adopt(invite) }
+            if let qr = E2E.env("SKWOD_E2E_PAIR_QR"), pairing == nil, app.workspaces.isEmpty { adopt(qr) }
             #endif
         }
         .onChange(of: app.incomingInvite) { _, _ in adoptIncomingInvite() }
+        .sheet(item: $pairing) { p in NewDevicePairingSheet(pairing: p).environmentObject(app) }
         .onChange(of: app.signedOut) { _, _ in adoptSignedOut() }
         .onChange(of: inviteLink) { _, _ in if !checkingLink { inviteState = .unknown } }
         #if os(iOS)
         .sheet(isPresented: $showScanner) {
-            QRScannerSheet { scanned in
+            QRScannerSheet(prompt: "Point the camera at your host's invite, or at “Add a device” on your other device.") { scanned in
                 showScanner = false
-                adopt(scanned)
+                // After the scanner has gone: a pairing QR opens a sheet of its own.
+                Task { try? await Task.sleep(for: .milliseconds(600)); adopt(scanned) }
             }
         }
         #endif
@@ -230,6 +237,10 @@ struct AuthView: View {
     /// Put a link (deep link, QR scan, pasteboard) into the right field. Invalid input is shown
     /// as an error and never placed in a field.
     private func adopt(_ raw: String, source: InviteDialRule.Source = .userAction) {
+        if raw.trimmingCharacters(in: .whitespacesAndNewlines).hasPrefix("skwod-pair:") {
+            adoptPairing(raw)
+            return
+        }
         do {
             let parsed = try InviteLink.parse(LoginEntry.canonical(raw))
             errorText = ""
@@ -322,6 +333,22 @@ struct AuthView: View {
                 .glassEffect(.regular, in: .rect(cornerRadius: 16, style: .continuous))
                 .accessibilityIdentifier("auth.signedOut")
             }
+            #if os(iOS)
+            // Build 48: signing in on a new phone is one scan of the QR your other device shows
+            // (Profile → Devices → Add a device). The link field below stays as the fallback.
+            do {
+                VStack(spacing: 6) {
+                    Button { showScanner = true } label: {
+                        Label("Scan from your other device", systemImage: "qrcode.viewfinder")
+                            .fontWeight(.semibold).frame(maxWidth: .infinity).padding(.vertical, 6)
+                    }
+                    .controlSize(.large).buttonStyle(.glassProminent).tint(.skAccent).foregroundStyle(.black)
+                    .accessibilityIdentifier("auth.scanPairing")
+                    Text("Have a link instead? Paste it below.")
+                        .font(.caption2).foregroundStyle(.white.opacity(0.45))
+                }
+            }
+            #endif
             Picker("", selection: Binding(get: { isSignup }, set: { new in
                 withAnimation(.smooth) { isSignup = new }
                 userChoseLogIn = !new
@@ -436,12 +463,33 @@ struct AuthView: View {
                     .font(.caption).foregroundStyle(.red.opacity(0.9))
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .fixedSize(horizontal: false, vertical: true)
+                if hostUnreachable {
+                    Text(HostUnreachableHint.tips)
+                        .font(.caption2).foregroundStyle(.white.opacity(0.6))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .fixedSize(horizontal: false, vertical: true)
+                    // The relay setting lives in Profile, which a signed-out device can't open.
+                    if !P2PManager.publicFallback {
+                        Text(HostUnreachableHint.relaysOff)
+                            .font(.caption2).foregroundStyle(.orange.opacity(0.9))
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .fixedSize(horizontal: false, vertical: true)
+                        Button("Use a relay when needed, and try again") {
+                            P2PManager.publicFallback = true
+                            Task { await authenticate() }
+                        }
+                        .font(.caption.weight(.semibold)).buttonStyle(.glass).tint(.skAccent)
+                        .accessibilityIdentifier("auth.enableRelays")
+                    }
+                }
             }
 
             Button(action: { Task { await authenticate() } }) {
                 HStack(spacing: 8) {
                     if busy { ProgressView().controlSize(.small).tint(.white) }
-                    Text(busy && !statusText.isEmpty ? statusText : (isSignup ? "Create account" : "Log in")).fontWeight(.semibold)
+                    Text(busy && !statusText.isEmpty ? statusText
+                         : hostUnreachable ? "Try again"
+                         : (isSignup ? "Create account" : "Log in")).fontWeight(.semibold)
                 }
                 .frame(maxWidth: .infinity).padding(.vertical, 6)
             }
@@ -592,6 +640,29 @@ struct AuthView: View {
         .simultaneousGesture(TapGesture().onEnded { if focus != field { focus = field } })
     }
 
+    /// A scanned "Add a device" QR (build 48): it names a skwod (by key), a relay and an account,
+    /// and carries a one-time code and a commitment. Nothing here touches the network: the next
+    /// screen first asks "Join … as …?", and only then dials and pairs (`NewDevicePairing`).
+    ///
+    /// Security: anyone can print a QR, so a scanned one is never a reason to type a password, and
+    /// pairing needs none. The skwod is named by a workspace this device already has, otherwise by
+    /// the host's short key — never by anything the QR says — and the person picks the matching
+    /// emoji on the device they already use.
+    private func adoptPairing(_ raw: String) {
+        do {
+            let offer = try pairingQrDecode(text: raw, now: UInt64(Date().timeIntervalSince1970))
+            let mine = app.workspaces.first { $0.nodeId == offer.nodeId }
+            errorText = ""
+            pairing = NewDevicePairing(offer: offer, known: mine != nil, knownName: mine?.name)
+        } catch {
+            errorText = coreErrorText(error, fallback: "That QR code isn't from Skwod's “Add a device”.")
+            #if DEBUG
+            E2E.pairingErrorDetail = String(describing: error)
+            E2E.notePairing(.failed(errorText))
+            #endif
+        }
+    }
+
     /// Credential-free reconnect to a skwod you already belong to whose address moved.
     private func reconnect(_ name: String) async {
         busy = true; errorText = ""; focus = nil
@@ -604,7 +675,7 @@ struct AuthView: View {
     }
 
     private func authenticate() async {
-        busy = true; errorText = ""; statusText = ""; focus = nil
+        busy = true; errorText = ""; statusText = ""; hostUnreachable = false; focus = nil
         defer { busy = false; statusText = "" }
         // 1) Validate what was entered. Nothing touches the network before this passes.
         let invite: ParsedInvite
@@ -621,10 +692,16 @@ struct AuthView: View {
         // 2) Reach the skwod. For a p2p host this finds the host by its key and connects — the
         //    connection only succeeds if the other end holds that key.
         let base: String
-        if invite.address.nodeId != nil { statusText = "Finding your host…" }
+        if let nodeId = invite.address.nodeId {
+            statusText = "Finding your host…"
+            RelayHintStore.set(invite.relayHint, for: nodeId)
+        }
+        // Bounded: the core gives up after ~20 s and P2PManager has its own backstop, so this
+        // always ends in either a connection or the error below — never an endless spinner.
         do { base = try await app.liveBase(for: invite.address) } catch {
+            hostUnreachable = invite.address.nodeId != nil
             errorText = invite.address.nodeId != nil
-                ? "Couldn't reach your host. Their computer may be off, asleep or offline — ask them to open Skwod, then try again."
+                ? HostUnreachableHint.message
                 : "Can't reach that Skwod. Check the address."
             return
         }

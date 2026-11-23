@@ -228,7 +228,7 @@ impl SkwodClient {
             attempts: 0,
             error: None,
             next_at: 0,
-            created_at: now_ms(),
+            created_at: next_queued_ms(),
         };
         let stored = self.with_cache(|c| {
             if c.outbox_pending().map(|p| p.len()).unwrap_or(0) >= MAX_QUEUED {
@@ -561,6 +561,24 @@ impl SkwodClient {
         if let Some(e) = self.outbox_all().into_iter().find(|e| e.local_id == local_id) {
             self.outbox_drop(&e.local_id);
             self.undo_optimistic(&e);
+        }
+    }
+}
+
+
+/// The time a queued item is filed under: the clock, but never the same millisecond twice, so
+/// messages queued in quick succession keep the order they were written in (history sorts by
+/// time, then by id — and ids are random).
+fn next_queued_ms() -> i64 {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    static LAST: AtomicI64 = AtomicI64::new(0);
+    let now = now_ms();
+    let mut prev = LAST.load(Ordering::Relaxed);
+    loop {
+        let next = now.max(prev + 1);
+        match LAST.compare_exchange_weak(prev, next, Ordering::Relaxed, Ordering::Relaxed) {
+            Ok(_) => return next,
+            Err(p) => prev = p,
         }
     }
 }

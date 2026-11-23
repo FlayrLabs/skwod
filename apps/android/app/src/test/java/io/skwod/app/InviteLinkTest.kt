@@ -150,4 +150,23 @@ class InviteLinkTest {
         assertEquals("SKWD-AB12-CD34", InviteLink.parse(Qr.decode(y, size, size)!!).joinCode)
         assertNull(Qr.decode(ByteArray(size * size) { 0x7F }, size, size))      // no code in the frame
     }
+
+    @Test fun relayHintIsKeptOnlyForAllowListedRelays() {
+        // Its own node id: parsing an `&r=` link records a hint, and other tests compare exact links.
+        val rnode = node.reversed()
+        val ok = InviteLink.parse("https://skwod.io/join#$rnode.abc&r=https://use1-1.relay.n0.iroh.link./")
+        assertEquals("https://use1-1.relay.n0.iroh.link/", ok.relayHint)
+        assertEquals("https://use1-1.relay.n0.iroh.link/", RelayHints.get(rnode))
+        assertEquals("https://use1-1.relay.n0.iroh.link/", InviteLink.parse("skwod://join/$rnode?r=https://use1-1.relay.n0.iroh.link/#abc").relayHint)
+        for (bad in listOf(
+            "http://use1-1.relay.n0.iroh.link/", "https://relay.n0.iroh.link/", "https://evil.example/",
+            "https://use1-1.relay.n0.iroh.link.evil.example/", "https://use1-1.relay.n0.iroh.link:8443/",
+            "https://use1-1.relay.n0.iroh.link/x", "https://-x.relay.n0.iroh.link/",
+        )) {
+            assertNull(bad, InviteLink.allowedRelay(bad))
+            assertNull(bad, InviteLink.parse("https://skwod.io/join#$rnode&r=$bad").relayHint)
+        }
+        val link = InviteLink.shareLink(rnode, "abc", relayUrl = "https://use1-1.relay.n0.iroh.link/")
+        assertEquals("https://skwod.io/join#$rnode.abc&r=https://use1-1.relay.n0.iroh.link/", link)
+    }
 }

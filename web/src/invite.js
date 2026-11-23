@@ -1,22 +1,26 @@
 // The share-link grammar, shared by the join page and its tests. Mirror of
 // core/skwod-net/src/invite.rs (the Rust reference, in the native tree) — keep the two in step.
 //
-//   https://skwod.io/join#<node id>[.<join code>][&u=<https url>][&l=<hex>]
+//   https://skwod.io/join#<node id>[.<join code>][&u=<https url>][&l=<hex>][&r=<relay url>]
 //
 //   <node id>    the host's public key: exactly 52 z-base-32 characters. It is the address.
 //   <join code>  1 to 128 of A-Z a-z 0-9 - _
 //   u            optional https address of the same skwod (hosts that also have a domain)
 //   l            optional LAN-discovery key (hex)
+//   r            optional home relay of the host: https://<region>.relay.n0.iroh.link/ only
+//                (allow-listed; anything else is dropped). Lets the app dial without a lookup.
 //
 // All of it is the URL fragment. Browsers do not send fragments to servers, so skwod.io never
 // receives the key or the code. The app form of the same invite is
 //
-//   skwod://join/<node id>[?u=…&l=…]#<join code>
+//   skwod://join/<node id>[?u=…&l=…&r=…]#<join code>
 
 const NODE_ID = /^[ybndrfg8ejkmcpqxot1uwisza345h769]{52}$/
 const CODE = /^[A-Za-z0-9_-]{1,128}$/
 const FALLBACK = /^https:\/\/[A-Za-z0-9.-]{1,253}(:[0-9]{1,5})?(\/[A-Za-z0-9._~\/-]*)?$/
 const LAN_KEY = /^[0-9a-f]{2,128}$/
+// Same rule as is_allowed_relay in invite.rs: https, an n0 relay host, no port/path/query.
+const RELAY = /^https:\/\/((?!-)[a-z0-9-]{1,63}(?<!-)\.)+relay\.n0\.iroh\.link\.?\/?$/i
 const MAX_LENGTH = 1024
 
 /**
@@ -48,9 +52,17 @@ export function parseFragment(hash) {
   if (u !== null && FALLBACK.test(u)) query.push('u=' + u)
   const l = value('l')
   if (l !== null && LAN_KEY.test(l)) query.push('l=' + l)
+  const r = value('r')
+  if (r !== null && RELAY.test(r)) query.push('r=' + canonicalRelay(r))
 
   const appLink = 'skwod://join/' + nodeId + (query.length ? '?' + query.join('&') : '') + (code ? '#' + code : '')
   return { ok: true, nodeId, code: code || null, appLink, shortKey: nodeId.slice(0, 6) + '…' + nodeId.slice(-6) }
+}
+
+/** `https://<host>/`, lowercase, no trailing dot — what the Rust parser keeps. */
+function canonicalRelay(r) {
+  const host = r.slice('https://'.length).replace(/\/$/, '').replace(/\.$/, '').toLowerCase()
+  return 'https://' + host + '/'
 }
 
 /** 'ios' | 'android' | 'mac' | 'other'. Used only to order the buttons; never sent anywhere. */

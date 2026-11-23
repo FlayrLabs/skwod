@@ -737,11 +737,39 @@ pub struct InboundMessage {
     pub undecryptable: bool,
 }
 
+/// The pairing stopped because the nonce did not match the QR's commitment.
+pub const PAIR_NONCE_MISMATCH: &str = "the other device's check did not match this code, so nothing was added; make a new code on your other device";
+
+/// A refused pair request in words (404: the host has not turned QR pairing on; 409: the code is
+/// already in use by another device).
+fn pair_error(e: ClientError) -> EngineError {
+    match e {
+        ClientError::Status { status: 404, .. } => EngineError::Protocol("this Skwod's host hasn't turned on adding devices by QR"),
+        ClientError::Status { status: 409, .. } => EngineError::Protocol("this code is already in use by another device; make a new one on your other device"),
+        e => e.into(),
+    }
+}
+
+/// Where a QR pairing stands on the new device ([`Engine::pair_poll`]).
+#[derive(Debug)]
+pub enum PairPoll {
+    /// Nothing from the existing device yet.
+    Waiting,
+    /// The existing device has seen this device's key and released its nonce (checked against the
+    /// QR's commitment): the emoji can be shown now.
+    Revealed(Vec<u8>),
+    /// Approved: this device is linked and registered — (session json, device id).
+    Paired(serde_json::Value, String),
+}
+
 /// The E2EE engine for one device.
 pub struct Engine {
     api: ApiClient,
     /// Credential-less client used ONLY for sealed-sender deposits.
     sealed_api: ApiClient,
+    /// QR pairing without a session (build 48): (poll secret b64, account user id, the nonce
+    /// commitment the QR carried). Memory only.
+    pending_pair: Option<(String, String, [u8; 16])>,
     store: SignalStore,
     user_id: Option<String>,
     device_id: Option<String>,
@@ -915,6 +943,7 @@ impl Engine {
         Self {
             api,
             sealed_api,
+            pending_pair: None,
             store: SignalStore::generate(),
             user_id: None,
             device_id: None,
@@ -1712,13 +1741,34 @@ impl Engine {
     /// device calls [`Engine::complete_link`] until it returns a device id. Calling again while a
     /// link is pending returns the same code.
     pub async fn begin_link(&mut self) -> Result<String, EngineError> {
+        self.begin_link_inner(None).await
+    }
+
+    /// [`Engine::begin_link`] with a code minted by the EXISTING device (QR pairing, build 48):
+    /// this device presents `code` instead of showing one. Returns the account's user id, which
+    /// the confirmation emoji are bound to.
+    pub async fn begin_link_with_code(&mut self, code: &str) -> Result<String, EngineError> {
+        self.begin_link_inner(Some(code)).await?;
+        self.account_user_id().await
+    }
+
+    /// This device's identity key (public), for the pairing confirmation.
+    pub fn identity_key(&self) -> Vec<u8> {
+        self.store.identity_key()
+    }
+
+    async fn begin_link_inner(&mut self, given: Option<&str>) -> Result<String, EngineError> {
         if let Some((code, request_id)) = &self.pending_link {
-            if self.api.get(&format!("/api/e2ee/link-requests/{}", enc(request_id))).await.is_ok() {
+            let same = given.is_none_or(|g| skwod_crypto::link::normalize_code(g) == skwod_crypto::link::normalize_code(code));
+            if same && self.api.get(&format!("/api/e2ee/link-requests/{}", enc(request_id))).await.is_ok() {
                 return Ok(code.clone());
             }
         }
         let user_id = self.account_user_id().await?;
-        let code = skwod_crypto::link::generate_code();
+        let code = match given {
+            Some(g) => g.to_string(),
+            None => skwod_crypto::link::generate_code(),
+        };
         let identity = self.store.identity_key();
         let resp = self
             .api
@@ -1753,6 +1803,98 @@ impl Engine {
         if v["approved"].as_bool() != Some(true) {
             return Ok(None);
         }
+        self.finish_link(&code, &user_id, &v).await.map(Some)
+    }
+
+    /// QR pairing on a device with NO session (build 48): open a pair request for `username`
+    /// (account `user_id`, both from the QR) bound to the offer (its id derives from `code`). The
+    /// existing device approves it after comparing emoji; [`Engine::pair_poll`] then claims a
+    /// session by signing with this device's identity key. No password is involved.
+    pub async fn pair_begin(&mut self, code: &str, user_id: &str, username: &str, commitment: [u8; 16]) -> Result<(), EngineError> {
+        let identity = self.store.identity_key();
+        let secret = B64.encode(skwod_crypto::random_bytes::<32>());
+        let resp = self
+            .sealed_api
+            .post(
+                "/api/e2ee/pair-requests",
+                serde_json::json!({
+                    "username": username,
+                    "offer_id": skwod_crypto::link::pair_offer_id(code),
+                    "identity_key": B64.encode(&identity),
+                    "proof": B64.encode(skwod_crypto::link::request_proof(code, user_id, &identity)),
+                    "poll_secret": secret,
+                }),
+            )
+            .await
+            .map_err(pair_error)?;
+        let request_id = resp["request_id"].as_str().ok_or(EngineError::Protocol("pair request response"))?.to_string();
+        self.pending_link = Some((code.to_string(), request_id));
+        self.pending_pair = Some((secret, user_id.to_string(), commitment));
+        Ok(())
+    }
+
+    /// Poll a pairing started with [`Engine::pair_begin`]: a claim signed by this device's
+    /// identity key. [`PairPoll::Revealed`] once the existing device released its nonce (which
+    /// must match the QR's commitment); after approval this engine takes the ONE session the
+    /// server hands out, finishes the link exactly as [`Engine::complete_link`] does (MAC under
+    /// the code, link signature, sealed bundle), registers, and returns [`PairPoll::Paired`].
+    pub async fn pair_poll(&mut self) -> Result<PairPoll, EngineError> {
+        let (Some((code, request_id)), Some((secret, user_id, commitment))) = (self.pending_link.clone(), self.pending_pair.clone()) else {
+            return Err(EngineError::Protocol("no pairing in progress"));
+        };
+        let raw_secret = B64.decode(&secret).map_err(|_| EngineError::Protocol("pair secret"))?;
+        let offer_id = skwod_crypto::link::pair_offer_id(&code);
+        let ts = now_ms();
+        let payload = skwod_crypto::link::op_payload(&[offer_id.as_bytes(), &<sha2::Sha256 as sha2::Digest>::digest(&raw_secret)]);
+        let signature = self.store.sign_device_op("pair-claim", &user_id, &request_id, ts, &payload)?;
+        let body = serde_json::json!({ "poll_secret": secret, "timestamp": ts, "signature": B64.encode(signature) });
+        let v = match self.sealed_api.post(&format!("/api/e2ee/pair-requests/{}/claim", enc(&request_id)), body).await {
+            Ok(v) => v,
+            Err(ClientError::Status { status: 404, .. }) => {
+                self.pending_link = None;
+                self.pending_pair = None;
+                return Err(EngineError::Protocol("this pairing was not approved, or it expired; make a new code on your other device"));
+            }
+            Err(e) => return Err(e.into()),
+        };
+        // The nonce must be the one the QR committed to; anything else was not made by the device
+        // that showed the QR, and the pairing stops.
+        let nonce = match v["nonce"].as_str() {
+            None => None,
+            Some(n) => {
+                let n = B64.decode(n).ok().filter(|n| n.len() == 32 && skwod_crypto::link::pair_commitment(&code, n) == commitment);
+                if n.is_none() {
+                    self.pending_link = None;
+                    self.pending_pair = None;
+                    return Err(EngineError::Protocol(PAIR_NONCE_MISMATCH));
+                }
+                n
+            }
+        };
+        if v["approved"].as_bool() != Some(true) {
+            return Ok(nonce.map_or(PairPoll::Waiting, PairPoll::Revealed));
+        }
+        // Approved: never without the nonce the person compared emoji under.
+        if nonce.is_none() {
+            self.pending_link = None;
+            self.pending_pair = None;
+            return Err(EngineError::Protocol(PAIR_NONCE_MISMATCH));
+        }
+        let session = v["session"].clone();
+        let (Some(token), Some(session_user)) = (session["token"].as_str(), session["user_id"].as_str()) else {
+            return Err(EngineError::Protocol("pair approval response"));
+        };
+        if session_user != user_id {
+            return Err(EngineError::Protocol("pair approval is for another account"));
+        }
+        self.api = self.api.anonymous().with_token(token.to_string());
+        self.pending_pair = None;
+        let device_id = self.finish_link(&code, &user_id, &v).await?;
+        Ok(PairPoll::Paired(session, device_id))
+    }
+
+    async fn finish_link(&mut self, code: &str, user_id: &str, v: &serde_json::Value) -> Result<String, EngineError> {
+        let (code, user_id) = (code.to_string(), user_id.to_string());
         let field = |k: &str| v[k].as_str().and_then(|s| B64.decode(s).ok()).ok_or(EngineError::Protocol("link approval response"));
         let linker_device = v["device_id"].as_str().ok_or(EngineError::Protocol("link approval response"))?.to_string();
         let linker_identity = field("identity_key")?;
@@ -1776,7 +1918,7 @@ impl Engine {
         // Tell the linker its set arrived (it re-sends until it hears this).
         let linker = DeviceAddress::new(user_id, linker_device);
         let _ = self.send_content(std::slice::from_ref(&linker), &Content::SiblingsAck).await;
-        Ok(Some(device_id))
+        Ok(device_id)
     }
 
     /// On an EXISTING device: approve the pending link request that matches `code` (the code shown
@@ -1784,6 +1926,90 @@ impl Engine {
     /// pending request matches the code — a wrong code, an expired request, or a request made by
     /// someone who is not holding the device that shows that code.
     pub async fn approve_link(&mut self, code: &str) -> Result<bool, EngineError> {
+        self.approve_link_inner(code).await
+    }
+
+    /// On an EXISTING device (QR pairing): the pair request made for the offer with `code`, if
+    /// any — `(user id, request id, identity key, contested)`. Approves nothing. A request whose
+    /// proof does not verify under the code is ignored.
+    pub async fn find_pair_request(&mut self, code: &str) -> Result<Option<(String, String, Vec<u8>, bool)>, EngineError> {
+        let local = self.local()?;
+        let v = match self.api.get(&format!("/api/e2ee/pair-requests/by-offer/{}", skwod_crypto::link::pair_offer_id(code))).await {
+            Ok(v) => v,
+            Err(ClientError::Status { status: 404, .. }) => return Ok(None),
+            Err(e) => return Err(e.into()),
+        };
+        let (Some(id), Some(identity), Some(proof)) = (
+            v["request_id"].as_str(),
+            v["identity_key"].as_str().and_then(|s| B64.decode(s).ok()),
+            v["proof"].as_str().and_then(|s| B64.decode(s).ok()),
+        ) else {
+            return Err(EngineError::Protocol("pair request response"));
+        };
+        if !skwod_crypto::link::verify_request_proof(code, &local.user_id, &identity, &proof) {
+            return Ok(None);
+        }
+        Ok(Some((local.user_id, id.to_string(), identity, v["contested"].as_bool().unwrap_or(true))))
+    }
+
+    /// On an EXISTING device: release this offer's `nonce` for exactly `identity`, the key it
+    /// saw on request `request_id` (once; the server refuses another key or a second nonce).
+    pub async fn reveal_pair(&mut self, request_id: &str, identity: &[u8], nonce: &[u8]) -> Result<(), EngineError> {
+        self.ensure_bound().await?;
+        self.api
+            .post(
+                &format!("/api/e2ee/pair-requests/{}/reveal", enc(request_id)),
+                serde_json::json!({ "identity_key": B64.encode(identity), "nonce": B64.encode(nonce) }),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// On an EXISTING device: approve pair request `request_id` for exactly `identity` (the key
+    /// whose emoji were confirmed). The server refuses a contested offer or another key.
+    pub async fn approve_pair(&mut self, code: &str, request_id: &str, identity: &[u8]) -> Result<(), EngineError> {
+        let local = self.local()?;
+        self.ensure_bound().await?;
+        let signature = self.store.sign_link(&local.user_id, identity)?;
+        if self.restored_install && self.linked_here.len() < 64 {
+            self.linked_here.insert(identity.to_vec());
+        }
+        let mac = skwod_crypto::link::approval_mac(code, &local.user_id, &self.store.identity_key(), identity);
+        let bundle = self.link_bundle_for(code, &local.user_id, identity);
+        self.api
+            .post(
+                &format!("/api/e2ee/pair-requests/{}/approve", enc(request_id)),
+                serde_json::json!({ "device_id": local.device_id, "signature": B64.encode(signature), "approval_mac": B64.encode(mac), "bundle": bundle, "identity_key": B64.encode(identity) }),
+            )
+            .await?;
+        self.last_sibling_check = None;
+        Ok(())
+    }
+
+    /// On an EXISTING device: register the offer its QR shows (device-signed), so a new device
+    /// can open a request for it. `expires_at_ms`: when the offer ends; the account's username
+    /// is what the server knows it by.
+    pub async fn register_pair_offer(&mut self, code: &str, username: &str, expires_at_ms: i64) -> Result<(), EngineError> {
+        self.ensure_bound().await?;
+        let offer_id = skwod_crypto::link::pair_offer_id(code);
+        let payload = skwod_crypto::link::op_payload(&[&expires_at_ms.to_be_bytes(), username.as_bytes()]);
+        let proof = self.device_proof("pair-offer", &offer_id, &payload)?;
+        self.api
+            .signed(reqwest::Method::POST, "/api/e2ee/pair-offers", Some(serde_json::json!({ "offer_id": offer_id, "expires_at": expires_at_ms })), &proof)
+            .await
+            .map_err(pair_error)?;
+        Ok(())
+    }
+
+    /// On an EXISTING device: refuse pair request `request_id`.
+    pub async fn deny_pair(&mut self, request_id: &str) -> Result<(), EngineError> {
+        // The server takes a denial only from a session bound to a current device.
+        self.ensure_bound().await?;
+        self.api.delete(&format!("/api/e2ee/pair-requests/{}", enc(request_id))).await?;
+        Ok(())
+    }
+
+    async fn approve_link_inner(&mut self, code: &str) -> Result<bool, EngineError> {
         let local = self.local()?;
         self.ensure_bound().await?;
         let v = self.api.get("/api/e2ee/link-requests").await?;

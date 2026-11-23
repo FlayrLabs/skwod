@@ -258,7 +258,7 @@ struct SecureJoinView: View {
     /// Ask the server for its p2p address (members only). A workspace joined by key already
     /// knows it; the Mac that hosts it reads it from its own server; a VPS reports it here.
     private func loadNodeId() async {
-        if let known = app.current?.nodeId { hostNodeId = known; return }
+        if let known = app.current?.nodeId { hostNodeId = known }
         guard let token = app.session?.token, let base = URL(string: app.serverURL), !app.serverURL.isEmpty else { return }
         var req = URLRequest(url: base.appendingPathComponent("api/instance/p2p"))
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
@@ -267,7 +267,9 @@ struct SecureJoinView: View {
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               obj["enabled"] as? Bool == true, let id = obj["node_id"] as? String,
               (try? InviteLink.parse(InviteLink.p2pPrefix + id)) != nil else { return }
-        hostNodeId = id
+        // The host's home relay goes into the links handed out from here (`&r=`).
+        RelayHintStore.set(obj["relay_url"] as? String, for: id)
+        if hostNodeId == nil { hostNodeId = id }
     }
 
     private func kindLabel(_ kind: String) -> String {

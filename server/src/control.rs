@@ -163,7 +163,15 @@ impl HostControl {
             match self.start_p2p_with_retries(&opts).await {
                 Ok(host) => {
                     lan = host.lan_advertising();
-                    tracing::info!(public_fallback = opts.public_fallback, "p2p endpoint up (address = this instance's key; discovery via Mainline DHT + local network)");
+                    // Say what is actually published: the old line claimed "local network" even with
+                    // LAN discovery off, and never mentioned n0 DNS, which is what new members
+                    // without a DHT path depend on.
+                    tracing::info!(
+                        public_fallback = opts.public_fallback,
+                        local_discovery = lan,
+                        "p2p endpoint up (address = this instance's key; published to {})",
+                        if opts.public_fallback { "Mainline DHT + n0 DNS, reachable via n0 relays" } else { "Mainline DHT only" }
+                    );
                     running.p2p = Some(host);
                 }
                 // The TCP listener still works (VPS/reverse-proxy hosts), so this is not fatal.

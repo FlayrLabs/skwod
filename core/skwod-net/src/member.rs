@@ -10,8 +10,14 @@ use tokio::sync::Mutex;
 use crate::wire::{self, BiStream};
 use crate::{NetConfig, NetError};
 
-/// DHT lookup + hole punching on a cold start can take a few seconds; past this we call it unreachable.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// The WHOLE first connect — binding the endpoint, the DHT / n0 lookup, hole punching, the
+/// admission proof — has this long. A reachable host answers in 1–3 s (relay or direct); past
+/// this the app shows "couldn't reach your host" with Try again, instead of spinning forever.
+pub const CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
+/// The admission proof is best effort; it never holds a connect longer than this.
+const PROOF_TIMEOUT: Duration = Duration::from_secs(5);
+/// Closing a failed endpoint is bounded too, and done off the caller's path.
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(3);
 const RETRY_PAUSE: Duration = Duration::from_millis(750);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -109,15 +115,30 @@ impl Member {
     /// Bind a member endpoint and establish the first connection to `host`. With
     /// [`crate::Discovery::Dht`], `host` can be just `EndpointAddr::new(node_id)`.
     pub async fn connect(cfg: &NetConfig, host: impl Into<EndpointAddr>) -> Result<Arc<Self>, NetError> {
-        let endpoint = crate::bind(cfg).await?;
+        Self::connect_within(cfg, host, CONNECT_TIMEOUT).await
+    }
+
+    /// [`Member::connect`] with an explicit overall budget. Every await in here is under it:
+    /// nothing can turn an unreachable host into an endless "Finding your host…".
+    pub async fn connect_within(cfg: &NetConfig, host: impl Into<EndpointAddr>, budget: Duration) -> Result<Arc<Self>, NetError> {
+        let deadline = tokio::time::Instant::now() + budget;
+        let endpoint = match tokio::time::timeout_at(deadline, crate::bind(cfg)).await {
+            Ok(r) => r?,
+            Err(_) => return Err(NetError::Unreachable("timed out".into())),
+        };
         let host = host.into();
         let lan = match (cfg.plan().mdns_lookup, cfg.lan_key) {
             (true, Some(key)) => crate::lan::listen(&endpoint, key, host.id),
             _ => None,
         };
         let me = Arc::new(Self { endpoint, host, conn: Mutex::new(None), voice: Mutex::default(), voice_stats: Arc::default(), _lan: lan });
-        if let Err(e) = me.connection().await {
-            me.endpoint.close().await;
+        if let Err(e) = me.connection_until(deadline).await {
+            // Off the caller's path and bounded: a close stuck behind a relay or DNS task must
+            // not keep the login screen spinning.
+            let endpoint = me.endpoint.clone();
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(CLOSE_TIMEOUT, endpoint.close()).await;
+            });
             return Err(e);
         }
         Ok(me)
@@ -138,6 +159,10 @@ impl Member {
 
     /// The live connection, re-dialing if the previous one died (network change, host restart).
     pub async fn connection(&self) -> Result<Connection, NetError> {
+        self.connection_until(tokio::time::Instant::now() + CONNECT_TIMEOUT).await
+    }
+
+    async fn connection_until(&self, deadline: tokio::time::Instant) -> Result<Connection, NetError> {
         let mut slot = self.conn.lock().await;
         if let Some(c) = slot.as_ref() {
             if c.close_reason().is_none() {
@@ -149,7 +174,6 @@ impl Member {
         // empty simply because our own DHT client hasn't finished bootstrapping yet (iroh then
         // fails fast with "no addressing information"), and a host that just started may not
         // have published yet.
-        let deadline = tokio::time::Instant::now() + CONNECT_TIMEOUT;
         let conn = loop {
             let dial = self.endpoint.connect(self.host.clone(), crate::ALPN);
             let error = match tokio::time::timeout_at(deadline, dial).await {
@@ -169,13 +193,18 @@ impl Member {
         // bring one; an idle host does not need it, and an older host ignores the stream.
         // Best-effort: a failure here shows up as the first request failing, like any other.
         let (host, me, proof_conn) = (*self.host.id.as_bytes(), *self.endpoint.id().as_bytes(), conn.clone());
-        let stamp = tokio::task::spawn_blocking(move || crate::pow::solve_for(crate::pow::Purpose::Connection, &host, &me, crate::pow::current_window(), crate::pow::CONN_POW_BITS)).await;
-        if let (Ok(stamp), Ok((mut send, _recv))) = (stamp, proof_conn.open_bi().await) {
-            let mut frame = vec![wire::KIND_PROOF];
-            frame.extend_from_slice(stamp.as_bytes());
-            let _ = send.write_all(&frame).await;
-            let _ = send.finish();
-        }
+        let proof = async move {
+            let stamp = tokio::task::spawn_blocking(move || crate::pow::solve_for(crate::pow::Purpose::Connection, &host, &me, crate::pow::current_window(), crate::pow::CONN_POW_BITS)).await;
+            if let (Ok(stamp), Ok((mut send, _recv))) = (stamp, proof_conn.open_bi().await) {
+                let mut frame = vec![wire::KIND_PROOF];
+                frame.extend_from_slice(stamp.as_bytes());
+                let _ = send.write_all(&frame).await;
+                let _ = send.finish();
+            }
+        };
+        // Never past the caller's deadline either: the apps' backstop timer sits just after it.
+        let proof_deadline = deadline.min(tokio::time::Instant::now() + PROOF_TIMEOUT);
+        let _ = tokio::time::timeout_at(proof_deadline, proof).await;
         *slot = Some(conn.clone());
         Ok(conn)
     }

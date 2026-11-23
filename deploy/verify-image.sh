@@ -9,14 +9,16 @@
 #    that does not match it.
 # 2. The digest must carry a cosign signature made by the release workflow of the source
 #    repository (keyless: a short-lived certificate from Sigstore's Fulcio, bound to the GitHub
-#    Actions identity below, recorded in the Rekor transparency log). Needs `cosign` >= 2.
+#    Actions identity below, recorded in the Rekor transparency log). Needs `cosign` >= 3 (the
+#    workflow signs with cosign 3's bundle format).
 #
 # An image you built yourself (`docker build -t skwod-server .`) needs none of this: you are
 # the publisher. See docs/SELF-HOSTING.md.
 set -euo pipefail
 
-# Who must have signed: the image workflow in the source repository, on a release tag.
-IDENTITY_REGEXP="${SKWOD_IMAGE_IDENTITY_REGEXP:-^https://github\.com/FlayrLabs/skwod/\.github/workflows/image\.yml@refs/tags/v[0-9]+$}"
+# Who must have signed: the image workflow in the source repository, run from a `skwod-v<n>`
+# release tag or by hand from the protected main branch (.github/workflows/image.yml).
+IDENTITY_REGEXP="${SKWOD_IMAGE_IDENTITY_REGEXP:-^https://github\.com/FlayrLabs/skwod/\.github/workflows/image\.yml@refs/(tags/skwod-v[0-9]+|heads/main)$}"
 OIDC_ISSUER="https://token.actions.githubusercontent.com"
 
 FORMAT_ONLY=0

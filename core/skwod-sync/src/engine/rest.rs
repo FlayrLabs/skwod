@@ -463,6 +463,15 @@ impl Engine {
         Ok(())
     }
 
+    /// Name this skwod on its host (the instance owner only; build 46). Device-signed (op
+    /// `instance-name`) over the name's bytes exactly as sent — the server signs-checks the raw
+    /// string, then cleans it. An empty name clears it. Returns the name the host now keeps.
+    pub async fn set_instance_name(&mut self, name: &str) -> Result<Option<String>, EngineError> {
+        let body = serde_json::json!({ "name": name });
+        let v = self.destructive(reqwest::Method::PUT, "/api/instance/name", Some(body), "instance-name", "", name.as_bytes()).await?;
+        Ok(v.get("name").and_then(|x| x.as_str()).map(str::to_string))
+    }
+
     /// Point voice at an SFU (the instance owner only). Device-signed over the three values as
     /// the server stores them (trimmed).
     pub async fn set_voice_config(&mut self, url: &str, api_key: &str, api_secret: &str) -> Result<(), EngineError> {

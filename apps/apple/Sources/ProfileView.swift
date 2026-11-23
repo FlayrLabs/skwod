@@ -203,10 +203,10 @@ struct ProfileView: View {
             ForEach(app.workspaces) { w in
                 Button { Task { await app.activate(w) } } label: {
                     HStack(spacing: 12) {
-                        Circle().fill(Color.seeded(w.name).gradient).frame(width: 34, height: 34)
-                            .overlay(Text(w.name.prefix(1).uppercased()).font(.subheadline.bold()).foregroundStyle(.white))
+                        Circle().fill(Color.seeded(w.displayName).gradient).frame(width: 34, height: 34)
+                            .overlay(Text(w.displayName.prefix(1).uppercased()).font(.subheadline.bold()).foregroundStyle(.white))
                         VStack(alignment: .leading, spacing: 1) {
-                            Text(w.name).foregroundStyle(.white)
+                            Text(w.displayName).foregroundStyle(.white)
                             Text(w.nodeId.map { "Host key \(InviteLink.shortKey($0))" } ?? w.server)
                                 .font(.caption2).foregroundStyle(.white.opacity(0.45)).lineLimit(1)
                         }
@@ -440,6 +440,15 @@ struct ProfileView: View {
                         .font(.caption2).foregroundStyle(.white.opacity(0.45))
                 }
             }
+            Toggle(isOn: Binding(get: { TypingSetting.isOn() },
+                                 set: { UserDefaults.standard.set($0, forKey: TypingSetting.key); previewsTick += 1 })) {
+                VStack(alignment: .leading, spacing: 1) {
+                    Text("Send typing indicators").foregroundStyle(.white)
+                    Text("Others see when you're typing, and you see when they are. Off: neither. The host can see when you're typing in a chat, just as it sees when you send.")
+                        .font(.caption2).foregroundStyle(.white.opacity(0.45))
+                }
+            }
+            .accessibilityIdentifier("privacy.typing")
             Toggle(isOn: Binding(get: { SoundSettings.received }, set: { SoundSettings.received = $0; previewsTick += 1 })) {
                 VStack(alignment: .leading, spacing: 1) {
                     Text("Sound for new messages").foregroundStyle(.white)

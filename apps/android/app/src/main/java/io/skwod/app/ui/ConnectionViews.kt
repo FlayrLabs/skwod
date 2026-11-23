@@ -182,6 +182,9 @@ fun PrivacySection() {
     SettingRow("Sound when a message is sent",
         "A soft sound once your message has been delivered to the skwod.",
         settings.soundSent) { settings.soundSent = it }
+    SettingRow("Send typing indicators",
+        "Others in a chat see when you're typing, and you see when they are. The host can see when you're typing in a chat, just as it sees when you send.",
+        settings.typingIndicators) { settings.typingIndicators = it }
     SettingRow("Hide Skwod in recent apps",
         "The app switcher shows a blank card instead of your chats.",
         settings.recentsPrivacy) { v -> settings.recentsPrivacy = v; ScreenPrivacy.apply(ctx) }

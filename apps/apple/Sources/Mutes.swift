@@ -98,5 +98,6 @@ extension View {
     func muteMenu(scope: String) -> some View {
         self.contextMenu { MuteMenuItems(key: scope) }
             .overlay(alignment: .trailing) { MutedMark(key: scope) }
+            .overlay(alignment: .trailing) { TopicMentionBadge(topic: scope).padding(.trailing, 24) }
     }
 }

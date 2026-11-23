@@ -31,6 +31,8 @@ struct ChatMessage: Identifiable, Hashable {
     var system: SystemRow? = nil
     /// Mine and not delivered yet (`Outbox`): "Sending…" or "Not delivered" with Retry / Discard.
     var sendState: SendState? = nil
+    /// Who this message mentions (`MentionCodec`, from inside the decrypted text).
+    var mentions: MentionPayload = MentionPayload()
 
     /// Convenience for demo/preview rows that only need emoji reactions.
     var reactions: [String] {

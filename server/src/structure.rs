@@ -57,6 +57,7 @@ pub fn routes() -> Router<AppState> {
         // Instance identity + proof-of-possession — UNAUTHENTICATED so a client can pin/verify the
         // server BEFORE sending its token. Lets a moved skwod be recognized as the same one.
         .route("/instance/identity", get(instance_identity))
+        .route("/instance/name", get(get_instance_name).put(set_instance_name))
         .route("/instance/prove", post(instance_prove))
         .route("/instance/address-record", get(address_record))
         .route("/instance/owner-attestation", get(instance_owner_attestation))
@@ -69,6 +70,72 @@ const PROOF_TAG: &[u8] = b"skwod-instance-proof-v1:";
 
 /// The instance's stable identity: its Ed25519 signing public key (unique per instance, survives
 /// address changes) plus a short opaque `instance_id` (its hash) for quick matching/display.
+/// The skwod's display name, set by its owner (build 46). Members read it signed in (a name is
+/// not public: `/instance/identity` is fetched before log-in and stays name-free). `null` until
+/// the owner sets one. It is a LABEL: clients clean it, refuse look-alikes of their other
+/// skwods' names and always show the host key beside it.
+async fn get_instance_name(State(state): State<AppState>, _auth: AuthUser) -> Result<Json<Value>, ApiError> {
+    let raw: Option<Vec<u8>> = sqlx::query_scalar("SELECT value FROM instance_secrets WHERE name = 'instance_name'")
+        .fetch_optional(&state.db)
+        .await?;
+    Ok(Json(json!({ "name": raw.and_then(|v| String::from_utf8(v).ok()) })))
+}
+
+/// Longest skwod name, in characters.
+pub(crate) const INSTANCE_NAME_MAX: usize = 64;
+
+/// A name the server will keep: trimmed, 1–64 characters, no control, format (bidi, zero-width)
+/// or line-separator characters. `Ok(None)` = clear it.
+pub(crate) fn clean_instance_name(raw: &str) -> Result<Option<String>, ApiError> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Ok(None);
+    }
+    let hidden = |c: char| {
+        c.is_control()
+            || matches!(c as u32, 0x00AD | 0x061C | 0x180E | 0x200B..=0x200F | 0x2028..=0x202E | 0x2060..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB)
+    };
+    if name.chars().count() > INSTANCE_NAME_MAX || name.chars().any(hidden) {
+        return Err(ApiError::BadRequest("a skwod name is 1-64 characters with no control or invisible characters"));
+    }
+    Ok(Some(name.to_string()))
+}
+
+#[derive(Deserialize)]
+struct InstanceNameReq {
+    #[serde(default)]
+    name: String,
+}
+
+/// Owner only, signed by a device like the other instance-wide owner operations (op
+/// `instance-name`, payload: the name's bytes as sent). An empty name clears it.
+async fn set_instance_name(
+    State(state): State<AppState>,
+    auth: AuthUser,
+    headers: axum::http::HeaderMap,
+    Json(req): Json<InstanceNameReq>,
+) -> Result<Json<Value>, ApiError> {
+    require_instance_owner(&state, &auth.user_id).await?;
+    let cleaned = clean_instance_name(&req.name)?;
+    crate::keydir::destructive_authority(&state, &auth, &headers, "instance-name", "", req.name.as_bytes()).await?;
+    match &cleaned {
+        Some(name) => {
+            sqlx::query(
+                "INSERT INTO instance_secrets (name, value, created_at) VALUES ('instance_name', $1, $2)
+                 ON CONFLICT (name) DO UPDATE SET value = excluded.value, created_at = excluded.created_at",
+            )
+            .bind(name.as_bytes())
+            .bind(now_ms())
+            .execute(&state.db)
+            .await?;
+        }
+        None => {
+            sqlx::query("DELETE FROM instance_secrets WHERE name = 'instance_name'").execute(&state.db).await?;
+        }
+    }
+    Ok(Json(json!({ "name": cleaned })))
+}
+
 async fn instance_identity(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let (_secret, public) = crate::keydir::server_signing_key(&state).await?;
     use sha2::{Digest, Sha256};
@@ -961,7 +1028,20 @@ async fn delete_server(
     }
     // Irreversible, and it takes every message with it: a device, not just a token (audit M-3).
     crate::keydir::destructive_authority(&state, &auth, &headers, "delete-server", &server_id, b"").await?;
+    // Who to tell, read BEFORE the memberships go with the server: the socket re-checks
+    // authorization before every delivery, so an event on the server's own topic after the
+    // delete would reach nobody.
+    let members: Vec<String> = sqlx::query_scalar("SELECT user_id FROM server_members WHERE server_id = $1")
+        .bind(&server_id)
+        .fetch_all(&state.db)
+        .await?;
     sqlx::query("DELETE FROM servers WHERE id = $1").bind(&server_id).execute(&state.db).await?;
+    // Each member's own topic: their apps drop the server now (they re-check the server list;
+    // nothing in the event is trusted beyond "look again"), and their sockets drop its topics.
+    for member in &members {
+        state.rt.publish(&crate::rt::user_topic(member), "server_deleted", json!({ "server_id": server_id }));
+        state.rt.publish(&crate::rt::user_topic(member), "revoke", json!({ "server_id": server_id }));
+    }
     Ok(Json(json!({ "success": true })))
 }
 

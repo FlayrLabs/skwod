@@ -6,6 +6,8 @@ import UserNotifications
 import CryptoKit
 #if os(macOS)
 import AppKit
+#else
+import UIKit
 #endif
 import LiveKit
 
@@ -168,10 +170,18 @@ enum E2E {
 
     /// Every alert decision made for an incoming message (`AppState.incomingAlert`), newest last.
     @MainActor private static var alerts: [String] = []
-    @MainActor static func sawAlert(topic: String, muted: Bool, outcome: MessageAlert.Outcome) {
-        alerts.append("\(topic.prefix(11)) muted=\(muted) banner=\(outcome.banner) banner_sound=\(outcome.bannerSound) app_sound=\(outcome.inAppSound)")
+    @MainActor static func sawAlert(topic: String, muted: Bool, outcome: MessageAlert.Outcome, mention: Bool = false) {
+        alerts.append("\(topic.prefix(11)) mention=\(mention) muted=\(muted) banner=\(outcome.banner) banner_sound=\(outcome.bannerSound) app_sound=\(outcome.inAppSound)")
         if alerts.count > 50 { alerts.removeFirst(alerts.count - 50) }
     }
+
+    // ---- build 46: paste, typing, mentions, server menus, the skwod's host name ----
+    /// How many attachments the composer on screen has staged (set by the composer itself).
+    @MainActor static var stagedCount = 0
+    #if os(iOS)
+    /// The composer field on screen: `pasteimage` calls its own `paste(_:)`, as the Paste menu does.
+    @MainActor static weak var composerField: UITextView?
+    #endif
 
     /// A small photo with a GPS tag, as a phone would hand over (the upload path strips it).
     static func samplePhoto(seed: Int = 0) -> Data {
@@ -755,6 +765,50 @@ enum E2E {
                 note(command, "ok: \(bytes.count) bytes, declared \(a.size), image=\(image), token=\(a.token != nil)")
             } catch { note(command, "error: \((error as? AttachmentError)?.errorDescription ?? "\(error)")") }
         // ---- build 45: mutes, the alert decisions, the host's upload limit, a photo story ----
+        case "pasteimage":
+            // A picture on the clipboard, then the composer's own Paste (what the edit menu calls).
+            #if os(iOS)
+            guard let field = composerField else { note(command, "error: no composer on screen"); return true }
+            UIPasteboard.general.image = UIImage(data: samplePhoto(seed: 46))
+            let before = stagedCount
+            field.paste(nil)
+            for _ in 0..<20 where stagedCount == before { try? await Task.sleep(for: .milliseconds(250)) }
+            note(command, stagedCount > before ? "ok staged=\(stagedCount)" : "error: nothing staged (\(stagedCount))")
+            #else
+            note(command, "error: iOS only")
+            #endif
+        case "typing":
+            // Who shows as typing in the conversation on screen now.
+            let now = Date()
+            note(command, "topic=\(app.typing.state.topic ?? "-") typers=\(app.typing.state.active(now: now).count) line=\(TypingState.text(app.typing.labels(now: now)) ?? "-")")
+        case "mutechannel":
+            guard let workspace = app.current?.id else { note(command, "error: no skwod"); return true }
+            MuteCenter.shared.mute(workspaceId: workspace, key: "channel:\(space.channelId)", for: .forever)
+            note(command, "ok muted=\(MuteCenter.shared.isMuted(workspaceId: workspace, scope: "channel:\(space.channelId)"))")
+        case "mentions":
+            // The red "@ n" of every channel of this skwod, and whose @everyone counts here.
+            guard let workspace = app.current?.id else { note(command, "error: no skwod"); return true }
+            MentionBadges.reload()
+            let counts = MentionBadges.shared.counts[workspace] ?? [:]
+            note(command, "badges=\(counts.values.reduce(0, +)) channel=\(MentionBadges.shared.count("channel:\(space.channelId)", workspaceId: workspace)) everyone=\(chat.everyoneSenders[space.serverId]?.count ?? -1)")
+        case "servers":
+            let before = chat.serverGroups.count
+            await chat.refreshServerList()
+            note(command, "n=\(chat.serverGroups.count) [\(chat.serverGroups.map(\.name).joined(separator: ", "))] before=\(before)")
+        case "leaveserver", "deleteserver":
+            // leaveserver[:<name>] / deleteserver[:<name>] — what the server menu's items call.
+            let target = arg.isEmpty ? space.serverId : (chat.serverGroups.first { $0.name == arg }?.serverId ?? "")
+            guard !target.isEmpty else { note(command, "error: no such server"); return true }
+            let problem = parts[0] == "leaveserver" ? await chat.leaveServer(target) : await chat.deleteServer(target)
+            note(command, problem.map { "error: \($0)" } ?? "ok servers=\(chat.serverGroups.count)")
+        case "renamehost":
+            // What "Rename on host…" calls (the instance owner).
+            let problem = await app.setInstanceName(arg)
+            note(command, problem.map { "error: \($0)" } ?? "ok")
+        case "skwodname":
+            // The name this entry shows, after asking the host again.
+            await app.refreshInstanceName()
+            note(command, "name=\(app.current?.displayName ?? "-") from_host=\(app.current?.nameFromHost == true)")
         case "mute", "unmute":
             // mute:<user> — the conversation with them; mute:skwod — the whole skwod (until unmuted).
             guard let workspace = app.current?.id else { note(command, "error: no skwod"); return true }

@@ -58,6 +58,8 @@ mod content_tests;
 mod audit_tests;
 #[cfg(test)]
 mod audit2_tests;
+#[cfg(test)]
+mod build46_tests;
 
 use clap::{Parser, Subcommand};
 use sqlx::any::AnyPoolOptions;

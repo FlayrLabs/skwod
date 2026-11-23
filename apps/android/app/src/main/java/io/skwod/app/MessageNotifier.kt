@@ -137,9 +137,19 @@ class MessageNotifier(private val model: AppModel, private val ctx: Context) {
         saveLedger(ledger)
         if (!first) return
         val text = m.content?.let { NotifyPolicy.preview(it) }
-        if (quiet()) { post(topic, "Skwod", "New message"); return }
-        if (text == null) { post(topic, "#${space.channelName}", "New message"); return }
+        // A mention of me (or an honoured @everyone, or a reply to me) alerts even where muted.
+        val decoded = ChatTags.parse(m.content ?: "").mentions
+        // @everyone from the pinned owner or an admin ([Mentions.everyoneSenders]).
+        val everyone = if (decoded.everyone) model.refreshEveryoneSenders(space.serverId) else emptySet()
+        if (asked !== model.bound) return
+        val replyToMine = m.replyToId?.let { id -> rows.firstOrNull { it.messageId == id }?.authorId }?.let { it == me || it == "__me__" } == true
+        val mentioned = Mentions.mentionsMe(decoded, me, m.authorId,
+            everyoneHonoured = Mentions.everyoneHonoured(m.authorId, everyone), replyToMine = replyToMine)
+        if (mentioned) model.addMentionBadges(listOf(m.messageId), topic)
+        if (quiet()) { post(topic, if (mentioned) MentionAlert.title("", "", redacted = true) else "Skwod", "New message", mentioned); return }
         val who = nameOf(m.authorId, space.serverId)?.let { model.contacts.shown(m.authorId, it).label } ?: "Someone"
+        if (mentioned) { post(topic, MentionAlert.title(who, "#${space.channelName}", redacted = false), text ?: "New message", mentioned = true); return }
+        if (text == null) { post(topic, "#${space.channelName}", "New message"); return }
         post(topic, "#${space.channelName} · ${space.name}", "$who: $text")
     }
 
@@ -168,8 +178,13 @@ class MessageNotifier(private val model: AppModel, private val ctx: Context) {
             val who = model.contacts.shown(e.peerUserId, claimed).label
             // A group message is announced under the group's title, with who wrote it.
             val group = model.groups.find(e.conversationId)
+            // In a group, a mention of me alerts even where muted (no @everyone in DMs).
+            val mentioned = group != null && model.current?.userId?.let { me ->
+                Mentions.mentionsMe(Mentions.decode(e.text), me, e.peerUserId, everyoneHonoured = false) } == true
+            if (mentioned) model.addMentionBadges(listOf(e.messageId), topic)
             when {
-                generic -> post(topic, "Skwod", "New message")
+                generic -> post(topic, if (mentioned) MentionAlert.title("", "", redacted = true) else "Skwod", "New message", mentioned)
+                mentioned -> post(topic, MentionAlert.title(who, model.groups.title(group!!), redacted = false), text, mentioned = true)
                 group != null -> post(topic, model.groups.title(group), "$who: $text")
                 else -> post(topic, who, text)
             }
@@ -190,10 +205,11 @@ class MessageNotifier(private val model: AppModel, private val ctx: Context) {
      * decision — nothing for the chat on screen or under Do Not Disturb, the app's own sound
      * with a silent notification in front, a notification with sound otherwise.
      */
-    private fun post(topic: String, title: String, text: String) {
+    private fun post(topic: String, title: String, text: String, mentioned: Boolean = false) {
         val active = model.realtime.appActive
         val out = AlertPolicy.received(AlertPolicy.Incoming(
-            muted = model.isMuted(topic),
+            // A mention of me alerts through a muted chat; only a muted skwod silences it.
+            muted = MentionAlert.muted(model.muteHolds(topic), model.muteHolds(MuteList.SKWOD), mentioned),
             doNotDisturb = model.myStatus == "dnd",
             appActive = active,
             onScreen = active && model.realtime.focusedTopic == topic,

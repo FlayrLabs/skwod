@@ -94,6 +94,34 @@ object Uploads {
         } finally { staged.delete() }
     }
 
+    /**
+     * A picture pasted from the clipboard, read whole so it can be previewed (and removed) before
+     * Send — never more than the host's per-file limit or the photo cap. Sending it is then
+     * [prepareImage], exactly like a camera photo (metadata stripped, encrypted, staged).
+     */
+    suspend fun readPastedImage(ctx: Context, model: AppModel, uri: Uri): ByteArray = withContext(Dispatchers.IO) {
+        refreshLimit(model)
+        val limit = UploadLimit.current
+        val cap = minOf(limit, MAX_PHOTO_BYTES)
+        val input = try { ctx.contentResolver.openInputStream(uri) } catch (_: Exception) { null }
+            ?: throw AttachmentException("Couldn't read the picture on the clipboard. Copy it again, then paste.")
+        val out = java.io.ByteArrayOutputStream()
+        try {
+            input.use { s ->
+                val buf = ByteArray(64 * 1024)
+                var total = 0L
+                while (true) {
+                    val n = s.read(buf); if (n < 0) break
+                    total += n
+                    if (total > cap) throw AttachmentException(if (cap == limit) UploadLimit.tooLargeSentence(limit) else "That picture is too large to send.")
+                    out.write(buf, 0, n)
+                }
+            }
+        } catch (e: AttachmentException) { throw e
+        } catch (_: Exception) { throw AttachmentException("Couldn't read the picture on the clipboard. Copy it again, then paste.") }
+        out.toByteArray()
+    }
+
     /** A photo from the camera (a bitmap's JPEG bytes): stripped, staged, encrypted. */
     suspend fun prepareImage(ctx: Context, model: AppModel, picked: ByteArray, forDm: Boolean): Prepared = withContext(Dispatchers.IO) {
         if (picked.size > MAX_PHOTO_BYTES) throw AttachmentException("That photo is too large.")

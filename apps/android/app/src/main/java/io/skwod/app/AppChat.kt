@@ -416,6 +416,14 @@ class AppChat(private val model: AppModel) {
         }
     }
 
+    /** A server the user left or deleted: every channel of it goes from the list. */
+    fun removeServer(serverId: String) {
+        spaces.removeAll { it.serverId == serverId }
+        if ((selection as? SidebarItem.Space)?.space?.serverId == serverId) selection = null
+        if (railServerId == serverId) railServerId = null
+        touched(); persistSpaces()
+    }
+
     fun removeSpace(s: RealSpace) {
         spaces.removeAll { it.channelId == s.channelId }
         if ((selection as? SidebarItem.Space)?.space?.channelId == s.channelId) selection = null

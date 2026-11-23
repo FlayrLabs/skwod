@@ -781,3 +781,20 @@ Bindings must be regenerated (`build-core.sh`) for four additions.
 - Push (audit M1): no raw-token registration any more; a skwod that refuses wake credentials
   gets none and Settings says its host needs updating. A VoIP or alert wake without a
   `skwod_cred` this install registered is never rung and never dials a host.
+
+## Build 46
+
+### Added
+
+| Function | Purpose |
+|---|---|
+| `instance_name() -> String?` | The skwod's name as its owner set it on the host (`GET /api/instance/name`, signed in). `None` when unset, and from an older host (404). A LABEL the host supplies: apps hold it to the shared host-name rule (`apps/shared-test-vectors/skwod-names.json`) and always show the host key beside it. |
+| `set_instance_name(name) -> String?` | The instance owner names the skwod (`PUT /api/instance/name`). Device-signed, op `instance-name`, target `""`, payload = the name's bytes exactly as sent (the host checks the signature over the raw string, then trims it and refuses control/invisible characters and more than 64 characters). Empty clears it. Returns the name the host keeps. A non-owner gets `Engine` with "http status 403"; a refused name "http status 400". Apps check the name against the shared rule first. |
+
+### Not in the core (decided by the apps, same rule on both)
+
+- **Whose @everyone counts** (`EveryoneRule` / `Mentions.everyoneSenders`): the pinned owner
+  (`space_owner`), plus members whose roles grant Administrator or Manage Server. Roles are the
+  server's word, so an admin counts only when listed as a member, not held (`held_members`) and not
+  blocked. The iOS notification extension gets the resulting ids per channel from the app (in the
+  sender sets, key `everyone:channel:<id>`); it asks the server nothing about roles.

@@ -600,3 +600,25 @@ async fn messages_written_while_the_device_lived_on_another_install_are_never_si
     // What this install wrote itself before all that is still its own readable row, not a placeholder.
     assert!(rows.iter().any(|m| m.content.as_deref() == Some("alice before") && !m.is_undecryptable), "{summary:?}");
 }
+
+/// Build 46: the instance owner names the skwod on the host (device-signed); a member reads it,
+/// cannot set it, and a cleared name reads as none.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_owner_names_the_skwod_and_members_read_it() {
+    let Some(p) = pair().await else { return };
+    // An open-signup test server has no instance owner: make Alice the one `skwod init` would.
+    let status = Command::new("sqlite3")
+        .arg(p.server._dir.path().join("skwod.db"))
+        .arg(format!("INSERT INTO instance_secrets (name, value, created_at) VALUES ('owner_user_id', CAST('{}' AS BLOB), 0)", p.alice))
+        .status()
+        .expect("sqlite3 (to name the instance owner)");
+    assert!(status.success());
+    assert_eq!(p.bobs.instance_name().await.expect("read before"), None);
+    assert_eq!(p.phone.set_instance_name("  Weekend Crew \u{1F3D5}\u{FE0F} ".into()).await.expect("owner sets").as_deref(), Some("Weekend Crew \u{1F3D5}\u{FE0F}"));
+    assert_eq!(p.bobs.instance_name().await.expect("member reads").as_deref(), Some("Weekend Crew \u{1F3D5}\u{FE0F}"));
+    assert!(p.bobs.set_instance_name("Bob's".into()).await.is_err(), "only the instance owner names the skwod");
+    assert!(p.phone.set_instance_name("a\u{202E}b".into()).await.is_err(), "bidi controls are refused");
+    assert_eq!(p.bobs.instance_name().await.unwrap().as_deref(), Some("Weekend Crew \u{1F3D5}\u{FE0F}"));
+    assert_eq!(p.phone.set_instance_name(String::new()).await.expect("owner clears"), None);
+    assert_eq!(p.bobs.instance_name().await.unwrap(), None);
+}

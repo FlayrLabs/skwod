@@ -24,6 +24,7 @@ struct SidebarView: View {
     @State private var newChannelTarget: ServerRef?
     @State private var rolesTarget: ServerRef?
     @State private var serverIconTarget: ServerRef?
+    @StateObject private var serverActions = ServerActions()
     /// Bumped on live presence events so the DM rows' dots recompute (Realtime is nested state).
     @State private var presenceTick = 0
 
@@ -57,6 +58,7 @@ struct SidebarView: View {
         .sheet(item: $settingsTarget) { s in DismissableSheet { ChannelSettingsSheet(space: s, chat: chat) } }
         .sheet(item: $newChannelTarget) { srv in NewChannelSheet(server: srv, chat: chat) }
         .sheet(item: $rolesTarget) { srv in DismissableSheet { RolesSheet(server: srv) } }
+        .modifier(ServerActionsHost(actions: serverActions, chat: chat))
         .sheet(item: $serverIconTarget) { srv in
             AvatarPickerSheet(
                 title: "Server icon",
@@ -127,11 +129,20 @@ struct SidebarView: View {
                             Label("Change server icon", systemImage: "photo.circle")
                         }
                     }
+                    if chat.inChannelsMode, let g = chat.currentServer {
+                        Divider()
+                        ServerMenuItems(group: g, chat: chat, actions: serverActions)
+                    }
                     Divider()
                     Button { showCreate = true } label: { Label("Create a server", systemImage: "plus") }
                     Button { showJoin = true } label: { Label("Join with a code", systemImage: "ticket") }
                 } label: {
                     HStack(spacing: 6) {
+                        // Which level this is: the Skwod (the host) holds servers; a server holds
+                        // channels.
+                        Text(chat.inChannelsMode ? "Server" : "Skwod")
+                            .font(.system(size: 10, weight: .semibold)).textCase(.uppercase)
+                            .foregroundStyle(Color(white: 0.6))
                         Text(chat.inChannelsMode ? (chat.currentServer?.name ?? app.current?.displayName ?? "Skwod")
                                                  : (app.current?.displayName ?? "Skwod"))
                             .font(.system(size: 15, weight: .bold))
@@ -244,7 +255,7 @@ struct SidebarView: View {
         ScrollView {
             VStack(alignment: .leading, spacing: 1) {
                 HStack {
-                    Text("Servers").font(.system(size: 11, weight: .semibold)).textCase(.uppercase)
+                    Text("Servers in this Skwod").font(.system(size: 11, weight: .semibold)).textCase(.uppercase)
                         .foregroundStyle(.secondary)
                     Spacer()
                     createJoinMenu
@@ -291,7 +302,8 @@ struct SidebarView: View {
                             Button { newChannelTarget = ServerRef(serverId: g.serverId, name: g.name) } label: {
                                 Label("New channel", systemImage: "plus")
                             }
-                            Button { inviteTarget = g.channels.first } label: { Label("Invite people", systemImage: "person.badge.plus") }
+                            Divider()
+                            ServerMenuItems(group: g, chat: chat, actions: serverActions)
                         }
                     }
                 }

@@ -34,18 +34,22 @@ object ChatTags {
     const val ATTACH = "skwod/attach|"
     const val MUSIC = "skwod/music|"
 
-    data class Parsed(val text: String, val attachment: ChatAttachment?, val music: MusicTrack?)
+    /** [text] never carries the invisible mention trailer ([Mentions]); [mentions] has what it said. */
+    data class Parsed(val text: String, val attachment: ChatAttachment?, val music: MusicTrack?,
+                      val mentions: Mentions.Decoded = Mentions.Decoded(text))
 
     fun parse(body: String): Parsed {
         if (body.startsWith(ATTACH)) {
             val a = ChatAttachment.fromJson(body.substring(ATTACH.length))
-            if (a != null) return Parsed(a.caption ?: "", a, null)
+            // A caption carries its own trailer: its mentions are read against the caption itself.
+            if (a != null) return Mentions.decode(a.caption ?: "").let { Parsed(it.text, a, null, it) }
         }
         if (body.startsWith(MUSIC)) {
             val t = MusicTrack.fromJson(body.substring(MUSIC.length))
             if (t != null) return Parsed("", null, t)
         }
-        return Parsed(body, null, null)
+        val decoded = Mentions.decode(body)
+        return Parsed(decoded.text, null, null, decoded)
     }
 }
 

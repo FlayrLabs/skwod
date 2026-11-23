@@ -179,3 +179,49 @@ struct UpdateBanner: View {
         }
     }
 }
+
+/// "This Skwod's host is newer — update Skwod": the active skwod refuses what this build sends
+/// (`SessionRefusal.updateApp`). Shown in place of a sign-out; the account, keys and messages
+/// stay. The button runs the platform's update (Sparkle on the Mac, the signed manifest's
+/// TestFlight hand-off on iOS).
+struct HostNewerBanner: View {
+    @EnvironmentObject private var app: AppState
+    @EnvironmentObject private var updater: Updater
+
+    var body: some View {
+        if let id = app.hostNewerWorkspaceId, id == app.current?.id {
+            HStack(spacing: 12) {
+                Image(systemName: "exclamationmark.arrow.circlepath").foregroundStyle(.orange)
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(SessionRefusal.hostNewerTitle)
+                        .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white)
+                    Text("Your account, keys and messages are still here.")
+                        .font(.caption2).foregroundStyle(.white.opacity(0.6))
+                }
+                Spacer(minLength: 8)
+                Button {
+                    Task { await update() }
+                } label: {
+                    Text("Update Skwod").font(.system(size: 13, weight: .semibold))
+                }
+                .buttonStyle(.borderedProminent).tint(.skAccent).controlSize(.small)
+                .accessibilityIdentifier("hostNewer.update")
+            }
+            .padding(.horizontal, 14).padding(.vertical, 10)
+            .background(.ultraThinMaterial, in: Capsule())
+            .overlay(Capsule().stroke(.orange.opacity(0.35)))
+            .padding(.horizontal, 12).padding(.top, 8)
+            .shadow(color: .black.opacity(0.35), radius: 12, y: 4)
+            .accessibilityIdentifier("hostNewer.banner")
+        }
+    }
+
+    private func update() async {
+        #if os(macOS)
+        SparkleUpdater.shared.checkForUpdates()
+        #else
+        await updater.check(serverURL: app.serverURL, manual: true)
+        if updater.available != nil { await updater.install(serverURL: app.serverURL) }
+        #endif
+    }
+}

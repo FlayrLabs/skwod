@@ -79,10 +79,21 @@ pub fn fix_ownership(data: &Path, to: RunAs) -> std::io::Result<Fixed> {
     let top_stat = fstat(top.as_raw_fd()).map_err(io)?;
     let device = top_stat.st_dev;
     let mut fixed = Fixed::default();
+    // Directories are re-owned LAST, deepest first, through descriptors kept open for that.
+    // With only CAP_CHOWN (no DAC_OVERRIDE) root may not look up names in a 0700 directory it
+    // no longer owns: re-owning a directory before its entries would lock the walk out of it.
+    // That is exactly the layout `skwod restore` run as root leaves behind (0700 dirs).
+    let mut dirs_later: Vec<std::os::fd::OwnedFd> = Vec::new();
+    let keep = |dir: &Dir| -> Option<std::os::fd::OwnedFd> {
+        use std::os::fd::FromRawFd;
+        let fd = nix::unistd::dup(dir.as_raw_fd()).ok()?;
+        // SAFETY: `dup` just returned this descriptor; nothing else owns it.
+        Some(unsafe { std::os::fd::OwnedFd::from_raw_fd(fd) })
+    };
     if wrong(&top_stat) {
-        match fchown(top.as_raw_fd(), Some(uid), Some(gid)) {
-            Ok(()) => fixed.changed += 1,
-            Err(_) => fixed.failed += 1,
+        match keep(&top) {
+            Some(fd) => dirs_later.push(fd),
+            None => fixed.failed += 1,
         }
     }
 
@@ -124,9 +135,9 @@ pub fn fix_ownership(data: &Path, to: RunAs) -> std::io::Result<Fixed> {
                     continue;
                 }
                 if wrong(&cst) {
-                    match fchown(child.as_raw_fd(), Some(uid), Some(gid)) {
-                        Ok(()) => fixed.changed += 1,
-                        Err(_) => fixed.failed += 1,
+                    match keep(&child) {
+                        Some(fd) => dirs_later.push(fd),
+                        None => fixed.failed += 1,
                     }
                 }
                 stack.push(child);
@@ -138,6 +149,15 @@ pub fn fix_ownership(data: &Path, to: RunAs) -> std::io::Result<Fixed> {
                     Err(_) => fixed.failed += 1,
                 }
             }
+        }
+    }
+    // A directory is always found after its parent, so the reverse order re-owns children
+    // before parents.
+    for fd in dirs_later.iter().rev() {
+        use std::os::fd::AsRawFd as _;
+        match fchown(fd.as_raw_fd(), Some(uid), Some(gid)) {
+            Ok(()) => fixed.changed += 1,
+            Err(_) => fixed.failed += 1,
         }
     }
     Ok(fixed)

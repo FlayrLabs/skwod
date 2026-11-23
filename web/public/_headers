@@ -40,3 +40,30 @@
 /.well-known/assetlinks.json
   Content-Type: application/json
   Cache-Control: public, max-age=3600
+
+# Images other sites are meant to show: link previews (Open Graph / X cards, rendered by
+# chat apps and preview tools in their own origin), favicons and home-screen icons. The site-wide
+# same-origin resource policy would make browsers refuse to draw them anywhere but skwod.io, so
+# these few public, static images are released for cross-origin use. Nothing else is.
+/og-image.jpg
+  ! Cross-Origin-Resource-Policy
+  Cross-Origin-Resource-Policy: cross-origin
+  Cache-Control: public, max-age=86400
+/favicon.ico
+  ! Cross-Origin-Resource-Policy
+  Cross-Origin-Resource-Policy: cross-origin
+/favicon-32x32.png
+  ! Cross-Origin-Resource-Policy
+  Cross-Origin-Resource-Policy: cross-origin
+/favicon-16x16.png
+  ! Cross-Origin-Resource-Policy
+  Cross-Origin-Resource-Policy: cross-origin
+/apple-touch-icon.png
+  ! Cross-Origin-Resource-Policy
+  Cross-Origin-Resource-Policy: cross-origin
+/skwod-icon.png
+  ! Cross-Origin-Resource-Policy
+  Cross-Origin-Resource-Policy: cross-origin
+/icon-192.png
+  ! Cross-Origin-Resource-Policy
+  Cross-Origin-Resource-Policy: cross-origin

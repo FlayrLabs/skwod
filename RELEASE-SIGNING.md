@@ -371,9 +371,11 @@ failing `./check-deps.sh`; the commit id is inside the signed manifest statement
 
 **Workflow.** `.github/workflows/image.yml` in the public repository builds
 `ghcr.io/flayrlabs/skwod-server` for linux/amd64 and linux/arm64, each on a native GitHub runner
-(no QEMU). It runs on a `skwod-v<n>` tag push, or by hand from `main`
-(`gh workflow run image.yml -R FlayrLabs/skwod --ref main -f build=<n>`). It never runs for pull
-requests, and the build number must equal `CURRENT_PROJECT_VERSION` in `apps/apple/project.yml`.
+(no QEMU). It runs only on a `skwod-v<n>` tag: pushed, or re-run by hand with
+`gh workflow run image.yml -R FlayrLabs/skwod --ref skwod-v<n>`. It never runs for pull requests.
+`deploy/image-release-guard.sh` (tested by `deploy/test-image-release-guard.sh`) refuses unless
+`<n>` equals `CURRENT_PROJECT_VERSION` in `apps/apple/project.yml` and the tagged commit is on
+`main`, so a tag on an unreviewed commit gets no image.
 
 1. **Build and test, per architecture, with no registry credentials.** The image is built with no
    cache, with SBOM and provenance (`mode=max`) attestations, as an OCI archive.
@@ -381,29 +383,36 @@ requests, and the build number must equal `CURRENT_PROJECT_VERSION` in `apps/app
    template's flags, and the image must become healthy, print the one-time admin token, wait for
    Start, and run as 99:100. The second run uses the compose posture, started at once, and the
    bundled `livekit-server` must be running.
-2. **Publish** (the only job with `packages: write` and `id-token: write`). It pushes the two tested
+2. **Publish** (the only job with `packages: write` and `id-token: write`). It runs behind the
+   `release` environment, so a maintainer approves each run. Before pushing anything it refuses a
+   build that is already published, or one that is not newer than the `org.opencontainers.image.version`
+   label of the current `latest`. All publishing shares one concurrency group (`image-publish`).
+   It then pushes the two tested
    archives byte for byte (`<n>-amd64`, `<n>-arm64`), merges them into one multi-arch index tagged
    `<n>`, and signs that digest keylessly: `cosign sign --yes …@sha256:<digest>`. That is a Fulcio
    certificate bound to the workflow and its ref, with an entry in Rekor; there is no long-lived key
    to steal. The job then checks the signature with `deploy/verify-image.sh`, the same check hosts
-   run. **Only then** does it move `latest` to that digest. The run summary prints the digest; put
+   run. **Only then** does it move `latest` to that digest, after checking once more that this only moves
+   it forward. The run summary prints the digest; put
    it in the release notes.
-3. **Tags.** `<n>` is immutable by convention: never re-run the workflow for a build that is
-   already published. `latest` exists for Unraid's "check for updates" and always points at a
+3. **Tags.** `<n>` is never overwritten; the workflow refuses. `latest` exists for Unraid's "check for updates" and always points at a
    signed, smoke-tested build. Compose and VPS hosts still pin by digest (`SKWOD_IMAGE` is
    required and has no default).
 4. **Hosts verify** with `deploy/verify-image.sh ghcr.io/flayrlabs/skwod-server@sha256:<digest>`
    (cosign 3 or newer). It pins the signer to
-   `https://github.com/FlayrLabs/skwod/.github/workflows/image.yml@refs/tags/skwod-v<n>` or
-   `…@refs/heads/main`, with the issuer set to GitHub Actions. If the workflow moves, change
-   `IDENTITY_REGEXP` in that script in the same commit.
-5. **Repository settings this relies on.** `main` is protected, and a tag ruleset restricts who
-   may create `skwod-v*` tags. Either of those refs can produce a validly signed image. The GHCR
+   `https://github.com/FlayrLabs/skwod/.github/workflows/image.yml@refs/tags/skwod-v<n>` (the
+   workflow path, the repository and a release-tag ref), with the certificate's GitHub
+   repository extension set to `FlayrLabs/skwod` and the issuer set to GitHub Actions. If the
+   workflow moves, change `IDENTITY_REGEXP` in that script in the same commit.
+5. **Repository settings this relies on.** `main` is protected. A tag ruleset lets only
+   maintainers create, move or delete `skwod-v*` tags. The `release` environment requires a
+   maintainer's approval. These live in the repository's settings, not in code; see
+   docs/GOING-PUBLIC.md, section 8, in the monorepo. The GHCR
    package `skwod-server` must be **public**, or hosts cannot pull it. The repository variable
    `SKWOD_DEFAULT_PUSH_GATEWAY` (not a secret) is baked in as the built-in push gateway; when it is
    empty, the workflow warns and the image has none (docs/PUSH.md).
 6. **Residual trust.** You still trust GitHub Actions and Sigstore. A compromised workflow run on
-   `main` or on a release tag produces a validly signed image. Reproducible image builds (the plan
+   a release tag produces a validly signed image. Reproducible image builds (the plan
    above, step 5) are what would let a host check the digest against source.
 
 ### The published Mac build keeps its secrets in the login keychain (L7)

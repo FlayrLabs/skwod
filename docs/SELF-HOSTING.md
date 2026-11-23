@@ -132,7 +132,7 @@ trusted as the server itself. Two safe choices:
   ```
 
   `verify-image.sh` runs `cosign verify` (cosign 3 or newer). It pins the signer to the source
-  repository's image workflow, run from a `skwod-v<n>` release tag or from `main` (keyless
+  repository's image workflow, run on a `skwod-v<n>` release tag (keyless
   Sigstore; the signature is in the public Rekor log). Each release's notes carry the digest, and
   so does the image workflow's run summary. The publishing and signing procedure is in
   `RELEASE-SIGNING.md`, under *The Docker image*. To update, change the digest on purpose; nothing
@@ -197,6 +197,18 @@ with a fresh volume.
 | p2p | `core/skwod-core/examples/p2p_member.rs` connected by the invite from the Mac, signed up as owner, created an E2EE space, sent 5 messages and read all 5 back decrypted. Path: **n0 relay** (the VM's UDP port is not reachable from the Mac, so a direct path could not form) |
 | Call | through the container's own LiveKit: a publisher on the Mac via the member's p2p voice tunnel, a second participant on the container's loopback. `lk room join --publish-demo` video arrived at the second participant. Then an Opus track published with LiveKit's GCM frame encryption (Go SDK): the SFU lists it as `encryption: GCM`; the receiver opened 680 frames with the call key, 0 with a wrong key, and the plaintext marker was never visible on the wire |
 | Upgrade | a volume written by a root-run server: the default non-root start refuses with the fix-it message; `skwod fix-ownership` (compose's init step) re-owns it and is a no-op the second time; the Unraid-style start (`--user 0:0`, caps `CHOWN,SETUID,SETGID`) re-owns it and then runs `skwod` **and** `livekit-server` as uid 1000 with `CapPrm/CapEff/CapInh/CapAmb = 0` and `NoNewPrivs: 1`; healthcheck `healthy` |
+
+**Mac → Docker move (2026-11-22, linux/arm64 VM).** A data folder made by the Mac app's bundled
+server (owner, member, server, channel, messages, an approval invite) was exported with
+`skwod backup`, restored with the root-run `docker run … skwod restore` from
+[UNRAID.md](UNRAID.md#moving-your-skwod-from-a-mac-to-unraid) and started with the Unraid
+template's flags. The result had the same instance identity and the same p2p node id. The old
+invite still checked valid, both accounts signed in again, the old ciphertext came back
+byte-identical, a new message went through, LiveKit ran with a freshly written loopback
+`livekit.yaml`, and everything ran as 99:100. The test found, and this build fixes, a
+`fix-ownership` bug: it re-owned a 0700 directory before its contents, which locked the walk
+(root with only `CAP_CHOWN`) out of `blobs/`. Not checked here: decryption by the real apps
+after the move. The server stores the same bytes, and the apps keep their own keys.
 
 Not verified: an **amd64** build (the Dockerfile has no architecture-specific step other than the
 LiveKit download, whose amd64 archive and checksum were fetched and verified, but the image was

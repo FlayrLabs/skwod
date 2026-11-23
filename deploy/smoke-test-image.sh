@@ -8,9 +8,11 @@
 # host and nothing kept afterwards:
 #
 #   1. "unraid"  — exactly the flags of deploy/unraid/skwod.xml: started as root with only
-#                  CHOWN+SETUID+SETGID, read-only root, waiting for the Start button. It must
-#                  become healthy, print the one-time admin token, wait for Start, and run the
-#                  server as 99:100 (Unraid's nobody:users), not as root.
+#                  CHOWN+SETUID+SETGID, read-only root, waiting for the Start button. Its data
+#                  folder is root-owned with 0700 directories, the layout a root-run
+#                  `skwod restore` leaves (moving a skwod from a Mac). It must become healthy,
+#                  print the one-time admin token, wait for Start, and run the server as 99:100
+#                  (Unraid's nobody:users), not as root.
 #   2. "started" — the deploy/docker-compose.yml posture (uid 1000, no capabilities at all)
 #                  without the Start button, so the server starts at once: it must become
 #                  healthy, print the admin token and the owner's join code, and run the bundled
@@ -24,16 +26,11 @@ IMAGE="${1:-${SKWOD_IMAGE:-}}"
 [ -n "$IMAGE" ] || { echo "usage: $0 <image>" >&2; exit 2; }
 TIMEOUT="${SKWOD_SMOKE_TIMEOUT:-120}"   # seconds per wait
 
-WORK="$(mktemp -d)"
 TAG="skwod-smoke-$$"
 CONTAINERS=()
 cleanup() {
   for c in "${CONTAINERS[@]}"; do docker rm -f "$c" >/dev/null 2>&1 || true; done
-  docker volume rm -f "$TAG-started" >/dev/null 2>&1 || true
-  # The "unraid" case re-owns its folder to 99:100; remove it through a container.
-  docker run --rm --user 0:0 --network none -v "$WORK:/w" --entrypoint /bin/sh "$IMAGE" \
-    -c 'rm -rf /w/*' >/dev/null 2>&1 || true
-  rm -rf "$WORK" 2>/dev/null || true
+  docker volume rm -f "$TAG-started" "$TAG-unraid" >/dev/null 2>&1 || true
 }
 trap cleanup EXIT
 
@@ -51,10 +48,12 @@ wait_for() {
   done
 }
 healthy() { docker exec "$1" skwod healthcheck; }
-logs_have() { docker logs "$1" 2>&1 | grep -Eq "$2"; }
-# Processes of the container, as "uid command" lines (docker top passes the options to ps).
-procs() { docker top "$1" -o uid,comm | tail -n +2; }
-runs() { procs "$1" | awk -v c="$2" '$2 == c { found = 1 } END { exit !found }'; }
+# Read the whole log first: `grep -q` quitting early would SIGPIPE `docker logs` under pipefail.
+logs_have() { local l; l="$(docker logs "$1" 2>&1)"; grep -Eq "$2" <<<"$l"; }
+# Processes of the container, as "uid command" lines (docker top passes the options to ps,
+# and needs the pid column).
+procs() { docker top "$1" -o pid,uid,comm | awk 'NR > 1 { print $2, $3 }'; }
+runs() { local p; p="$(procs "$1")"; awk -v c="$2" '$2 == c { found = 1 } END { exit !found }' <<<"$p"; }
 
 show_logs() { echo "---- logs of $1 ----" >&2; docker logs "$1" 2>&1 | tail -n 40 >&2; echo "----" >&2; }
 
@@ -62,18 +61,25 @@ echo "smoke test: $IMAGE ($(docker image inspect -f '{{.Os}}/{{.Architecture}}' 
 
 # --- 1. the Unraid template's flags ------------------------------------------------------------
 c="$TAG-unraid"; CONTAINERS+=("$c")
-mkdir -p "$WORK/unraid"
-echo "1. unraid template flags (root → 99:100, waits for Start)"
+echo "1. unraid template flags (root → 99:100, waits for Start), root-owned 0700 data folder"
+docker volume create "$TAG-unraid" >/dev/null
+docker run --rm --user 0:0 --network none -v "$TAG-unraid:/d" --entrypoint /bin/sh "$IMAGE" -c \
+  'chown 0:0 /d && chmod 700 /d && mkdir -m 700 /d/blobs /d/snapshots && echo x > /d/blobs/b && chmod 600 /d/blobs/b'
 docker run -d --name "$c" \
   --user 0:0 --cap-drop=ALL --cap-add=CHOWN --cap-add=SETUID --cap-add=SETGID \
   --security-opt no-new-privileges:true --read-only --tmpfs /tmp:noexec,nosuid,size=64m \
   -e SKWOD_ADMIN_LISTEN=0.0.0.0:3477 -e SKWOD_WAIT_FOR_START=true -e SKWOD_P2P_PORT=47474 \
   -e SKWOD_RUN_AS=99:100 \
-  -v "$WORK/unraid:/data" "$IMAGE" >/dev/null
+  -v "$TAG-unraid:/data" "$IMAGE" >/dev/null
 if wait_for "$TIMEOUT" healthy "$c"; then pass "healthy"; else fail "not healthy after ${TIMEOUT}s"; fi
 if logs_have "$c" 'One-time admin token: [A-Z0-9]+(-[A-Z0-9]+)+'; then pass "one-time admin token in the log"; else fail "no admin token in the log"; fi
 if logs_have "$c" 'Not serving yet'; then pass "waits for Start server"; else fail "did not wait for Start server"; fi
-if procs "$c" | awk '$2 == "skwod" && $1 == "99" { ok = 1 } END { exit !ok }'; then
+if logs_have "$c" 'data volume ownership: [0-9]+ entries given to 99:100' && ! logs_have "$c" 'could not be changed'; then
+  pass "the whole root-owned data folder was given to 99:100"
+else
+  fail "the data folder was not fully re-owned"
+fi
+if awk '$2 == "skwod" && $1 == "99" { ok = 1 } END { exit !ok }' <<<"$(procs "$c")"; then
   pass "server runs as uid 99, not root"
 else
   fail "server is not running as uid 99:"; procs "$c" >&2 || true

@@ -16,9 +16,11 @@
 # the publisher. See docs/SELF-HOSTING.md.
 set -euo pipefail
 
-# Who must have signed: the image workflow in the source repository, run from a `skwod-v<n>`
-# release tag or by hand from the protected main branch (.github/workflows/image.yml).
-IDENTITY_REGEXP="${SKWOD_IMAGE_IDENTITY_REGEXP:-^https://github\.com/FlayrLabs/skwod/\.github/workflows/image\.yml@refs/(tags/skwod-v[0-9]+|heads/main)$}"
+# Who must have signed: the image workflow (.github/workflows/image.yml) of the source repository,
+# run on a `skwod-v<n>` release tag. The certificate's identity (workflow path + repository + tag
+# ref), its GitHub repository extension and its issuer are all checked.
+IDENTITY_REGEXP="${SKWOD_IMAGE_IDENTITY_REGEXP:-^https://github\.com/FlayrLabs/skwod/\.github/workflows/image\.yml@refs/tags/skwod-v[0-9]+$}"
+REPOSITORY="${SKWOD_IMAGE_REPOSITORY:-FlayrLabs/skwod}"
 OIDC_ISSUER="https://token.actions.githubusercontent.com"
 
 FORMAT_ONLY=0
@@ -35,7 +37,8 @@ echo "✓ pinned by digest"
 [ "$FORMAT_ONLY" = "1" ] && exit 0
 
 command -v cosign >/dev/null 2>&1 || { echo "✗ cosign is not installed (https://docs.sigstore.dev/cosign/system_config/installation/)" >&2; exit 2; }
-if cosign verify "$REF" --certificate-identity-regexp "$IDENTITY_REGEXP" --certificate-oidc-issuer "$OIDC_ISSUER" >/dev/null; then
+if cosign verify "$REF" --certificate-identity-regexp "$IDENTITY_REGEXP" --certificate-oidc-issuer "$OIDC_ISSUER" \
+     --certificate-github-workflow-repository "$REPOSITORY" >/dev/null; then
   echo "✓ signed by the skwod release workflow ($IDENTITY_REGEXP)"
 else
   echo "✗ no valid signature by the skwod release workflow on $REF — do not run it." >&2

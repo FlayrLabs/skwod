@@ -39,6 +39,7 @@ A few words used below:
 10. [Updating](#updating)
 11. [Backups](#backups)
 12. [Moving to another box](#moving-to-another-box)
+    - [Moving your Skwod from a Mac to Unraid](#moving-your-skwod-from-a-mac-to-unraid)
 13. [Troubleshooting](#troubleshooting)
 14. [For the cautious: pin an exact image](#for-the-cautious-pin-an-exact-image)
 
@@ -385,8 +386,102 @@ A restore signs everyone out once. Members just sign in again, and their apps se
 If the restore brought back people or devices you had removed since the backup, it lists them in
 `restore-report.txt` in the data folder.
 
-**From the Skwod Mac app to Unraid:** on the Mac, use **Start server → Options → Backup →
-Export…**, copy the file to the Unraid box, and restore it as above.
+**From the Skwod Mac app:** see the next section.
+
+## Moving your Skwod from a Mac to Unraid
+
+Started your Skwod on a Mac and want it on an always-on Unraid box now? You can move it
+**without losing anything**. Every message, member, server, channel and invite comes along, and
+the move keeps its **address** (its key), so your friends don't need new invites.
+
+> **The one rule: never run both at once.** Your Skwod's address is its key, and the key moves
+> with it. If the Mac and the Unraid box both run it, friends' apps reach whichever one answers
+> first. Some messages then land on one copy and some on the other, and the two copies never
+> merge. So the Mac's server is switched **off** before the Unraid one starts, and stays off.
+
+**Before you start**, tell your group that the Skwod will be down for a few minutes, and that
+everyone will have to **sign in once more** afterwards with their username and password. Make
+sure they know their password. Their messages stay on their phones; nothing else changes.
+
+### On the Mac: export, then switch the Mac's server off
+
+1. Open Skwod on the Mac. Open the **Start server** window (from the Skwod icon in the menu bar,
+   or the app's **Start server** button) and click **Options**.
+2. Under **Backup**, click **Export…**. Choose where to save the file (for example, the Desktop).
+3. Choose a **passphrase** of at least 14 characters, type it twice, and **write it down**.
+   Without it, nobody can open the file, you included. You get a file ending in
+   `.skwodbackup`.
+4. Click the Skwod icon in the **menu bar** and choose **Stop server**. From now on, friends
+   can't reach the Mac's copy.
+5. Make sure the Mac never starts it again by itself. **Quit Skwod** (menu bar icon → **Quit
+   Skwod**). In Finder, choose **Go → Go to Folder…**, type
+   `~/Library/Application Support/` and press **Enter**. Rename the folder `skwod-host-data` to
+   `skwod-host-data-moved-to-unraid`. If you chose another **Storage folder** in Options, rename
+   that folder instead.
+
+   **Why:** Skwod builds up to 45 start the server again at every launch whenever that folder
+   exists, even after **Stop server**. Later builds remember **Stop server**, but the rename is
+   safe on every build, and the renamed folder is also an extra copy to keep for a while.
+
+### Copy the file to Unraid
+
+6. Copy the `.skwodbackup` file to a share on the Unraid box. In Finder, choose
+   **Go → Connect to Server…**, type `smb://tower` (your Unraid box's name) and open a share. If
+   you don't have a backups share, create one in Unraid's **Shares** tab, named `backups`. Put
+   the file in a folder called `skwod` there, so it ends up at
+   `/mnt/user/backups/skwod/` on the box.
+
+### On Unraid: restore into an empty appdata folder, then start
+
+7. Do [steps 1–3](#1-what-you-need-first) of this guide (add the template and look over the
+   settings), but **don't press Apply yet**. If you already pressed it, stop the container and
+   delete `/mnt/user/appdata/skwod` first (only if you never used that new, empty server).
+8. Open the Unraid **Terminal** (`>_`) and paste this. Replace the passphrase and the file name
+   with yours. The file name is case-sensitive.
+
+   ```sh
+   docker run --rm --user 0:0 --network none \
+     -e SKWOD_BACKUP_PASSPHRASE='the passphrase you wrote down' \
+     -v /mnt/user/appdata:/appdata -v /mnt/user/backups/skwod:/backup \
+     ghcr.io/flayrlabs/skwod-server:latest \
+     skwod restore --in /backup/YOUR-FILE.skwodbackup --data /appdata/skwod
+   ```
+
+   It downloads the server image the first time (a minute), then ends with a short report. It
+   refuses, and changes nothing, if the passphrase is wrong or if `/mnt/user/appdata/skwod`
+   already holds a skwod.
+9. Back on the template page, click **Apply**. The container takes over the restored folder (it
+   fixes the file owner by itself) and **starts serving right away**. A Skwod that already has an
+   owner doesn't wait for the Start button.
+10. Check it: open the admin page ([steps 5–6](#5-find-the-one-time-admin-token)). It should say
+    **Running**, with your **Members** count, **Voice and video: On** and **Reachable by invite:
+    Yes**.
+
+### What your friends notice
+
+- The Skwod is unreachable for the few minutes between **Stop server** on the Mac and **Apply**
+  on Unraid. Then their apps reconnect by themselves, to the same address.
+- **Everyone is signed out once.** A restore deliberately ends every session. Each person opens
+  the app, sees the sign-in screen, and signs in with their **username and password**. Their
+  chat history, servers and channels are all still there.
+- **Invites keep working.** Links you sent before the move point to the same address and still
+  work (until they expire as usual).
+- **You, on the Mac**: the Mac app reached its own server through a local address, which now
+  has nothing behind it. Sign in to the Unraid Skwod from the Mac like any member: open your
+  profile → **Add a skwod**, choose **Log in**, paste the server's invite or address (from the
+  Unraid admin page, or any invite), and use your owner username and password. Then remove the
+  old entry. Your phones are not affected; they already connect by address.
+
+### The other way: Unraid back to a Mac
+
+1. Make an encrypted backup on Unraid ([Backups](#backups), step 2), then **stop** the container
+   right away. On the Docker tab, turn its **Autostart** switch off, so a reboot of the Unraid
+   box doesn't start it again.
+2. Copy the `.skwodbackup` file to the Mac.
+3. In the Skwod Mac app: open **Start server → Options → Backup → Import…**, choose the file, and
+   type the passphrase. Then press **Start server**.
+4. Once the Mac copy works, remove the Unraid container (or leave it stopped with Autostart off,
+   for a while, as a spare). As before, never run both.
 
 ## Troubleshooting
 

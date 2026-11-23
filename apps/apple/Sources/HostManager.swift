@@ -94,6 +94,11 @@ final class HostManager: ObservableObject {
     /// Keychain account holding the owner login this Mac created for its own server.
     static let ownerCredentialsAccount = "host-owner-login"
     private static let dataDirKey = "skwod.host.dataDir"
+    /// Set when the person pressed "Stop server"; cleared when they start it again. While set,
+    /// launch, login and update relaunches do NOT bring the server back. A skwod that moved to
+    /// another machine (docs/UNRAID.md, "Moving your Skwod from a Mac") must never come back
+    /// here by itself: the same key on two machines splits the skwod in two.
+    static let stoppedByUserKey = "skwod.host.stoppedByUser"
 
     /// Where the host's data (SQLite DB + encrypted blobs + the p2p key) lives. The choice is
     /// remembered, so a custom folder is found again on the next launch.
@@ -142,12 +147,14 @@ final class HostManager: ObservableObject {
     func ensureLocalServerRunning() async {
         if let startTask { await startTask.value; return }
         guard serverProcess == nil, !isHosting, hasHostedBefore else { return }
+        guard !UserDefaults.standard.bool(forKey: Self.stoppedByUserKey) else { return }
         await begin().value
     }
 
     /// The one button.
     func start() {
         guard !isHosting else { return }
+        UserDefaults.standard.set(false, forKey: Self.stoppedByUserKey)
         begin()
     }
 
@@ -169,6 +176,7 @@ final class HostManager: ObservableObject {
     }
 
     func stop() {
+        UserDefaults.standard.set(true, forKey: Self.stoppedByUserKey)
         halt()
         if case .failed = phase {} else { phase = .stopped }
     }

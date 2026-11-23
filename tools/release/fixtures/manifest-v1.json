@@ -1,0 +1,19 @@
+{
+  "android": {
+    "build": 46,
+    "file": "skwod-46.apk",
+    "notes": "Fixes \"things\" & more.",
+    "sha256": "9379cfb95416438572c33e2c2e03f1fdbdb10e4668cfbdb7bbd0e3049463ac33",
+    "sig2": "Qt7W0wuTY+Kd/EQR0bRjC7V46koWDiytP0nmd5eE5v9Oq561dwnHjGpAuI+FllsRwfk605PeLTRqmU9x5NdZBQ==",
+    "url": "https://github.com/FlayrLabs/skwod-releases/releases/download/v46/skwod-46.apk",
+    "version": "0.1.0",
+    "sig": "yMk5nKUINSnmfjWoHSsA0lKmM3GzuZJNdYo/gTxG5H4RhuDIK1RuSGCOdLKM7jBdRFNLJuuYiEblJff4ctnIBw=="
+  },
+  "ios": {
+    "build": 46,
+    "version": "0.1.0",
+    "testflight": "https://testflight.apple.com/join/AbCd1234"
+  },
+  "signed": "eyJhbmRyb2lkIjp7ImJ1aWxkIjo0NiwiZmlsZSI6InNrd29kLTQ2LmFwayIsIm5vdGVzIjoiRml4ZXMgXCJ0aGluZ3NcIiAmIG1vcmUuIiwic2hhMjU2IjoiOTM3OWNmYjk1NDE2NDM4NTcyYzMzZTJjMmUwM2YxZmRiZGIxMGU0NjY4Y2ZiZGI3YmJkMGUzMDQ5NDYzYWMzMyIsInNpZzIiOiJRdDdXMHd1VFkrS2QvRVFSMGJSakM3VjQ2a29XRGl5dFAwbm1kNWVFNXY5T3E1NjFkd25IakdwQXVJK0ZsbHNSd2ZrNjA1UGVMVFJxbVU5eDVOZFpCUT09IiwidXJsIjoiaHR0cHM6Ly9naXRodWIuY29tL0ZsYXlyTGFicy9za3dvZC1yZWxlYXNlcy9yZWxlYXNlcy9kb3dubG9hZC92NDYvc2t3b2QtNDYuYXBrIiwidmVyc2lvbiI6IjAuMS4wIn0sImNvbW1pdCI6IjAxMjM0NTY3ODlhYmNkZWYwMTIzNDU2Nzg5YWJjZGVmMDEyMzQ1NjciLCJleHBpcmVzIjoxODEwMzY4MDAwLCJpb3MiOnsiYnVpbGQiOjQ2LCJub3RlcyI6IkZpeGVzIFwidGhpbmdzXCIgJiBtb3JlLiIsInRlc3RmbGlnaHQiOiJodHRwczovL3Rlc3RmbGlnaHQuYXBwbGUuY29tL2pvaW4vQWJDZDEyMzQiLCJ2ZXJzaW9uIjoiMC4xLjAifSwiaXNzdWVkIjoxODAwMDAwMDAwLCJ2IjoxfQ==",
+  "signed_sig": "Ke2tRIlQRfKUpZlTkgI8mWRy/noroiSmzq+CmsVaq0ANyN4yS9NshGMpFMigkfaOVvjj56AopPluIxWpb8OkDg=="
+}

@@ -1,0 +1,181 @@
+# CI for pull requests and main. No secrets are used or needed anywhere in this file.
+#
+# Rules for this file (CODEOWNERS covers .github/, so changes here get the maintainer's review):
+#   - Trigger on `pull_request`, NEVER `pull_request_target`: a fork's pull request then runs
+#     with a read-only token and no secrets, and its code never runs with this repository's
+#     credentials.
+#   - `permissions: contents: read` and nothing more.
+#   - No `secrets.*`, no deploy, no publish. Releases are made by the maintainer, not by CI.
+#   - Third-party actions are pinned to a full commit SHA.
+name: ci
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  rust:
+    name: rust (${{ matrix.dir }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        dir: [server, core]
+    defaults:
+      run:
+        working-directory: ${{ matrix.dir }}
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - name: protoc (libsignal compiles its protobuf definitions)
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
+      - name: Toolchain from rust-toolchain.toml, with clippy
+        run: |
+          channel="$(sed -nE 's/^channel *= *"([^"]+)".*/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal --component clippy
+          rustc --version && cargo clippy --version
+      - name: clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+      - name: test
+        run: cargo test --locked
+
+  push-gateway:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: push-gateway
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: push-gateway/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm run typecheck
+      - run: npm test
+
+  web:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    defaults:
+      run:
+        working-directory: web
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      - run: npm ci --no-audit --no-fund
+      - run: npm test
+      # Offline: the build does not ask GitHub for the latest release, so the result does not
+      # depend on the network (the download buttons then point at the releases page).
+      - run: npm run build
+        env:
+          SKWOD_SITE_OFFLINE: '1'
+
+  android:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - uses: actions/setup-java@c5195efecf7bdfc987ee8bae7a71cb8b11521c00 # v4.7.1
+        with:
+          distribution: temurin
+          java-version: '17'
+          cache: gradle
+      - name: protoc
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq protobuf-compiler
+      - name: Toolchain from rust-toolchain.toml
+        working-directory: core
+        run: |
+          channel="$(sed -nE 's/^channel *= *"([^"]+)".*/\1/p' rust-toolchain.toml)"
+          rustup toolchain install "$channel" --profile minimal
+      # The JVM unit tests need the generated Kotlin bindings to compile, not the Android .so
+      # files, so the core is built for the runner itself and the bindings are generated from
+      # that library (the same UniFFI interface). A phone build uses ./build-core.sh instead.
+      - name: Kotlin bindings for the core
+        working-directory: core
+        run: |
+          cargo build --locked --release -p skwod-core
+          cargo run --locked --release -p skwod-core --bin uniffi-bindgen -- generate \
+            --library target/release/libskwod_core.so --language kotlin \
+            --out-dir ../apps/android/core/src/main/java/io/skwod/core
+      - name: Unit tests (the paywall switch is off, as in every source build)
+        working-directory: apps/android
+        run: ./gradlew --no-daemon testDebugUnitTest
+
+  apple-logic:
+    # Hostless logic tests only (SkwodLogicTests: nothing is launched or signed). The full app
+    # build needs the Rust core for three Apple targets and is left to contributors locally
+    # (CONTRIBUTING.md). macOS runners are free for public repositories.
+    runs-on: macos-26
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: apps/apple
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+      - run: brew install xcodegen
+      # The app targets reference the generated core bindings and the bundled host tools, which
+      # the logic tests do not use. Empty placeholders let xcodegen write the project.
+      - name: Project
+        run: |
+          mkdir -p Generated Resources/host-tools
+          touch Generated/SkwodCore.swift
+          xcodegen generate
+      - name: SkwodLogicTests
+        run: |
+          xcodebuild test -project Skwod.xcodeproj -scheme SkwodLogicTests \
+            -destination 'platform=macOS' CODE_SIGNING_ALLOWED=NO
+
+  sign-off:
+    # Every commit in a pull request carries a Signed-off-by line (DCO, see CONTRIBUTING.md).
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+          ref: ${{ github.event.pull_request.head.sha }}
+      - name: Every commit is signed off
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          HEAD: ${{ github.event.pull_request.head.sha }}
+        run: |
+          missing=0
+          for c in $(git rev-list --no-merges "$BASE..$HEAD"); do
+            if ! git log -1 --format=%B "$c" | grep -qE '^Signed-off-by: .+ <.+>$'; then
+              echo "::error::commit $(git log -1 --format='%h %s' "$c") has no Signed-off-by line"
+              missing=1
+            fi
+          done
+          [ "$missing" = 0 ] || { echo "Fix with: git rebase --signoff $BASE && git push --force-with-lease"; exit 1; }

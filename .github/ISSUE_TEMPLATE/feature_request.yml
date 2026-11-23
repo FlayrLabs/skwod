@@ -1,0 +1,26 @@
+name: Feature request
+description: Suggest an idea or an improvement.
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem would this solve?
+      description: Describe the situation. A good problem statement beats a finished design.
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: What do you have in mind?
+  - type: textarea
+    id: privacy
+    attributes:
+      label: Privacy and security
+      description: Would this need the server, the host or the push gateway to learn anything new (who talks to whom, when, content, contacts)? Skwod's rule is that they don't.
+  - type: checkboxes
+    id: pr
+    attributes:
+      label: Contributing
+      options:
+        - label: I'd like to work on this myself.

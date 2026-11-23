@@ -1,0 +1,217 @@
+name: Skwod
+options:
+  bundleIdPrefix: io.skwod
+  createIntermediateGroups: true
+  # The generated project is not committed, so the package pins are: Package.resolved (next to
+  # this file, committed) is installed into the project after every `xcodegen generate`. It fixes
+  # the transitive packages too (LiveKit's WebRTC and FFI binaries). To update a package: change
+  # exactVersion below, generate, let Xcode resolve, and copy the project's Package.resolved back.
+  postGenCommand: mkdir -p Skwod.xcodeproj/project.xcworkspace/xcshareddata/swiftpm && cp Package.resolved Skwod.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
+packages:
+  Sparkle:
+    url: https://github.com/sparkle-project/Sparkle
+    exactVersion: "2.10.1"
+  LiveKit:
+    url: https://github.com/livekit/client-sdk-swift.git
+    exactVersion: "2.19.0"
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "45"
+    ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+    # --- build-time switches (docs/APPLE.md) -------------------------------------------------
+    # Blind push gateway base URL (https://…). Empty = remote push disabled; the app then only
+    # notifies while it is running. See docs/PUSH.md for the contract. Left empty here on
+    # purpose: a release build passes its own gateway on the xcodebuild command line
+    # (upload-ios.sh reads SKWOD_PUSH_GATEWAY from the environment or signing.env).
+    SKWOD_PUSH_GATEWAY: ""
+    # Shared container + keychain group for the app and its notification service extension.
+    SKWOD_APP_GROUP: group.com.skwod.app
+    SKWOD_KEYCHAIN_GROUP: com.skwod.shared
+    # The macOS update feed (Sparkle, Info-macOS.plist SUFeedURL): the public release repo, the
+    # same for every install — never a skwod server. Archives are EdDSA-signed (SUPublicEDKey).
+    SKWOD_UPDATE_FEED: "https://github.com/FlayrLabs/skwod-releases/releases/latest/download/appcast.xml"
+    # Paywall: OFF. To build with the StoreKit gate, add SKWOD_PAYWALL to
+    # SWIFT_ACTIVE_COMPILATION_CONDITIONS (e.g. `xcodebuild … SKWOD_FLAGS=SKWOD_PAYWALL`).
+    SKWOD_FLAGS: ""
+  configs:
+    # Spelled out per configuration: a project-level "$(inherited)" would silently drop DEBUG.
+    Debug:
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: "DEBUG $(SKWOD_FLAGS)"
+    Release:
+      SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(SKWOD_FLAGS)"
+
+targets:
+  Skwod-macOS:
+    type: application
+    platform: macOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: Sources
+      - path: Resources
+        excludes:
+          - "host-tools/**"
+      - path: Resources/host-tools
+        type: folder
+        buildPhase: resources
+      - path: Generated/SkwodCore.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.skwod.mac
+        PRODUCT_NAME: Skwod
+        GENERATE_INFOPLIST_FILE: YES
+        # Custom keys (skwod:// URL scheme, loopback-only ATS exception, Sparkle) live in the
+        # plist; the INFOPLIST_KEY_* settings below are merged into it.
+        INFOPLIST_FILE: Info-macOS.plist
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "Skwod connects straight to your friends' devices when you are on the same network."
+        INFOPLIST_KEY_CFBundleDisplayName: Skwod
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.social-networking
+        INFOPLIST_KEY_NSAppleMusicUsageDescription: "Skwod uses Apple Music to add songs to your posts and stories."
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: "Skwod uses the microphone for end-to-end encrypted voice and video calls."
+        INFOPLIST_KEY_NSCameraUsageDescription: "Skwod uses the camera for end-to-end encrypted video calls."
+        ENABLE_HARDENED_RUNTIME: YES
+        CODE_SIGN_ENTITLEMENTS: Skwod-macOS.entitlements
+        OTHER_LDFLAGS: -lc++
+    dependencies:
+      - framework: Generated/SkwodCore.xcframework
+        embed: false
+      - sdk: Security.framework
+      - sdk: SystemConfiguration.framework
+      - sdk: Network.framework   # the p2p transport (iroh) reads interface/gateway state through it
+      - sdk: MusicKit.framework
+      - package: Sparkle   # macOS-only native self-update (EdDSA-signed appcast); iOS never links it
+      - package: LiveKit   # WebRTC SFU client for E2EE voice/video
+
+  Skwod-iOS:
+    type: application
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: Sources
+      - path: Resources
+      - path: Generated/SkwodCore.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.skwod.app
+        INFOPLIST_KEY_ITSAppUsesNonExemptEncryption: "NO"  # standard-crypto declaration; skips TestFlight's Missing Compliance stall
+        PRODUCT_NAME: Skwod
+        GENERATE_INFOPLIST_FILE: YES
+        # Custom keys (skwod:// URL scheme, loopback-only ATS exception, background modes, push
+        # gateway, shared groups) live in the plist; INFOPLIST_KEY_* settings are merged into it.
+        INFOPLIST_FILE: Info-iOS.plist
+        INFOPLIST_KEY_NSLocalNetworkUsageDescription: "Skwod connects straight to your host's computer when you are on the same Wi-Fi."
+        INFOPLIST_KEY_CFBundleDisplayName: Skwod
+        INFOPLIST_KEY_UIApplicationSceneManifest_Generation: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
+        INFOPLIST_KEY_NSAppleMusicUsageDescription: "Skwod uses Apple Music to add songs to your posts and stories."
+        INFOPLIST_KEY_NSCameraUsageDescription: "Skwod uses the camera for end-to-end encrypted video calls, to send photos in chat, and to scan invite QR codes."
+        INFOPLIST_KEY_NSMicrophoneUsageDescription: "Skwod uses the microphone for end-to-end encrypted voice and video calls."
+        INFOPLIST_KEY_NSPhotoLibraryUsageDescription: "Skwod accesses your photos so you can send them in chat."
+        CODE_SIGN_ENTITLEMENTS: Skwod-iOS.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"
+        OTHER_LDFLAGS: -lc++
+        DEVELOPMENT_TEAM: NRNU83UJ68
+        CODE_SIGN_STYLE: Automatic
+    dependencies:
+      - framework: Generated/SkwodCore.xcframework
+        embed: false
+      - sdk: Security.framework
+      - sdk: SystemConfiguration.framework
+      - sdk: Network.framework   # the p2p transport (iroh) reads interface/gateway state through it
+      - sdk: MusicKit.framework
+      - package: LiveKit   # WebRTC SFU client for E2EE voice/video
+      - sdk: PushKit.framework
+      - sdk: CallKit.framework
+      # Rewrites the gateway's generic "New message" push on-device (docs/PUSH.md).
+      - target: SkwodNotificationService
+
+  # Notification Service Extension: receives the blind gateway's generic alert and, when it can
+  # within the extension's limits, fetches + decrypts on-device and rewrites the text. If it
+  # can't, the generic text stays. No plaintext ever goes through Apple (docs/PUSH.md).
+  SkwodNotificationService:
+    type: app-extension
+    platform: iOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: NotificationService
+      - path: Generated/SkwodCore.swift
+      # The small shared pieces the extension needs — nothing with UI in it.
+      - path: Sources/Keychain.swift
+      - path: Sources/Workspace.swift
+      - path: Sources/Invites.swift
+      - path: Sources/Shared.swift
+      # Who may be announced under a conversation's title (Foundation only).
+      - path: Sources/ConversationStore.swift
+      # Which rows a wake treats as new: by id, never by the server's clock (Foundation only).
+      - path: Sources/AnnounceWindow.swift
+      # What keeps one skwod's files and answers out of another's (Foundation only).
+      - path: Sources/WorkspaceIsolation.swift
+      # Whose wake it is, whether it may interrupt, how often a host may be dialed (Foundation only).
+      - path: Sources/WakeRules.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.skwod.app.NotificationService
+        PRODUCT_NAME: SkwodNotificationService
+        GENERATE_INFOPLIST_FILE: YES
+        INFOPLIST_FILE: NotificationService/Info.plist
+        INFOPLIST_KEY_CFBundleDisplayName: Skwod
+        CODE_SIGN_ENTITLEMENTS: NotificationService/NotificationService.entitlements
+        TARGETED_DEVICE_FAMILY: "1,2"
+        OTHER_LDFLAGS: -lc++
+        DEVELOPMENT_TEAM: NRNU83UJ68
+        CODE_SIGN_STYLE: Automatic
+        SKIP_INSTALL: YES
+        SWIFT_ACTIVE_COMPILATION_CONDITIONS: "$(inherited) SKWOD_EXTENSION"
+    dependencies:
+      - framework: Generated/SkwodCore.xcframework
+        embed: false
+      - sdk: Security.framework
+      - sdk: SystemConfiguration.framework
+      - sdk: Network.framework   # the p2p transport (iroh) reads interface/gateway state through it
+      - sdk: UserNotifications.framework
+
+  # Hostless logic tests (no app is launched, nothing is signed in, no real data is touched):
+  # the conversation stores and their clash rules, compiled from the same source file the apps
+  # use.  xcodebuild test -project Skwod.xcodeproj -scheme SkwodLogicTests -destination 'platform=macOS'
+  SkwodLogicTests:
+    type: bundle.unit-test
+    platform: macOS
+    deploymentTarget: "26.0"
+    sources:
+      - path: Tests
+      - path: Sources/ConversationStore.swift
+      # What is stored besides the conversation lists (spaces, contacts, Security activity).
+      - path: Sources/StoredModels.swift
+      # When the app sounds / notifies for a message (Foundation only).
+      - path: Sources/MessageAlerts.swift
+      # The notification extension's "what is new" rule (by id, not by server time).
+      - path: Sources/AnnounceWindow.swift
+      # How an install registers for wakes: credential, rotation, the raw-token transition.
+      - path: Sources/PushRegistration.swift
+      # Build 45: what travels inside encrypted messages (the story song clip among it), the
+      # host's upload limit, and where "Start server" / "Invite friends" lead.
+      - path: Sources/FeedWire.swift
+      - path: Sources/UploadLimit.swift
+      - path: Sources/HostSetupRoute.swift
+      # The signed release manifest the iOS update banner reads (Foundation + CryptoKit only).
+      - path: Sources/UpdateManifest.swift
+      # Build 45 audit: one skwod's base URL, session, files and server answers stay its own.
+      - path: Sources/WorkspaceIsolation.swift
+      # Whose name is shown and how far it is trusted (contacts, look-alikes, waiting members).
+      - path: Sources/NameTrust.swift
+      # What a contentless wake may make the device do: mutes that fail closed, the dial budget.
+      - path: Sources/WakeRules.swift
+      # How long a hold has left, and what "Waiting to restore" says (contested: no countdown).
+      - path: Sources/HoldCountdown.swift
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: io.skwod.logic-tests
+        GENERATE_INFOPLIST_FILE: YES
+        CODE_SIGN_IDENTITY: "-"
+        CODE_SIGN_STYLE: Manual
+    scheme:
+      testTargets:
+        - SkwodLogicTests

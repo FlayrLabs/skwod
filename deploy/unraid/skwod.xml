@@ -1,0 +1,44 @@
+<?xml version="1.0"?>
+<Container version="2">
+  <Name>skwod</Name>
+  <!-- Pin the image BY DIGEST (name@sha256:…), never by a tag such as :main, which is whatever
+       the registry serves that day. Replace the placeholder with the digest of the image you
+       built or of a published release after checking its signature (docs/SELF-HOSTING.md,
+       deploy/verify-image.sh). The placeholder is not a valid reference, so nothing is pulled
+       until you do. -->
+  <Repository>ghcr.io/flayrlabs/skwod-server@sha256:REPLACE_WITH_THE_IMAGE_DIGEST</Repository>
+  <Registry>https://ghcr.io/flayrlabs/skwod-server</Registry>
+  <Network>bridge</Network>
+  <MyIP/>
+  <Shell>bash</Shell>
+  <Privileged>false</Privileged>
+  <Support>https://github.com/FlayrLabs/skwod/issues</Support>
+  <Project>https://github.com/FlayrLabs/skwod</Project>
+  <Overview>Host your own skwod: private, end-to-end-encrypted group chat with voice and video for you and your friends. The admin page is published on 127.0.0.1 of the Unraid box only (it is plain HTTP and shows the owner setup code): from your computer run "ssh -L 3477:127.0.0.1:3477 root@your-unraid-box", open http://127.0.0.1:3477, type the one-time admin token from this container's log (Docker tab, click the icon, Logs), press "Start server" and send the invite to your friends. No domain, no port forwarding and no account are needed: friends reach your server by its key. The server stores only encrypted messages and cannot read them. Voice and video are built in (a LiveKit server runs inside the container and is never exposed).</Overview>
+  <Category>Network:Messenger Network:Voip</Category>
+  <WebUI/>
+  <TemplateURL/>
+  <Icon/>
+  <!-- Hardened: read-only root, no capabilities for the server, no privilege escalation.
+       The container STARTS as root with exactly three capabilities so it can give the appdata
+       folder (which Unraid/Docker create root-owned) to the unprivileged user, and then
+       switches to SKWOD_RUN_AS before it opens any socket; after that switch the kernel has
+       cleared every capability and no-new-privileges keeps it that way. -->
+  <!-- "-p 127.0.0.1:3477:3477": the admin page is published on the box's loopback only (an
+       Unraid "Port" setting would publish it to the whole LAN). -->
+  <ExtraParams>-p 127.0.0.1:3477:3477 --user 0:0 --cap-drop=ALL --cap-add=CHOWN --cap-add=SETUID --cap-add=SETGID --security-opt no-new-privileges:true --read-only --tmpfs /tmp:noexec,nosuid,size=64m --memory=768m --restart unless-stopped</ExtraParams>
+  <PostArgs/>
+  <CPUset/>
+  <DateInstalled/>
+  <DonateText/>
+  <DonateLink/>
+  <Requires>Outbound UDP must be allowed (it is by default).</Requires>
+  <Config Name="Data" Target="/data" Default="/mnt/user/appdata/skwod" Mode="rw" Description="Everything the server keeps: the encrypted database and attachments, and the keys that ARE your server's address. Back this folder up; if you lose it, every invite stops working." Type="Path" Display="always" Required="true" Mask="false">/mnt/user/appdata/skwod</Config>
+  <Config Name="Connection port (UDP)" Target="47474" Default="47474" Mode="udp" Description="How friends' apps reach the server. Nothing needs forwarding; forwarding this UDP port on your router is optional and makes direct connections more likely. If you change the host port, set the same number in 'P2P port' below." Type="Port" Display="always" Required="true" Mask="false">47474</Config>
+  <Config Name="Admin page address" Target="SKWOD_ADMIN_LISTEN" Default="0.0.0.0:3477" Mode="" Description="Leave as is: the address INSIDE the container. On the Unraid box the page is published on 127.0.0.1 only (Extra Parameters); reach it through an SSH tunnel. It is protected by a one-time token printed in the container log." Type="Variable" Display="advanced" Required="true" Mask="false">0.0.0.0:3477</Config>
+  <Config Name="Wait for Start button" Target="SKWOD_WAIT_FOR_START" Default="true" Mode="" Description="Serve nobody until you press Start server on the admin page. Your choice is remembered." Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
+  <Config Name="P2P port" Target="SKWOD_P2P_PORT" Default="47474" Mode="" Description="Must match the container side of 'Connection port (UDP)'." Type="Variable" Display="advanced" Required="true" Mask="false">47474</Config>
+  <Config Name="Run as (uid:gid)" Target="SKWOD_RUN_AS" Default="99:100" Mode="" Description="The unprivileged user the server runs as (Unraid's nobody:users)." Type="Variable" Display="advanced" Required="true" Mask="false">99:100</Config>
+  <Config Name="Use public relays as a fallback" Target="SKWOD_PUBLIC_FALLBACK" Default="true" Mode="" Description="true: when a direct connection is impossible, traffic goes through iroh's public relays (still end-to-end encrypted; the relay sees IP addresses and timing). false: direct connections only, strictly independent, but some friends may not be able to connect." Type="Variable" Display="advanced" Required="false" Mask="false">true</Config>
+  <Config Name="Find on local network" Target="SKWOD_LOCAL_DISCOVERY" Default="" Mode="" Description="Leave empty (off). Only useful with Network set to 'host'; can also be switched on the admin page." Type="Variable" Display="advanced" Required="false" Mask="false"/>
+</Container>

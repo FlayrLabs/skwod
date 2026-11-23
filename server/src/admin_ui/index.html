@@ -1,0 +1,78 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>Skwod host</title>
+<link rel="stylesheet" href="/admin.css">
+</head>
+<body>
+<main>
+  <header>
+    <h1>Skwod</h1>
+    <p id="state" class="pill" data-phase="loading">…</p>
+  </header>
+
+  <section id="login" hidden>
+    <h2>Admin token</h2>
+    <p>Type the one-time token this server printed in its log when it started.
+       On Unraid or Synology, open the container's <b>Logs</b>.</p>
+    <form id="login-form" autocomplete="off">
+      <input id="token" inputmode="latin" autocapitalize="characters" spellcheck="false"
+             placeholder="XXXXX-XXXXX-XXXXX-XXXXX" aria-label="Admin token" required>
+      <button type="submit">Continue</button>
+    </form>
+    <p class="note">Each token works once. Restart the server to get a new one.</p>
+  </section>
+
+  <section id="stopped" hidden>
+    <p class="lead">Your server is off. Start it and you get an invite to send to your friends.
+       Nothing to configure: no domain, no port forwarding, no account.</p>
+    <button id="start" class="big">Start server</button>
+    <p class="note" id="firewall-note">On Windows, the first start may show a <b>Windows Firewall</b> prompt for
+       “skwod”. Choose <b>Allow</b> (Private networks is enough). It lets friends connect to you
+       directly; if you decline, they can still connect through a relay, only slower.</p>
+  </section>
+
+  <section id="running" hidden>
+    <div id="invite-block">
+      <h2 id="invite-title">Invite</h2>
+      <p id="invite-help"></p>
+      <img id="qr" alt="Invite QR code" width="240" height="240">
+      <p><code id="invite"></code></p>
+      <div class="row">
+        <button id="copy">Copy invite</button>
+        <button id="new-invite" class="quiet">New invite</button>
+      </div>
+      <p id="invite-expiry" class="note"></p>
+    </div>
+    <dl>
+      <div><dt>Members</dt><dd id="members">0</dd></div>
+      <div><dt>Online now</dt><dd id="online">0</dd></div>
+      <div><dt>Voice and video</dt><dd id="voice">–</dd></div>
+      <div><dt>Reachable by invite</dt><dd id="p2p">–</dd></div>
+    </dl>
+    <label class="toggle">
+      <input type="checkbox" id="lan">
+      <span><b>Let people on this Wi-Fi find my server faster</b><br>
+      <span class="note">Off by default. Turn it on only on a network you trust, like your home.
+      Your server then answers on the local network under a name that changes every hour and that
+      only people holding your invite can recognise. Leave it off on public, hotel or work Wi-Fi.</span></span>
+    </label>
+    <div class="row">
+      <button id="restart" class="quiet">Restart</button>
+      <button id="stop" class="danger">Stop server</button>
+    </div>
+  </section>
+
+  <p id="problem" class="problem" hidden></p>
+
+  <footer>
+    <p>This server stores only encrypted messages. It cannot read them, and neither can this page.</p>
+    <p><span id="version"></span> <a href="#" id="logout" hidden>Sign out</a></p>
+  </footer>
+</main>
+<script src="/admin.js"></script>
+</body>
+</html>

@@ -1,0 +1,22 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- E2EE voice/video (LiveKit/WebRTC) needs mic + camera under the hardened runtime.
+	     The app is not sandboxed (it runs a bundled server + SFU as child processes), so these
+	     device entitlements are what grant capture access to the notarized build. -->
+	<key>com.apple.security.device.audio-input</key>
+	<true/>
+	<key>com.apple.security.device.camera</key>
+	<true/>
+	<!-- Data-protection keychain (kSecUseDataProtectionKeychain): session tokens and the cache
+	     key live here instead of the login keychain. This is a RESTRICTED entitlement on macOS:
+	     a Developer ID build must embed a provisioning profile for io.skwod.mac that authorizes
+	     it, or the signed app will not launch (docs/APPLE.md → "Release signing"). Unsigned and
+	     ad-hoc local builds ignore it and fall back to the login keychain. -->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)io.skwod.mac</string>
+	</array>
+</dict>
+</plist>

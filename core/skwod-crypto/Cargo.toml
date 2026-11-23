@@ -1,0 +1,38 @@
+[package]
+name = "skwod-crypto"
+description = "skwod's E2EE layer: Signal's official libsignal (PQXDH, Double Ratchet + SPQR, Sender Keys, Sealed Sender, safety numbers) plus the small non-protocol pieces around it (attachment cipher, message padding, passphrase key backup)."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Signal's official protocol implementation (AGPL-3.0-only). Not on crates.io; pinned to the
+# v0.108.0 release tag by commit hash so a moved tag can never change what we build.
+libsignal-protocol = { version = "0.1.0", git = "https://github.com/signalapp/libsignal", rev = "8be00c282001caa3585d18de0f044c6d500348ab" } # tag v0.108.0
+async-trait = "0.1"          # libsignal's store traits are async_trait(?Send)
+rand = "0.9"                 # the RNG traits libsignal's API takes (OsRng only)
+uuid = "1"                   # sender-key distribution ids
+serde = { version = "1", features = ["derive"] }
+postcard = { version = "1", default-features = false, features = ["use-std"] }   # store snapshot for the encrypted on-device cache
+zeroize = { version = "1", features = ["derive"] }
+subtle = "2"
+thiserror = "1"
+
+# Non-protocol primitives, all from audited RustCrypto/dalek crates (see docs/SECURITY.md
+# "What is not libsignal"). None of these touch message-session crypto.
+aes = "0.8"                  # attachment cipher: AES-256-CBC + HMAC-SHA256 (Signal's attachment scheme)
+cbc = { version = "0.1", features = ["alloc"] }
+hmac = "0.12"
+sha2 = "0.10"
+hkdf = "0.12"
+chacha20poly1305 = "0.10"    # space-name / beacon / backup AEAD (static-key metadata sealing)
+argon2 = "0.5"               # passphrase key backup
+ed25519-dalek = { version = "2", features = ["rand_core"] }   # the server INSTANCE identity the invite pins
+rand_core = { version = "0.6", features = ["getrandom"] }
+
+[dev-dependencies]
+hex = "0.4"

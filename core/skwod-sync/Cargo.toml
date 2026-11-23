@@ -1,0 +1,40 @@
+[package]
+name = "skwod-sync"
+description = "Client sync engine: encrypted local cache, server API/WS client, libsignal session management. Shared by all native clients via UniFFI."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+skwod-crypto = { path = "../skwod-crypto", version = "0.0.0" }
+# SQLCipher-encrypted local store (the on-device message cache). Vendored so iOS/Android
+# cross-builds don't depend on a system OpenSSL.
+rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+hex = "0.4"
+zeroize = "1"
+base64 = "0.22"
+# Percent-encode user/server-controlled identifiers before interpolating them into REST paths/queries.
+percent-encoding = "2"
+tokio = { version = "1", features = ["rt", "macros", "sync", "time", "net"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"] }
+futures-util = "0.3.31"
+rand = "0.8"
+# Decentralized address beacon (Nostr): BIP340 schnorr signatures + event-id hashing.
+secp256k1 = { version = "0.29", features = ["std"] }
+sha2 = "0.10"
+postcard = { version = "1", default-features = false, features = ["use-std"] }   # compact session-state serialization
+# Tor client for private beacon lookups (hide member IP from relays; hide host IP too when publishing).
+arti-client = { version = "0.30", default-features = false, features = ["tokio", "rustls", "compression"] }
+tor-rtcompat = { version = "0.30", default-features = false, features = ["tokio", "rustls"] }
+tokio-util = { version = "0.7", features = ["compat"] }
+
+[dev-dependencies]
+tempfile = "3"

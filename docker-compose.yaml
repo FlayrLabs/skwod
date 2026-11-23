@@ -1,0 +1,33 @@
+# Build-from-source compose for a platform that builds the image itself (a "docker compose build
+# pack"): full container hardening — read-only root, tmpfs noexec, cap-drop, no-new-privileges.
+# The SQLite DB + encrypted blobs live on the named `skwod-data` volume (the only writable path).
+# For running a skwod at home or on a VPS use deploy/ instead (docs/SELF-HOSTING.md).
+services:
+  server:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    ports:
+      - "3000"
+    volumes:
+      - skwod-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    cpus: 0.5
+    healthcheck:
+      # The hardened runtime image ships no wget/curl, so probe /health with bash's /dev/tcp.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/3000 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && grep -q '\"status\":\"ok\"' <&3"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  skwod-data:

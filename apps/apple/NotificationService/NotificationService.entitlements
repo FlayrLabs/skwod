@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- Shared with the app: the encrypted message cache lives in this container… -->
+	<key>com.apple.security.application-groups</key>
+	<array>
+		<string>$(SKWOD_APP_GROUP)</string>
+	</array>
+	<!-- …and its key + the session token live in this keychain group. -->
+	<key>keychain-access-groups</key>
+	<array>
+		<string>$(AppIdentifierPrefix)$(SKWOD_KEYCHAIN_GROUP)</string>
+	</array>
+</dict>
+</plist>

@@ -1,0 +1,3 @@
+# Same pin as server/ and core/.
+[toolchain]
+channel = "1.93.1"

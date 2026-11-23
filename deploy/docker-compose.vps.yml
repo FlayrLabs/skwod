@@ -1,0 +1,81 @@
+# skwod VPS deploy — public, TLS-terminated instance for hosting friends over the internet.
+#
+# Two services:
+#   • skwod  — the ciphertext-only server (SQLite + encrypted blobs on the `skwod-data` volume).
+#   • caddy  — reverse proxy that gets + renews a real HTTPS certificate automatically (Let's
+#              Encrypt) for your domain, so the mobile apps (which require TLS) can connect.
+#
+# Driven by `deploy/vps-install.sh`, which renders the Caddyfile and passes the env below.
+# Build from source by default; set SKWOD_IMAGE to pull a prebuilt image instead.
+
+services:
+  skwod:
+    image: ${SKWOD_IMAGE:-skwod-local}
+    build:
+      context: ..
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    command: ["skwod", "run", "--data", "/data", "--listen", "0.0.0.0:3000"]
+    environment:
+      # Caddy is the ONLY peer whose X-Forwarded-For is believed (client_key.rs): it has a fixed
+      # address on the private network below. Without this every request appears to come from
+      # the proxy, so all clients share one per-IP rate-limit bucket (one abuser locks everyone
+      # out of signup/login); trusting more than this one address would let clients forge it.
+      SKWOD_TRUSTED_PROXIES: 172.31.250.2
+      # The admin page is for home/NAS hosts; a VPS is managed with vps-install.sh.
+      SKWOD_ADMIN_LISTEN: "off"
+    networks:
+      skwod-net:
+        ipv4_address: 172.31.250.3
+    volumes:
+      - skwod-data:/data
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=64m
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    mem_limit: 512m
+    cpus: 1.0
+    expose:
+      - "3000"
+    healthcheck:
+      test: ["CMD", "skwod", "healthcheck"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    depends_on:
+      - skwod
+    networks:
+      skwod-net:
+        ipv4_address: 172.31.250.2
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy-data:/data     # ACME account + issued certificates (persist across restarts)
+      - caddy-config:/config
+    cap_drop:
+      - ALL
+    cap_add:
+      - NET_BIND_SERVICE
+    security_opt:
+      - no-new-privileges:true
+
+networks:
+  skwod-net:
+    ipam:
+      config:
+        - subnet: 172.31.250.0/24
+
+volumes:
+  skwod-data:
+  caddy-data:
+  caddy-config:

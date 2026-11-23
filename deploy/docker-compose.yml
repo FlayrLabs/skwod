@@ -1,0 +1,78 @@
+# skwod — host a server with Docker (any Linux box, Synology Container Manager, Portainer,
+# Docker Desktop). One container: the skwod server plus a LiveKit SFU it runs on loopback, so
+# voice and video work with nothing else to set up.
+#
+#   SKWOD_IMAGE=<image> docker compose up -d
+#   docker compose logs skwod        # shows the one-time admin token
+#   open http://127.0.0.1:3477       # ON THIS MACHINE: press "Start server", copy the invite
+#
+# SKWOD_IMAGE is required and has no default on purpose: a tag such as `:main` is whatever the
+# registry serves that day, and whoever can push to it would run their code on your host with
+# your server's keys. Use an image you built yourself (`docker build -t skwod-server .`), or a
+# published one BY DIGEST — `ghcr.io/flayrlabs/skwod-server@sha256:<64 hex>` — after checking
+# its signature (`deploy/verify-image.sh`, docs/SELF-HOSTING.md).
+#
+# The admin page is published on 127.0.0.1 only. It is plain HTTP, and while the skwod has no
+# owner it shows the owner setup code, so it must not cross a network. From another computer,
+# tunnel to it:  ssh -L 3477:127.0.0.1:3477 you@this-machine   then open http://127.0.0.1:3477
+# (SKWOD_ADMIN_BIND=0.0.0.0 publishes it to the LAN again; only on a network you fully trust.)
+#
+# No domain, no port forwarding, no account: friends reach the server by its key (docs/P2P.md).
+# Also the bundle `skwod init` writes and starts.
+
+services:
+  # One-shot: give an existing data volume/folder to the user the server runs as. Volumes
+  # written by an older (root) image and host folders Docker created are root-owned, and the
+  # non-root server cannot open them. Runs as root with the single capability it needs, changes
+  # only entries with the wrong owner (so it is a no-op from the second start on), and exits.
+  init-permissions:
+    image: ${SKWOD_IMAGE:?set SKWOD_IMAGE to the image you built, or to a published one pinned by digest (name@sha256:...) - see docs/SELF-HOSTING.md}
+    user: "0:0"
+    network_mode: none
+    read_only: true
+    cap_drop: [ALL]
+    cap_add: [CHOWN]
+    security_opt: ["no-new-privileges:true"]
+    command: ["skwod", "fix-ownership", "--data", "/data", "--owner", "${SKWOD_RUN_AS:-1000:1000}"]
+    volumes:
+      - ${SKWOD_DATA:-skwod-data}:/data
+    restart: "no"
+
+  skwod:
+    image: ${SKWOD_IMAGE:?set SKWOD_IMAGE to the image you built, or to a published one pinned by digest (name@sha256:...) - see docs/SELF-HOSTING.md}
+    depends_on:
+      init-permissions:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    user: "${SKWOD_RUN_AS:-1000:1000}"
+    read_only: true
+    tmpfs:
+      - /tmp:noexec,nosuid,size=64m
+    cap_drop: [ALL]
+    security_opt: ["no-new-privileges:true"]
+    environment:
+      # The admin page, behind a one-time token printed in the log. It listens on every
+      # interface INSIDE the container (that is how a published port reaches it); which host
+      # address it is published on is decided under `ports:` below — loopback by default.
+      SKWOD_ADMIN_LISTEN: 0.0.0.0:3477
+      # Serve nobody until you press "Start server" (remembered across restarts).
+      SKWOD_WAIT_FOR_START: "true"
+      # A fixed UDP port so the mapping below matches (and so you CAN forward it on your
+      # router for faster direct connections — optional).
+      SKWOD_P2P_PORT: ${SKWOD_P2P_PORT:-47474}
+      # Empty values are treated as unset.
+      SKWOD_PUBLIC_FALLBACK: ${SKWOD_PUBLIC_FALLBACK:-}
+      SKWOD_NO_P2P: ${SKWOD_NO_P2P:-}
+      SKWOD_PUSH_GATEWAYS: ${SKWOD_PUSH_GATEWAYS:-}
+    ports:
+      - "${SKWOD_ADMIN_BIND:-127.0.0.1}:${SKWOD_ADMIN_PORT:-3477}:3477"   # admin page, this machine only
+      - "${SKWOD_P2P_PORT:-47474}:${SKWOD_P2P_PORT:-47474}/udp"           # p2p (QUIC)
+      - "127.0.0.1:${SKWOD_API_PORT:-3000}:3000"                          # API, this machine only
+    volumes:
+      - ${SKWOD_DATA:-skwod-data}:/data      # SQLite + encrypted blobs + keys. Back this up.
+    mem_limit: 768m
+    # LiveKit is NOT a separate service and publishes no ports: the server starts the bundled,
+    # version-pinned binary on 127.0.0.1 inside this container and tunnels calls over p2p.
+
+volumes:
+  skwod-data:

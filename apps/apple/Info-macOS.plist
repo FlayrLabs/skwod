@@ -1,0 +1,55 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- skwod://join/<node id>#<join code> invites open the app. Input is validated in
+	     Sources/Invites.swift and only ever prefills the connect screen. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>CFBundleURLName</key>
+			<string>io.skwod.invite</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>skwod</string>
+			</array>
+		</dict>
+	</array>
+	<!-- The ONLY transport-security exception: plain http/ws to this machine's own loopback
+	     (the in-process p2p proxy, and a Mac host's own server + SFU). No arbitrary loads,
+	     no per-domain exceptions. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<!-- Sparkle (Sources/SparkleUpdater.swift). One fixed public feed for every install: skwod is
+	     p2p, so no skwod server is asked. Archives must be EdDSA-signed by SUPublicEDKey; GitHub
+	     only carries them. A check once a day; updates download and install when the app quits.
+	     The user can switch the automatic check off in Profile. -->
+	<key>SUFeedURL</key>
+	<string>$(SKWOD_UPDATE_FEED)</string>
+	<key>SUPublicEDKey</key>
+	<string>cVE0iMBoFVB8dOjzqNCFVgFyr9qD+G0BhfrDRnN9mMg=</string>
+	<key>SUEnableAutomaticChecks</key>
+	<true/>
+	<key>SUScheduledCheckInterval</key>
+	<integer>86400</integer>
+	<key>SUAllowsAutomaticUpdates</key>
+	<true/>
+	<key>SUAutomaticallyUpdate</key>
+	<true/>
+	<key>SUVerifyUpdateBeforeExtraction</key>
+	<true/>
+	<!-- The appcast itself must be EdDSA-signed by SUPublicEDKey (generate_appcast appends the
+	     signature block). 0 = never fall back to accepting an unsigned feed. -->
+	<key>SURequireSignedFeed</key>
+	<true/>
+	<key>SUSignedFeedFailureExpirationInterval</key>
+	<real>0</real>
+	<key>SUEnableSystemProfiling</key>
+	<false/>
+</dict>
+</plist>

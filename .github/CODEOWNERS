@@ -1,0 +1,58 @@
+# Code owners: GitHub asks these people for a review, and with "Require review from Code
+# Owners" turned on in branch protection, a pull request touching these paths can't be merged
+# without their approval.
+#
+# Owner: the FlayrLabs team @FlayrLabs/skwod-maintainers. Its members are the only people whose
+# approval can merge a pull request. The team needs write access to this repository; GitHub
+# ignores lines whose owner doesn't exist or has no write access, and shows an error on this file.
+#
+# Later lines win, so the catch-all comes first.
+
+*                                   @FlayrLabs/skwod-maintainers
+
+# Cryptography: the libsignal integration, key stores, attachments, backups, device links.
+/core/skwod-crypto/                 @FlayrLabs/skwod-maintainers
+# The sync engine: trust, accounts, guards, what is accepted from a server.
+/core/skwod-sync/src/engine.rs      @FlayrLabs/skwod-maintainers
+/core/skwod-sync/src/engine/        @FlayrLabs/skwod-maintainers
+/core/skwod-net/src/invite.rs       @FlayrLabs/skwod-maintainers
+/core/Cargo.lock                    @FlayrLabs/skwod-maintainers
+
+# Server: authentication, sessions, the key directory, push.
+/server/src/auth.rs                 @FlayrLabs/skwod-maintainers
+/server/src/client_key.rs           @FlayrLabs/skwod-maintainers
+/server/src/keydir.rs               @FlayrLabs/skwod-maintainers
+/server/src/admission.rs            @FlayrLabs/skwod-maintainers
+/server/src/admin.rs                @FlayrLabs/skwod-maintainers
+/server/src/push.rs                 @FlayrLabs/skwod-maintainers
+/server/src/apns.rs                 @FlayrLabs/skwod-maintainers
+/server/src/fcm.rs                  @FlayrLabs/skwod-maintainers
+/server/src/gateway.rs              @FlayrLabs/skwod-maintainers
+/server/migrations/                 @FlayrLabs/skwod-maintainers
+/server/migrations-postgres/        @FlayrLabs/skwod-maintainers
+/server/Cargo.lock                  @FlayrLabs/skwod-maintainers
+
+# The push gateway (the only publisher-run service).
+/push-gateway/                      @FlayrLabs/skwod-maintainers
+
+# Releases, updates and signing: what makes a build "official".
+/apps/apple/Sources/UpdateManifest.swift  @FlayrLabs/skwod-maintainers
+/apps/apple/Sources/PushRegistration.swift @FlayrLabs/skwod-maintainers
+/apps/apple/NotificationService/    @FlayrLabs/skwod-maintainers
+/apps/apple/project.yml             @FlayrLabs/skwod-maintainers
+/apps/apple/*.entitlements          @FlayrLabs/skwod-maintainers
+/apps/android/app/build.gradle.kts  @FlayrLabs/skwod-maintainers
+/apps/android/app/src/main/java/io/skwod/app/Updater.kt @FlayrLabs/skwod-maintainers
+/package-release.sh                 @FlayrLabs/skwod-maintainers
+/publish-release.sh                 @FlayrLabs/skwod-maintainers
+/RELEASE-SIGNING.md                 @FlayrLabs/skwod-maintainers
+
+# Policy files and the repository's own settings.
+/SECURITY.md                        @FlayrLabs/skwod-maintainers
+/docs/SECURITY.md                   @FlayrLabs/skwod-maintainers
+/LICENSE                            @FlayrLabs/skwod-maintainers
+/TRADEMARKS.md                      @FlayrLabs/skwod-maintainers
+/.gitleaks.toml                     @FlayrLabs/skwod-maintainers
+/.github/                           @FlayrLabs/skwod-maintainers
+/web/public/_headers                @FlayrLabs/skwod-maintainers
+/web/site.config.js                 @FlayrLabs/skwod-maintainers

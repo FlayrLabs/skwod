@@ -1,0 +1,116 @@
+# cargo-deny policy for the Skwod Rust workspaces (core/, server/, host/).
+# Run ./check-deps.sh (it runs `cargo deny check` in each workspace with this file).
+#
+# The point: a dependency must come from crates.io or from the ONE pinned git source below, must
+# not carry a known advisory, and must be under a licence compatible with AGPL-3.0-only
+# distribution (docs/DECISIONS.md ADR-011).
+
+[graph]
+all-features = true
+
+[advisories]
+# Any RUSTSEC advisory (vulnerability or unsound) fails the check; yanked crates too.
+yanked = "deny"
+# An `ignore` entry needs: the reason it does not apply to Skwod, and an expiry date. On or after
+# the expiry (or when the dependency that drags the crate in is bumped, whichever is first)
+# delete the entry, run ./check-deps.sh, and either fix what comes back or re-justify it.
+# Everything below is a transitive dependency of a deliberately pinned crate (libsignal at its
+# rev, iroh =1.4.1, arti 0.30, sqlx 0.8, uniffi 0.28); nothing we depend on directly is ignored.
+ignore = [
+    # --- vulnerabilities: no patched version is reachable; code path not reachable in Skwod ---
+
+    # rsa 0.9 (Marvin: timing side channel in RSA PRIVATE-key operations). core only, via
+    # arti's tor-llcrypto, which requires rsa ^0.9 in every release up to 0.48 — the fix (rsa
+    # 0.10) is not selectable. The Tor client only VERIFIES RSA signatures on directory
+    # documents and relay certificates (public-key operations); Skwod never builds arti's
+    # relay features and never loads or uses an RSA private key, so there is no secret-dependent
+    # timing to observe. The server and host do not link rsa at all.
+    # Expires 2027-02-28, or when tor-llcrypto moves to rsa 0.10.
+    { id = "RUSTSEC-2023-0071", reason = "arti client verifies RSA signatures only; no RSA private-key operation exists in Skwod" },
+
+    # Bundled SQLite < 3.54.0 (CVE-2026-119375): uninitialised page-cache memory is returned when
+    # a database is opened next to a crafted -wal file with a different page size. Local vector;
+    # it needs an attacker who can WRITE the database's directory and then READ query results.
+    #   core:   the SQLCipher message cache and arti's directory cache live in the app's private
+    #           data directory. Fix needs libsqlite3-sys 0.40 (the first whose SQLCipher bundles
+    #           SQLite 3.54), i.e. rusqlite >= 0.42, but arti's tor-dirmgr caps rusqlite at < 0.41
+    #           even in 0.48 and `links = "sqlite3"` allows one copy — not selectable today.
+    #   server: the database is in the server's own data directory, written only by the server
+    #           process. Fix needs sqlx 0.9, which
+    #           needs Rust 1.94 (toolchain is pinned to 1.93.1) and a port of every query site.
+    # Anyone able to plant files there already controls the data the bug could leak.
+    # Expires 2027-01-31: re-check tor-dirmgr's rusqlite range and schedule the sqlx 0.9 port.
+    { id = "RUSTSEC-2026-0459", reason = "database directories are private to the app/server; nobody less trusted can plant a -wal file" },
+
+    # --- unmaintained (no vulnerability reported); no drop-in the pinned parent can use ---
+
+    # paste: proc-macro, expands at compile time only. Via netlink-packet-* (iroh's netwatch,
+    # Linux) and arti's pwd-grp/tor-* crates. Nothing of it is in a shipped binary.
+    # Expires 2027-02-28, or on the next iroh/arti bump.
+    { id = "RUSTSEC-2024-0436", reason = "compile-time proc-macro pulled in by iroh and arti; not in any binary" },
+    # bincode 1.3.3: used by uniffi_macros 0.28 at compile time to decode the metadata uniffi
+    # itself just encoded — no untrusted input, not in the shipped library. Leaves with the
+    # uniffi upgrade (which regenerates the Swift/Kotlin bindings, so it is its own change).
+    # Expires 2027-02-28.
+    { id = "RUSTSEC-2025-0141", reason = "build-time only, inside uniffi 0.28's proc-macro" },
+    # basic-toml: askama_derive 0.12 (uniffi_bindgen 0.28's templates) reads its own config with
+    # it at compile time. Same exit as bincode. Expires 2027-02-28.
+    { id = "RUSTSEC-2026-0374", reason = "build-time only, inside uniffi_bindgen 0.28's template engine" },
+    # proc-macro-error2: error reporting inside hax-lib-macros, a proc-macro of libcrux
+    # (libsignal's ML-KEM), at libsignal's pinned rev. Compile time only.
+    # Expires 2027-02-28, or on the next libsignal bump.
+    { id = "RUSTSEC-2026-0173", reason = "compile-time proc-macro dependency of libsignal's libcrux at the pinned rev" },
+    # proc-macro-error: same story for glib-macros 0.18 (GTK 3 bindings; host tray app, Linux
+    # only). tray-icon/tao/muda have no GTK 4 backend to move to. Expires 2027-02-28.
+    { id = "RUSTSEC-2024-0370", reason = "compile-time proc-macro dependency of the GTK 3 bindings the Linux tray needs" },
+    # humantime: arti 0.30 parses the durations in ITS OWN config defaults with it; Skwod feeds it
+    # no external input. Unmaintained only because it wraps chrono's situation (below).
+    # Expires 2027-02-28, or on the next arti bump.
+    { id = "RUSTSEC-2026-0542", reason = "arti-internal config parsing of constant values" },
+    # chrono: only via wmi <- netwatch <- iroh =1.4.1, and only on Windows (the self-hosted
+    # server/host there; never in the Apple/Android core). Used to decode WMI timestamps of
+    # network adapters. Expires 2027-02-28, or on the next iroh bump.
+    { id = "RUSTSEC-2026-0543", reason = "Windows-only transitive dependency of the pinned iroh (wmi)" },
+]
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+# libsignal is not on crates.io; it is pinned by commit in core/skwod-crypto/Cargo.toml, and it
+# pulls Signal's SPQR crate from a second Signal repository by tag. These two repositories and
+# nothing else. cargo-deny matches allow-git by URL only (a ?rev= here is ignored), so the exact
+# commits are enforced by check-deps.sh against the lockfiles (ALLOWED_GIT_SOURCES there).
+allow-git = [
+    "https://github.com/signalapp/libsignal",
+    "https://github.com/signalapp/SparsePostQuantumRatchet.git",
+]
+
+[bans]
+# Duplicate versions are common in this tree (two rand generations, etc.): report, don't fail.
+multiple-versions = "warn"
+# Every dependency states a version requirement, our own path crates and the libsignal git
+# dependency included.
+wildcards = "deny"
+
+[licenses]
+confidence-threshold = 0.9
+allow = [
+    "AGPL-3.0-only",
+    "AGPL-3.0-or-later",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "CDLA-Permissive-2.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "OpenSSL",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+]

@@ -1,0 +1,24 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>NSExtension</key>
+	<dict>
+		<key>NSExtensionPointIdentifier</key>
+		<string>com.apple.usernotifications.service</string>
+		<key>NSExtensionPrincipalClass</key>
+		<string>$(PRODUCT_MODULE_NAME).NotificationService</string>
+	</dict>
+	<!-- Same loopback-only exception as the app: the extension reaches a p2p host through the
+	     in-process proxy. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<key>SkwodAppGroup</key>
+	<string>$(SKWOD_APP_GROUP)</string>
+	<key>SkwodKeychainGroup</key>
+	<string>$(AppIdentifierPrefix)$(SKWOD_KEYCHAIN_GROUP)</string>
+</dict>
+</plist>

@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- Decrypted attachments are written here before being opened by an external viewer. -->
+    <cache-path name="attachments" path="skwod-attachments/" />
+    <!-- Downloaded app-update apks, handed to the system package installer via FileProvider. -->
+    <cache-path name="updates" path="skwod-updates/" />
+</paths>

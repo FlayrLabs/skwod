@@ -1,0 +1,28 @@
+Skwod
+Copyright (C) the Skwod contributors
+
+This program is free software: you can redistribute it and/or modify it under the terms of the
+GNU Affero General Public License, version 3 only, as published by the Free Software Foundation.
+This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without
+even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See LICENSE.
+
+Source: https://github.com/FlayrLabs/skwod
+
+"Skwod", the Skwod logo and the app icons are trademarks of Flayr Labs LLC and are not licensed
+under the AGPL. See TRADEMARKS.md.
+
+This product links or bundles third-party software, including:
+
+  libsignal and SparsePostQuantumRatchet   AGPL-3.0-only   Copyright Signal Messenger, LLC
+  iroh                                     MIT OR Apache-2.0   Copyright n0, inc.
+  LiveKit server and client SDKs           Apache-2.0      Copyright LiveKit, Inc.
+  Arti                                     MIT OR Apache-2.0   Copyright The Tor Project, Inc.
+  SQLCipher                                BSD-3-Clause    Copyright Zetetic LLC
+  OpenSSL                                  Apache-2.0      Copyright The OpenSSL Project Authors
+  UniFFI                                   MPL-2.0         Copyright Mozilla
+  Sparkle                                  MIT             Copyright the Sparkle Project
+
+The full list, with versions and licences, is in THIRD-PARTY-NOTICES.md.
+
+Skwod is not affiliated with, endorsed by, or sponsored by Signal Messenger, LLC. "Signal" is a
+trademark of Signal Messenger, LLC.

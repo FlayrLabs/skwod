@@ -1,0 +1,32 @@
+# SkwodCore — shared Rust workspace (crypto + sync + UniFFI bindings).
+# See ../docs/ARCHITECTURE.md §4.
+[workspace]
+resolver = "3"
+members = [
+    "skwod-crypto",
+    "skwod-sync",
+    "skwod-core",
+    "skwod-net",
+]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+license = "AGPL-3.0-only"     # ADR-011 (supersedes ADR-002): we link libsignal
+rust-version = "1.93.1"     # libsignal v0.108.0 MSRV
+
+[workspace.lints.rust]
+unsafe_code = "forbid"        # crypto core stays safe-Rust; FFI unsafe is isolated to the bindings crate
+
+# Argon2id at backup-grade cost is unusably slow unoptimized; optimize just that crate (and the
+# KEM) in dev/test builds.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.libcrux-ml-kem]
+opt-level = 3
+# Proof-of-work stamps (skwod-net `pow.rs`) are ~1M SHA-256 per signup/login; unoptimized that
+# takes seconds and makes tests crawl. Optimize just the hashing path in dev/test builds.
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.skwod-net]
+opt-level = 3

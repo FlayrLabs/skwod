@@ -1,0 +1,6 @@
+.gradle/
+build/
+local.properties
+*.hprof
+core/src/main/jniLibs/
+core/src/main/java/io/skwod/core/uniffi/

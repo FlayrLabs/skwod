@@ -1,0 +1,10 @@
+# The exact LiveKit server release every skwod host form bundles, with the SHA-256 of each
+# upstream archive (from the release's own checksums.txt, v1.13.11). Read by the Dockerfile's
+# values check, deploy/fetch-livekit.sh and the host/ packaging scripts. To bump: change the
+# version AND every hash together, then re-run the call test in docs/P2P.md. Never "latest".
+LIVEKIT_VERSION=1.13.11
+SHA256_linux_amd64=1e9ee90ca301e1842b2887fc77cb122759756a9c8aeb4334ee91de3325ec43fb
+SHA256_linux_arm64=2af6ce091d6b3c79d1677f8ff1bbb91a8007f40b2325c059b52d38383c0830b6
+SHA256_linux_armv7=5f663a6498c3d81ef2dce55a3a1e7815aacfe78207e469abc0bd9c5b5ca5070b
+SHA256_windows_amd64=5d071ea43339f0140d24a66f0b2ff8a7bf6c4d0dceb19b30abca835670213667
+SHA256_windows_arm64=47ebfaa1ef6de546bf17a6699d4d9be59693bd5c3ffbec14d0749bd396ea3875

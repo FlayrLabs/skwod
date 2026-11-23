@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Deny cleartext (http/ws) everywhere so the bearer token + E2EE routing metadata can never travel
+  in the clear to another machine. The ONE exception is 127.0.0.1: the in-process p2p proxy
+  (skwod-net) listens there and carries every request to the host over an authenticated QUIC
+  connection, so "http://127.0.0.1:<port>/<secret>" never leaves this process.
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="false" />
+    <domain-config cleartextTrafficPermitted="true">
+        <domain includeSubdomains="false">127.0.0.1</domain>
+    </domain-config>
+</network-security-config>

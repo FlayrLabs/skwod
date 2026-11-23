@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Skwod host
+Comment=Host your own Skwod server for you and your friends
+Exec=/opt/skwod-host/skwod-host
+Icon=skwod-host
+Terminal=false
+Categories=Network;Chat;
+StartupNotify=false

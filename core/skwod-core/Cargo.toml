@@ -1,0 +1,46 @@
+[package]
+name = "skwod-core"
+description = "UniFFI umbrella — the SkwodCore surface bound into the Swift and Kotlin native clients."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version = "1.91"   # iroh (skwod-net) MSRV
+
+[lib]
+# cdylib for the packaged XCFramework/AAR; lib so uniffi-bindgen can load it as a library.
+crate-type = ["lib", "cdylib", "staticlib"]
+name = "skwod_core"
+
+[lints]
+workspace = true
+
+[dependencies]
+skwod-crypto = { path = "../skwod-crypto", version = "0.0.0" }
+skwod-sync = { path = "../skwod-sync", version = "0.0.0" }
+skwod-net = { path = "../skwod-net", version = "0.0.0" }   # p2p transport (iroh): host addressed by its key
+uniffi = { version = "0.28", features = ["tokio", "cli"] }
+tokio = { version = "1", features = ["sync", "rt-multi-thread"] }
+thiserror = "1"
+hex = "0.4"
+base64 = "0.22"
+serde_json = "1"
+
+
+[build-dependencies]
+uniffi = { version = "0.28", features = ["build"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+futures-util = "0.3"
+tokio-tungstenite = "0.24"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }   # examples: RUST_LOG=… for transport debugging
+
+[[bin]]
+# `cargo run --bin uniffi-bindgen -- generate ...` produces the Swift/Kotlin bindings.
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[features]
+default = []

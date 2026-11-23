@@ -1,0 +1,66 @@
+[package]
+name = "skwod-server"
+description = "Self-hostable, E2EE skwod server — stores only ciphertext, public keys, and routing metadata."
+version = "0.0.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+rust-version = "1.93.1"
+
+[[bin]]
+name = "skwod"
+path = "src/main.rs"
+
+[dependencies]
+axum = { version = "0.7", features = ["ws"] }
+# APNs delivery: HTTP/2 client + ES256 JWT provider auth (token-based, .p8 key).
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls", "http2"] }
+jsonwebtoken = "9"
+tokio = { version = "1", features = ["full"] }
+tokio-util = { version = "0.7", features = ["io"] }   # ReaderStream: stream release artifacts, don't buffer
+futures-util = "0.3"         # WebSocket sink/stream split
+clap = { version = "4", features = ["derive", "env"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+sqlx = { version = "0.8", features = ["runtime-tokio", "sqlite", "postgres", "any", "migrate"] }
+argon2 = "0.5"               # password hashing (login), same KDF family as the crypto core's PIN wrap
+rand = "0.8"                 # session tokens, join codes
+sha2 = "0.10"                # token hashing at rest
+hex = "0.4"
+uuid = { version = "1", features = ["v4"] }
+base64 = "0.22"              # binary key material in JSON bodies
+subtle = "2"                 # constant-time PIN-hash comparison
+hmac = "0.12"                # LiveKit access-token signing (HS256)
+skwod-crypto = { path = "../core/skwod-crypto", version = "0.0.0" }   # libsignal key/certificate validation + issuing (AGPL-3.0-only)
+# p2p front door (iroh): the host is addressed by its key; the same router is served over QUIC streams.
+skwod-net = { path = "../core/skwod-net", version = "0.0.0" }
+url = "2"                    # push-gateway URL validation (same crate reqwest uses)
+qrcode = { version = "0.14", default-features = false, features = ["svg"] }   # invite QR on the admin page
+hyper = { version = "1", features = ["server", "http1"] }
+hyper-util = { version = "0.1", features = ["tokio", "service"] }
+
+# Container entrypoint duties (one-time volume ownership fix, then drop root for good).
+[target.'cfg(unix)'.dependencies]
+nix = { version = "0.29", default-features = false, features = ["user", "fs", "dir"] }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
+tokio-tungstenite = "0.24"   # real-socket WebSocket tests
+tempfile = "3"
+
+# Proof-of-work stamps (skwod-net `pow.rs`) are ~1M SHA-256 per p2p signup/login; optimize just
+# the hashing path so dev/test builds don't take seconds per stamp.
+[profile.dev.package.sha2]
+opt-level = 3
+# Password hashing is unusable unoptimized: ~1 s per Argon2id hash in a debug build (several
+# under load). Tests that sign up a dozen accounts or run 35 logins then outlast the timeouts
+# they are about — the pool's 30 s acquire timeout, the 60 s login window — and fail for
+# reasons that have nothing to do with what they check.
+[profile.dev.package.argon2]
+opt-level = 3
+[profile.dev.package.blake2]
+opt-level = 3
+[profile.dev.package.skwod-net]
+opt-level = 3

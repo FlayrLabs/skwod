@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<!-- skwod://join/<node id>#<join code> invites open the app. Input is validated in
+	     Sources/Invites.swift and only ever prefills the connect screen. -->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>CFBundleURLName</key>
+			<string>com.skwod.invite</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>skwod</string>
+			</array>
+		</dict>
+	</array>
+	<!-- The ONLY transport-security exception: plain http/ws to this device's own loopback
+	     (the in-process p2p proxy). No arbitrary loads, no per-domain exceptions. -->
+	<key>NSAppTransportSecurity</key>
+	<dict>
+		<key>NSAllowsLocalNetworking</key>
+		<true/>
+	</dict>
+	<!-- remote-notification: gateway alert pushes; voip: PushKit call wake-ups (reported to
+	     CallKit immediately); audio: keep an answered call running in the background. -->
+	<key>UIBackgroundModes</key>
+	<array>
+		<string>remote-notification</string>
+		<string>voip</string>
+		<string>audio</string>
+	</array>
+	<!-- Build settings surfaced to the app (project.yml). -->
+	<key>SkwodPushGateway</key>
+	<string>$(SKWOD_PUSH_GATEWAY)</string>
+	<key>SkwodAppGroup</key>
+	<string>$(SKWOD_APP_GROUP)</string>
+	<key>SkwodKeychainGroup</key>
+	<string>$(AppIdentifierPrefix)$(SKWOD_KEYCHAIN_GROUP)</string>
+</dict>
+</plist>

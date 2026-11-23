@@ -1,0 +1,94 @@
+name = "skwod-push-gateway"
+main = "src/index.ts"
+compatibility_date = "2026-08-01"
+# Stays ON for the publisher's deployment: builds 44 and 45 of the apps (and the servers built
+# with them) have the workers.dev host name baked in, and turning it off ends push for every
+# one of them at the next deploy. DO NOT just flip this on a gateway that is in use (README
+# "Moving off workers.dev"). The per-caller limit therefore lives in the Worker
+# (RL_SOURCE_* below), where it works on any host.
+# A NEW third-party deployment should use its own host: uncomment the route, set
+# `workers_dev = false`, and add the Cloudflare rule of README "Per-source limit" on top.
+workers_dev = true
+# routes = [{ pattern = "push.example.org", custom_domain = true }]
+preview_urls = false
+
+# Privacy: the gateway must not retain request data. Leave Workers Logs and
+# Logpush off, and do not add Analytics Engine or tail consumers.
+logpush = false
+
+[observability]
+enabled = false
+
+[vars]
+# CHANGE THIS: comma-separated iOS bundle ids this gateway may push to (the app's
+# main bundle id; ".voip" is appended automatically for call pushes). Empty or
+# missing means every request is refused.
+ALLOWED_TOPICS = "com.skwod.app"
+
+# Budgets below apply per wake credential (per registration: one device in one skwod), and
+# separately per raw device token for the legacy shape. Rows are keyed by an HMAC, never by
+# the token or the credential itself.
+RL_MESSAGE_BURST = "1"
+RL_MESSAGE_BURST_WINDOW_S = "5"
+# The sustained rate: a busy chat produces at most ~28 coalesced wakes per 10 minutes from one
+# server, so 30 never silences it. (The old shape — 60 per hour and nothing shorter — let a
+# lively chat use its hour up in ~25 minutes and then went quiet for the rest of it.)
+RL_MESSAGE_PER_10MIN = "30"
+# Hourly ceiling per credential (and, for the legacy shape, per token that several servers wake).
+RL_MESSAGE_PER_HOUR = "180"
+RL_CALL_PER_MINUTE = "6"
+# Total wakes per minute across ALL callers. "0" = off, and it should stay off: callers are
+# unauthenticated, so a shared hard cap is something any one of them can exhaust to silence
+# everyone's notifications. Per-source limiting belongs in a Cloudflare rate-limiting rule in
+# front of the Worker (README "Per-source limit"), where the Worker never sees an IP. Set a
+# number here only as a last-resort brake, well above your real peak.
+RL_GLOBAL_PER_MINUTE = "0"
+
+# Per CALLER (source address; IPv6 by /64), per sliding minute, checked before the body is
+# read: wakes, and the four device routes together. Only an HMAC of the address is stored, for
+# one minute. "0" = off.
+RL_SOURCE_WAKE_PER_MINUTE = "120"
+RL_SOURCE_DEVICE_PER_MINUTE = "10"
+
+# Per-DEVICE ceilings, shared by all credentials of one PROVEN device (and nobody else).
+# Alerts, per proven APNs token: the per-credential message rules times the factor (4/5 s,
+# 120/10 min, 720/h) — above one credential's budget on purpose: several skwods share a phone
+# and none can starve the others.
+RL_DEST_MESSAGE_FACTOR = "4"
+# Rings, per (proven APNs token, VoIP token) pair. A VoIP token cannot be proven, so a
+# credential may name one that is not its device's; those rings count under ITS pair, never the
+# owner's, and the app ends them by `skwod_cred`. Nothing is keyed on a VoIP token alone. The
+# raw path gets the same two rules per raw token, in rows of its own.
+RL_DEST_CALL_PER_MINUTE = "6"
+RL_DEST_CALL_PER_HOUR = "20"
+# Credentials a device may register (POST /v1/register) per proven APNs token per day.
+RL_REGISTER_PER_DAY = "24"
+# Outstanding credentials per APNs token; registering one more evicts the oldest.
+LIVE_CREDENTIALS_PER_TOKEN = "16"
+# Registration challenges (silent pushes, POST /v1/challenge) per APNs token.
+RL_CHALLENGE_PER_10MIN = "3"
+RL_CHALLENGE_PER_DAY = "10"
+# Lifetime of a wake credential. The app renews when under a third of it remains.
+CRED_TTL_DAYS = "30"
+# The legacy wake shape { token, kind, topic } that build-44 servers send with build-44 apps'
+# raw tokens. A raw token cannot be revoked, so a host the user left can still wake a build-44
+# phone through it. Build-45 apps register no raw tokens and never ring (or dial a host) for a
+# wake without a `skwod_cred` they registered, so this matters only to build-44 phones, which
+# still depend on it.
+# TURN OFF ("0") ONCE NO BUILD-44 CLIENTS REMAIN — raw wakes then answer 410, which makes a
+# server drop the registration. See docs/PUSH.md "Plan to drop raw tokens", step (3).
+LEGACY_RAW_WAKES = "1"
+
+# APNS_HOST / APNS_SANDBOX_HOST override Apple's endpoints (tests only).
+# Secrets (wrangler secret put): APNS_KEY_P8, APNS_KEY_ID, APNS_TEAM_ID, WAKE_CRED_SECRET
+# (seals wake credentials and signs registration challenges; without it the credential routes
+# answer 503 and only the legacy shape works), and RATE_KEY_SALT (>= 16 characters; keys every
+# stored row — REQUIRED: without it every route but /health answers 503).
+
+[[durable_objects.bindings]]
+name = "RATE_LIMITER"
+class_name = "RateLimiter"
+
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["RateLimiter"]

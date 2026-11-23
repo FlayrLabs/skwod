@@ -1,0 +1,33 @@
+# gitleaks configuration: the default rules, plus an allow-list for values that look like
+# secrets but are not. Each entry names one exact value, so any other secret in the same file
+# is still reported. (gitleaks 8.30 does not combine `paths` and `regexes` with AND in an
+# allow-list: a path there allow-lists the WHOLE file. So the values below have no path, and
+# no entry may ever list a source file. tools/skwod-export.test.sh checks this.)
+#
+#   gitleaks dir . --config .gitleaks.toml
+
+[extend]
+useDefault = true
+
+# The release publisher's Ed25519 PUBLIC key (apps/apple/Sources/UpdateManifest.swift), pinned
+# by the apps to check update manifests.
+[[allowlists]]
+description = "publisher public key (not a secret)"
+regexes = ['''^4Sh3oT9eIwxDNLwUYUnZbaGm2lt0jEnBT2EYzGx5pY8=$''']
+
+# Made-up test fixtures: the local-proof secret (HostReliability.swift, server basics_tests.rs),
+# two blob download tokens (basics_tests.rs) and a recovery-key format sample (Build44AccountTest.kt).
+[[allowlists]]
+description = "test fixtures"
+regexes = [
+  '''^4f1c0d7e9a2b48c6b3e5d1a07f9c2e8451b6a3d0c7e9f2a4$''',
+  '''^b2f1c3d4e5f60718293a4b5c6d7e8f90$''',
+  '''^0123456789abcdef0123456789abcdef$''',
+  '''^ABCD-EFGH-JKLM-NPQR-ST23-4567$''',
+]
+
+# Cargo.lock: after the dependency name `"libcrux-secrets",` the generic-api-key rule takes the
+# NEXT crate name (libcrux-sha3, …) as the secret. Crate names are not secrets.
+[[allowlists]]
+description = "libcrux crate names after libcrux-secrets in Cargo.lock"
+regexes = ['''^libcrux-[a-z0-9-]+$''']

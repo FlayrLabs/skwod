@@ -7,6 +7,7 @@ import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.pager.HorizontalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -18,6 +19,8 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.window.Dialog
@@ -102,6 +105,7 @@ fun MainScreen(onSignOut: () -> Unit) {
         }
         Column(Modifier.align(Alignment.TopCenter).statusBarsPadding(), horizontalAlignment = Alignment.CenterHorizontally) {
             ConnectionBanner()
+            HostNewerBanner()
             UpdateBanner()
         }
     }
@@ -197,6 +201,47 @@ fun UpdateBanner(modifier: Modifier = Modifier) {
     }
 }
 
+/**
+ * The active skwod's host refuses this app's version ([AppModel.hostNewer]): it stays on screen —
+ * nothing was signed out — with "Update Skwod", which looks for the newer build on the release
+ * feed ([Updater]) and installs it.
+ */
+@Composable
+fun HostNewerBanner(modifier: Modifier = Modifier) {
+    val model = AppModel.get(LocalContext.current)
+    model.hostNewer ?: return
+    // The regular banner takes over once the newer build is known.
+    if (Updater.available != null) return
+    val ctx = LocalContext.current
+    val scope = rememberCoroutineScope()
+    var note by remember { mutableStateOf<String?>(null) }
+    var busy by remember { mutableStateOf(false) }
+    Surface(color = Color(0xFF2A1F0E).copy(alpha = 0.96f), shape = RoundedCornerShape(16.dp), shadowElevation = 8.dp,
+        modifier = modifier.padding(horizontal = 12.dp, vertical = 8.dp).fillMaxWidth()) {
+        Row(Modifier.padding(horizontal = 14.dp, vertical = 10.dp), verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Filled.SystemUpdateAlt, null, tint = Color(0xFFFFA726))
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text("This Skwod's host is newer — update Skwod", color = Color.White,
+                    style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+                Text(note ?: "You're still signed in. Messages stay on this phone until the app is updated.",
+                    color = Color.White.copy(alpha = 0.6f), style = MaterialTheme.typography.labelSmall, maxLines = 3)
+            }
+            Spacer(Modifier.width(8.dp))
+            if (busy) CircularProgressIndicator(Modifier.size(22.dp), strokeWidth = 2.dp, color = SkAccent)
+            else Button(onClick = {
+                busy = true; note = null
+                scope.launch {
+                    val found = Updater.available ?: Updater.check(manual = true)
+                    if (found != null) Updater.install(ctx)
+                    else note = "No newer Skwod is published yet. Try again later, or ask your host which version they run."
+                    busy = false
+                }
+            }, colors = ButtonDefaults.buttonColors(containerColor = SkAccent)) { Text("Update Skwod") }
+        }
+    }
+}
+
 /** Far-left rail: Home/DMs (skwod icon), Feed, one tile per connected skwod, and a "+" menu. */
 @Composable
 private fun ServerRail(chat: AppChat, onSignOut: () -> Unit) {
@@ -205,6 +250,13 @@ private fun ServerRail(chat: AppChat, onSignOut: () -> Unit) {
     var tick by remember { mutableStateOf(0) }
     var showAdd by remember { mutableStateOf(false) }
     var showCreate by remember { mutableStateOf(false) }
+    // Long-press menus: a server's, a skwod's, and what they open.
+    var serverMenuFor by remember { mutableStateOf<String?>(null) }
+    var skwodMenuFor by remember { mutableStateOf<String?>(null) }
+    var inviteFor by remember { mutableStateOf<RealSpace?>(null) }
+    var rolesFor by remember { mutableStateOf<RealSpace?>(null) }
+    var iconFor by remember { mutableStateOf<RealSpace?>(null) }
+    var confirmSignOut by remember { mutableStateOf(false) }
 
     Column(
         // No backing of its own: the rail sits directly on the pager's dark chrome veil, exactly
@@ -230,8 +282,15 @@ private fun ServerRail(chat: AppChat, onSignOut: () -> Unit) {
             // SERVERS (top): one tile per server (guild) inside the CURRENT skwod. Tapping shows its
             // channels in the middle column. A "+" creates a server here.
             chat.serverGroups().forEach { g ->
-                RailTile(active = chat.isServerActive(g), onClick = { chat.openServer(g); tick++ }) {
-                    AvatarTile(AvatarStore.serverKey(g.serverId), g.name, size = 44, corner = 14)
+                RailTile(active = chat.isServerActive(g), onClick = { chat.openServer(g); tick++ },
+                    onLongClick = { serverMenuFor = g.serverId }) {
+                    Box(Modifier.fillMaxSize()) {
+                        AvatarTile(AvatarStore.serverKey(g.serverId), g.name, size = 44, corner = 14)
+                        MentionBadge(model.mentionCount(g.channels.map { "channel:${it.channelId}" }), Modifier.align(Alignment.BottomEnd))
+                    }
+                    ServerActionsMenu(serverMenuFor == g.serverId, g, onDismiss = { serverMenuFor = null },
+                        onInvite = { inviteFor = g.channels.firstOrNull() }, onIcon = { iconFor = g.channels.firstOrNull() },
+                        onPermissions = { rolesFor = g.channels.firstOrNull() })
                 }
                 Spacer(Modifier.height(8.dp))
             }
@@ -251,11 +310,24 @@ private fun ServerRail(chat: AppChat, onSignOut: () -> Unit) {
             // above update to that skwod's servers.
             model.workspaces.forEach { w ->
                 val active = w.id == model.current?.id && !chat.homeMode
-                RailTile(active = active, onClick = {
-                    chat.homeMode = false; chat.selection = null; chat.railServerId = null
-                    scope.launch { withContext(Dispatchers.IO) { model.activate(w) }; tick++ }
+                val label = WorkspaceLabel.of(w, model.workspaces)
+                RailTile(active = active, onLongClick = { skwodMenuFor = w.localId }, onClick = {
+                    // The skwod already open stays open (no teardown, no login flash); one whose
+                    // session is over opens its login without leaving the one in use.
+                    if (!w.isSignedOut || w.id == model.current?.id) { chat.homeMode = false; chat.selection = null; chat.railServerId = null }
+                    scope.launch { withContext(Dispatchers.IO) { model.tapSkwod(w) }; tick++ }
                 }) {
-                    AvatarTile(w.instanceId?.let { AvatarStore.skwodKey(it) }, w.displayName, size = 44, corner = 14)
+                    Box(Modifier.fillMaxSize().semantics { contentDescription = listOfNotNull(label, WorkspaceLabel.state(w)).joinToString(". ") }) {
+                        AvatarTile(w.instanceId?.let { AvatarStore.skwodKey(it) }, w.displayName, size = 44, corner = 14)
+                        if (w.isSignedOut) Box(Modifier.align(Alignment.BottomEnd).size(16.dp).background(Color.Black.copy(alpha = 0.75f), CircleShape),
+                            contentAlignment = Alignment.Center) {
+                            Icon(Icons.Filled.Lock, null, tint = Color.White, modifier = Modifier.size(10.dp))
+                        }
+                    }
+                    SkwodActionsMenu(skwodMenuFor == w.localId, w, onDismiss = { skwodMenuFor = null },
+                        onOpen = { scope.launch { withContext(Dispatchers.IO) { model.tapSkwod(w) }; tick++ } },
+                        onSignOut = { confirmSignOut = true },
+                        onRemoved = { tick++; onSignOut() })
                 }
                 Spacer(Modifier.height(8.dp))
             }
@@ -277,15 +349,48 @@ private fun ServerRail(chat: AppChat, onSignOut: () -> Unit) {
     if (showCreate) {
         CreateServerDialog(onCancel = { showCreate = false }, onCreate = { chat.addSpace(it); showCreate = false })
     }
+    inviteFor?.let { sp ->
+        Dialog(onDismissRequest = { inviteFor = null }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+            Surface(color = GlassDialogTone) { SecureJoinScreen(sp, onClose = { inviteFor = null }) }
+        }
+    }
+    rolesFor?.let { sp ->
+        Dialog(onDismissRequest = { rolesFor = null }, properties = DialogProperties(usePlatformDefaultWidth = false)) {
+            Surface(color = GlassDialogTone) { RolesSheet(sp.serverId, sp.name, onClose = { rolesFor = null }) }
+        }
+    }
+    iconFor?.let { sp ->
+        AvatarPickerDialog(
+            title = "Server icon", currentKey = AvatarStore.serverKey(sp.serverId), name = sp.name,
+            onPick = { model.avatars.setServerAvatar(sp.serverId, it) },
+            onRemove = { model.avatars.clearAvatar(AvatarStore.serverKey(sp.serverId), chat.spaces.filter { it.serverId == sp.serverId }.map { it.channelId }) },
+            onClose = { iconFor = null })
+    }
+    if (confirmSignOut) {
+        val name = model.current?.displayName ?: "this Skwod"
+        AlertDialog(
+            onDismissRequest = { confirmSignOut = false },
+            confirmButton = {
+                TextButton(onClick = {
+                    confirmSignOut = false
+                    scope.launch { withContext(Dispatchers.IO) { model.leaveCurrent() }; tick++; onSignOut() }
+                }) { Text("Sign out") }
+            },
+            dismissButton = { TextButton(onClick = { confirmSignOut = false }) { Text("Cancel") } },
+            title = { Text("Sign out of $name?") },
+            text = { Text("Your messages and keys stay on this device, locked. Sign in again with your password to carry on where you left off — no relinking.") }
+        )
+    }
 }
 
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-private fun RailTile(active: Boolean, onClick: () -> Unit, content: @Composable () -> Unit) {
+private fun RailTile(active: Boolean, onClick: () -> Unit, onLongClick: (() -> Unit)? = null, content: @Composable () -> Unit) {
     Row(Modifier.fillMaxWidth().height(52.dp), verticalAlignment = Alignment.CenterVertically) {
         // Selection pill hugging the left edge.
         Box(Modifier.width(4.dp).height(if (active) 40.dp else 0.dp).clip(RoundedCornerShape(50)).background(Color.White))
         Spacer(Modifier.weight(1f))
-        Box(Modifier.size(48.dp).clip(RoundedCornerShape(16.dp)).clickable(onClick = onClick)) { content() }
+        Box(Modifier.size(48.dp).clip(RoundedCornerShape(16.dp)).combinedClickable(onClick = onClick, onLongClick = onLongClick)) { content() }
         Spacer(Modifier.weight(1f))
     }
 }
@@ -303,6 +408,7 @@ private fun DrawerList(chat: AppChat, onSignOut: () -> Unit) {
     var rolesFor by remember { mutableStateOf<RealSpace?>(null) }
     var serverIconFor by remember { mutableStateOf<RealSpace?>(null) }
     var showReports by remember { mutableStateOf(false) }
+    var serverMenuFor by remember { mutableStateOf<String?>(null) }
     var query by remember { mutableStateOf("") }
     // Voice/video: the server whose call is open, the host setup dialog, and an in-flight check.
     var voiceCallServer by remember { mutableStateOf<String?>(null) }
@@ -347,11 +453,16 @@ private fun DrawerList(chat: AppChat, onSignOut: () -> Unit) {
                         // Unread reports show on the menu they are in.
                         if (model.reports.list.isNotEmpty()) { ReportsBadge(model.reports.list.size); Spacer(Modifier.width(6.dp)) }
                         Text(if (chat.inChannelsMode) (chat.currentServer()?.name ?: model.current?.displayName ?: "Skwod")
-                             else (model.current?.displayName ?: "Skwod"), color = Color.White,
+                             else SkwodMenu.heading(model.current?.displayName ?: "Skwod"), color = Color.White,
                             style = MaterialTheme.typography.titleLarge, fontWeight = FontWeight.Bold)
                         Spacer(Modifier.width(6.dp))
                         Icon(Icons.Filled.ChevronRight, null, tint = Color.White.copy(alpha = 0.5f))
                     }
+                }
+                if (chat.inChannelsMode) chat.currentServer()?.let { g ->
+                    ServerActionsMenu(serverMenuFor == g.serverId, g, onDismiss = { serverMenuFor = null },
+                        onInvite = { inviteFor = g.channels.firstOrNull() }, onIcon = { serverIconFor = g.channels.firstOrNull() },
+                        onPermissions = { rolesFor = g.channels.firstOrNull() })
                 }
                 DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                     if (inviteSpace != null) DropdownMenuItem(text = { Text("Invite people") },
@@ -367,6 +478,11 @@ private fun DrawerList(chat: AppChat, onSignOut: () -> Unit) {
                     if (ReportRules.entryVisible(model.reports.list.size, model.isInstanceOwner)) DropdownMenuItem(text = { Text("Reports") },
                         onClick = { menu = false; showReports = true }, leadingIcon = { Icon(Icons.Filled.Flag, null) },
                         trailingIcon = { ReportsBadge(model.reports.list.size) })
+                    // Inside a server: its own menu (mute, leave — or delete, for its owner).
+                    if (chat.inChannelsMode) chat.currentServer()?.let { g ->
+                        DropdownMenuItem(text = { Text("Server options…") },
+                            onClick = { menu = false; serverMenuFor = g.serverId }, leadingIcon = { Icon(Icons.Filled.MoreHoriz, null) })
+                    }
                     HorizontalDivider()
                     if (model.canCreateServers) DropdownMenuItem(text = { Text("Create a server") },
                         onClick = { menu = false; showCreate = true }, leadingIcon = { Icon(Icons.Filled.Add, null) })
@@ -499,7 +615,13 @@ private fun DrawerList(chat: AppChat, onSignOut: () -> Unit) {
                     style = MaterialTheme.typography.labelMedium,
                     modifier = Modifier.padding(horizontal = 12.dp, vertical = 6.dp))
                 chat.serverGroups().forEach { g ->
-                    ServerRow(g.name, g.channels.size, onClick = { chat.openServer(g) })
+                    Box {
+                        ServerRow(g.name, g.channels.size, onClick = { chat.openServer(g) }, onLongClick = { serverMenuFor = g.serverId })
+                        MentionBadge(model.mentionCount(g.channels.map { "channel:${it.channelId}" }), Modifier.align(Alignment.CenterEnd).padding(end = 36.dp))
+                        ServerActionsMenu(serverMenuFor == g.serverId, g, onDismiss = { serverMenuFor = null },
+                            onInvite = { inviteFor = g.channels.firstOrNull() }, onIcon = { serverIconFor = g.channels.firstOrNull() },
+                            onPermissions = { rolesFor = g.channels.firstOrNull() })
+                    }
                 }
             }
             Spacer(Modifier.height(96.dp)) // clearance for the floating you-bar
@@ -551,6 +673,7 @@ private fun ChannelRow(model: AppModel, muteKey: String, name: String, selected:
             Text(name, color = if (selected) Color.White else Color.White.copy(alpha = 0.8f),
                 fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Normal)
             Spacer(Modifier.weight(1f))
+            MentionBadge(model.mentionCount(listOf(muteKey)))
             MutedMark(model, muteKey)
         }
         DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
@@ -578,13 +701,14 @@ private fun ChannelRow(model: AppModel, muteKey: String, name: String, selected:
 }
 
 /** A server row in the mobile skwod overview: monogram + name + channel count. Tapping opens it. */
+@OptIn(androidx.compose.foundation.ExperimentalFoundationApi::class)
 @Composable
-private fun ServerRow(name: String, channels: Int, onClick: () -> Unit) {
+private fun ServerRow(name: String, channels: Int, onClick: () -> Unit, onLongClick: (() -> Unit)? = null) {
     Row(
         Modifier.fillMaxWidth().padding(horizontal = 4.dp, vertical = 2.dp)
             .clip(RoundedCornerShape(12.dp))
             .background(Color.White.copy(alpha = 0.045f))
-            .clickable(onClick = onClick)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
             .padding(horizontal = 14.dp, vertical = 11.dp),
         verticalAlignment = Alignment.CenterVertically
     ) {
@@ -672,9 +796,11 @@ private fun DrawerChat(chat: AppChat) {
     when (val sel = chat.selection) {
         is SidebarItem.Home -> DmHomeView(chat)
         is SidebarItem.Feed -> FeedView(chat)
-        is SidebarItem.Space -> ChannelView(sel.space, onBack = { chat.selection = null })
-        is SidebarItem.Dm -> DmChatView(sel.dm, onBack = { chat.selection = null })
-        is SidebarItem.Group -> GroupChatView(sel.group, onBack = { chat.selection = null })
+        // Keyed by conversation: switching chats starts a fresh composition, so nothing waiting
+        // in one composer (a pasted picture, a paste still being read) follows into the next.
+        is SidebarItem.Space -> key("channel:" + sel.space.channelId) { ChannelView(sel.space, onBack = { chat.selection = null }) }
+        is SidebarItem.Dm -> key("dm:" + sel.dm.conversationId) { DmChatView(sel.dm, onBack = { chat.selection = null }) }
+        is SidebarItem.Group -> key("group:" + sel.group.conversationId) { GroupChatView(sel.group, onBack = { chat.selection = null }) }
         null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
             Text("Pick a channel", color = Color.White.copy(alpha = 0.5f))
         }
@@ -694,8 +820,9 @@ private fun JoinWithCodeDialog(chat: AppChat, onClose: () -> Unit) {
                 if (busy) return@TextButton
                 busy = true; error = null
                 scope.launch {
-                    // A full invite link works too — keep only the code half, minus any beacon suffix.
-                    val c = InviteBeacon.strip(code.trim().substringAfterLast("#"))
+                    // A full invite link works too (any spelling, share links included): its code is
+                    // used. A typed code is tidied up (case, spaces, dashes) — never while typing.
+                    val c = InviteBeacon.strip(JoinCode.extract(code))
                     val err = chat.joinByCode(c)
                     busy = false
                     if (err == null) onClose() else error = err
@@ -784,12 +911,13 @@ fun ProfileScreen(onSignOut: () -> Unit) {
             model.workspaces.forEach { w ->
                 Surface(color = GlassCardTone, shape = RoundedCornerShape(14.dp),
                     modifier = Modifier.fillMaxWidth().padding(vertical = 4.dp).clickable {
-                        scope.launch { withContext(Dispatchers.IO) { model.activate(w) }; tick++ }
+                        scope.launch { withContext(Dispatchers.IO) { model.tapSkwod(w) }; tick++ }
                     }) {
                     Row(Modifier.padding(14.dp), verticalAlignment = Alignment.CenterVertically) {
                         Monogram(w.displayName, size = 32); Spacer(Modifier.width(12.dp))
                         Column {
-                            Text(w.displayName, color = Color.White)
+                            Text(WorkspaceLabel.of(w, model.workspaces), color = Color.White)
+                            WorkspaceLabel.state(w)?.let { Text(it, color = Color(0xFFFFA726), style = MaterialTheme.typography.labelSmall) }
                             // A p2p skwod's address is its host's key; show the short form, never a URL.
                             Text(w.nodeId?.let { "Host key ${InviteLink.shortKey(it)}" } ?: w.server,
                                 color = Color.White.copy(alpha = 0.45f), style = MaterialTheme.typography.labelSmall)

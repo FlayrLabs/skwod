@@ -106,8 +106,8 @@ fun WhiteboardScreen(channelId: String? = null) {
                     )
                 }
         ) {
-            strokes.forEach { s -> drawStroke(s.points.map { denorm(it) }, WHITEBOARD_PALETTE[s.colorIndex], s.width) }
-            current?.let { pts -> drawStroke(pts.map { denorm(it) }, WHITEBOARD_PALETTE[colorIndex], width) }
+            strokes.forEach { s -> drawStroke(s.points.map { denorm(it) }, WHITEBOARD_PALETTE[s.colorIndex.coerceIn(0, WHITEBOARD_PALETTE.size - 1)], s.width) }
+            current?.let { pts -> drawStroke(pts.map { denorm(it) }, WHITEBOARD_PALETTE[colorIndex.coerceIn(0, WHITEBOARD_PALETTE.size - 1)], width) }
         }
         Spacer(Modifier.height(12.dp))
         Row(verticalAlignment = Alignment.CenterVertically) {

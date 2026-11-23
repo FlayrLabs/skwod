@@ -143,6 +143,12 @@ class Realtime(private val model: AppModel) {
         remove.forEach { s.send(JSONObject().put("type", "unsubscribe").put("topic", it).toString()) }
     }
 
+    /** "I'm typing" into [topic] (`channel:<id>` / `dm:<id>`); the caller paces it ([TypingState.mayAnnounce]). */
+    fun sendTyping(topic: String) {
+        if (topic.isEmpty() || topic !in wanted) return
+        ws?.send(JSONObject().put("type", "typing").put("topic", topic).toString())
+    }
+
     /** Push a status change through the socket (instant fan-out). */
     fun sendPresence(status: String) {
         myStatus = status
@@ -284,6 +290,9 @@ class Realtime(private val model: AppModel) {
             "join_denied" -> if (mine) model.launchIO { model.joins.onDenied(payload.optString("server_id")) }
             // The server's shape changed: new channels to list, a new member to hand keys to.
             "channels_changed" -> model.launchIO { model.chat.syncServerChannels() }
+            // A server I am in was deleted, or I was removed from one: only "go and check" —
+            // the list of my servers is asked again and whatever is no longer in it leaves.
+            "server_deleted", "revoke" -> if (mine) model.launchIO { model.refreshServerList() }
             "member_joined" -> model.launchIO { model.waiting.refresh(payload.optString("server_id")); model.refreshRoster() }
         }
         // Devices and recovery: every one of these is only a nudge. What actually happened is

@@ -27,7 +27,7 @@ android {
         applicationId = "com.skwod.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 45   // bump on every new build; mirrors iOS CURRENT_PROJECT_VERSION
+        versionCode = 46   // bump on every new build; mirrors iOS CURRENT_PROJECT_VERSION
         versionName = "0.1.0"
         ndk { abiFilters += listOf("arm64-v8a", "armeabi-v7a") }
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

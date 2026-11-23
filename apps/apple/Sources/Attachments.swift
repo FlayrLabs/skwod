@@ -22,16 +22,33 @@ enum ChatTags {
     static let music = "\u{2}skwod/music|"
 
     /// Split a raw decrypted body into its renderable parts.
-    static func parse(_ body: String) -> (text: String, attachment: ChatAttachment?, music: MusicTrack?) {
+    static func parse(_ raw: String) -> (text: String, attachment: ChatAttachment?, music: MusicTrack?) {
+        // The mentions trailer never shows (`MentionCodec`).
+        let body = MentionCodec.visible(raw)
         if body.hasPrefix(attach), let data = String(body.dropFirst(attach.count)).data(using: .utf8),
            let a = try? JSONDecoder().decode(ChatAttachment.self, from: data) {
-            return (a.caption ?? "", a, nil)
+            // A caption carries its own mentions trailer, if any (`mentions(_:)`).
+            return (MentionCodec.visible(a.caption ?? ""), a, nil)
         }
         if body.hasPrefix(music), let data = String(body.dropFirst(music.count)).data(using: .utf8),
            let t = try? JSONDecoder().decode(MusicTrack.self, from: data) {
             return ("", nil, t)
         }
         return (body, nil, nil)
+    }
+
+    /// Who the message mentions, decoded from exactly the text `parse` returns: the body's
+    /// trailer for a plain message, the caption's own for an attachment (offsets into the whole
+    /// body would point at the wrong characters of a caption), none for a song.
+    static func mentions(_ raw: String) -> MentionPayload {
+        let decoded = MentionCodec.decode(raw)
+        let body = decoded.visible
+        if body.hasPrefix(attach), let data = String(body.dropFirst(attach.count)).data(using: .utf8),
+           let a = try? JSONDecoder().decode(ChatAttachment.self, from: data) {
+            return MentionCodec.decode(a.caption ?? "").payload
+        }
+        if body.hasPrefix(music) { return MentionPayload() }
+        return decoded.payload
     }
 }
 
@@ -672,7 +689,7 @@ private struct ImageAttachmentView: View {
 
     var body: some View {
         Group {
-            if let thumbB64 = a.thumbB64, let data = Data(base64Encoded: thumbB64), let img = Image(data: data) {
+            if let img = AttachmentThumb.image(for: a) {
                 Button {
                     showFull = true
                     Task { await loader.fetch(a, app: app) }
@@ -780,7 +797,7 @@ private struct VideoAttachmentView: View {
     }
 
     @ViewBuilder private var poster: some View {
-        if let thumbB64 = a.thumbB64, let data = Data(base64Encoded: thumbB64), let img = Image(data: data) {
+        if let img = AttachmentThumb.image(for: a) {
             img.resizable().scaledToFill()
                 .frame(width: 340, height: 220)
                 .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
@@ -821,7 +838,7 @@ private struct AudioAttachmentView: View {
             }
             .buttonStyle(.plain)
             // Embedded cover art, if the file carried any (else the play button stands alone).
-            if let thumbB64 = a.thumbB64, let data = Data(base64Encoded: thumbB64), let img = Image(data: data) {
+            if let img = AttachmentThumb.image(for: a) {
                 img.resizable().scaledToFill()
                     .frame(width: 44, height: 44)
                     .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
@@ -953,5 +970,29 @@ enum UploadLimitSync {
         guard let store = BlobStore(app: app), let answer = await store.uploadLimit() else { return }
         asked = (workspace, Date())
         UploadLimit.learned(answer, workspace: workspace)
+    }
+}
+
+/// Decoded attachment thumbnails, kept: the base64 decode + image decode used to run in `body`
+/// on the main thread every time a row re-rendered. Keyed by blob (bounded; evicted under
+/// memory pressure).
+enum AttachmentThumb {
+    private final class Box { let image: Image; init(_ i: Image) { image = i } }
+    private static let cache: NSCache<NSString, Box> = {
+        let c = NSCache<NSString, Box>()
+        c.countLimit = 300
+        return c
+    }()
+
+    @MainActor static func image(for a: ChatAttachment) -> Image? {
+        guard let b64 = a.thumbB64 else { return nil }
+        // The whole thumbnail decides the key (its SHA-256), with the blob it belongs to: two
+        // attachments can never share an entry.
+        let digest = SHA256.hash(data: Data(b64.utf8)).map { String(format: "%02x", $0) }.joined()
+        let key = (a.blobId + ":" + digest) as NSString
+        if let hit = cache.object(forKey: key) { return hit.image }
+        guard let data = Data(base64Encoded: b64), let img = Image(data: data) else { return nil }
+        cache.setObject(Box(img), forKey: key)
+        return img
     }
 }

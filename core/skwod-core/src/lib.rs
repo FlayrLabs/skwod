@@ -1895,6 +1895,27 @@ impl SkwodClient {
         Ok(self.engine.lock().await.purge_messages(&server_id, older_than_ms).await?)
     }
 
+    /// The skwod's name as its owner set it on the host (`GET /api/instance/name`, signed in).
+    /// `None` when no name is set — and from an older host, which has no such route (404).
+    /// It is a LABEL the host supplies: apps check it (`SkwodNameRule`) and show the host key
+    /// beside it.
+    pub async fn instance_name(&self) -> Result<Option<String>, CoreError> {
+        match self.api.get("/api/instance/name").await {
+            Ok(v) => Ok(v.get("name").and_then(|x| x.as_str()).filter(|n| !n.is_empty()).map(str::to_string)),
+            Err(skwod_sync::ClientError::Status { status: 404, .. }) => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// The instance owner names the skwod on its host (build 46). Signed by this device (op
+    /// `instance-name`, over `name` exactly as given); the host trims it and refuses control or
+    /// invisible characters and more than 64 characters. An empty name clears it. Returns the
+    /// name the host now keeps. Anyone else is refused (`Engine`, "http status 403"); a name the
+    /// host will not keep is "http status 400".
+    pub async fn set_instance_name(&self, name: String) -> Result<Option<String>, CoreError> {
+        Ok(self.engine.lock().await.set_instance_name(&name).await?)
+    }
+
     /// Delete a space on the server for good (its owner only). Signed by this device (op
     /// `delete-server`). Local trust state is untouched: `forget_space` is a separate choice.
     pub async fn delete_space(&self, server_id: String) -> Result<(), CoreError> {

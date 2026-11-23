@@ -164,6 +164,12 @@ final class ChatModel: ObservableObject {
             // here — but an untrusted one gets the generic title.)
             for d in dms { names["dm:\(d.conversationId)"] = directTitle(d) }
             for g in groups { names["dm:\(g.conversationId)"] = title(of: g) }
+            // Who a mention banner may name (`MentionNotice`): only peers of a claimed direct
+            // conversation whose name this device trusts — the same name that titles it.
+            for d in ConversationStore.holders(dms) where !d.peerUserId.isEmpty {
+                let t = directTitle(d)
+                if t != NotificationTitles.generic { names[MentionNotice.personPrefix + d.peerUserId] = t }
+            }
             // A server's feed channel is in no list; the extension still has to look in it.
             for (serverId, channelId) in feedChannels where names["channel:\(channelId)"] == nil {
                 names["channel:\(channelId)"] = (spaces.first(where: { $0.serverId == serverId })?.name ?? "Skwod") + " feed"
@@ -171,7 +177,12 @@ final class ChatModel: ObservableObject {
             NotificationState.setNames(names, workspaceId: wid)
             // Whose rows the extension may announce under those titles: a group's are its
             // members as this device holds them, nobody else's.
-            NotificationState.setSenders(NotificationSenders.allowed(dms: dms, groups: groups, silent: store.silentIds), workspaceId: wid)
+            var senders = NotificationSenders.allowed(dms: dms, groups: groups, silent: store.silentIds)
+            // Whose @everyone counts in each channel (`EveryoneRule`), for the extension.
+            for s in spaces where !s.channelId.isEmpty && s.channelId != "demo" {
+                if let ids = everyoneSenders[s.serverId], !ids.isEmpty { senders[EveryoneRule.sendersKey(channelId: s.channelId)] = ids.sorted() }
+            }
+            NotificationState.setSenders(senders, workspaceId: wid)
         }
         app.realtime.setTopics(topics)
     }
@@ -189,6 +200,8 @@ final class ChatModel: ObservableObject {
     private(set) weak var app: AppState?
     private var labelsWatch: NSObjectProtocol?
     private(set) var loadedFor: String?   // workspace id the lists were loaded for
+    /// The workspace `spaces` were read for (nil while switching).
+    var spacesWorkspaceId: String? { loadedFor }
     private var loadedTurn: Int?     // …and the bind turn of the client they were loaded through
     private var spacesRead = false   // `spaces` was read from this workspace's (open) cache
     private var loadFinishedFor: String?
@@ -560,6 +573,8 @@ final class ChatModel: ObservableObject {
                 spaces.removeAll { voice.contains($0.channelId) }
                 added = true
             }
+            // Left or deleted while that listing was in flight: it stays out.
+            if droppedServers.contains(group.serverId) { continue }
             for ch in channels where ch.kind != "voice" {
                 guard let name = ch.name, !spaces.contains(where: { $0.channelId == ch.channelId }) else { continue }
                 spaces.append(RealSpace(name: group.name, channelName: name, serverId: group.serverId,
@@ -571,6 +586,8 @@ final class ChatModel: ObservableObject {
         if added { await persist(spaces, key: "sidebar.spaces") }
         await resolveFeedChannels()
         await refreshRoster()
+        // Deleted servers (and ones this account was removed from) leave the sidebar.
+        await refreshServerList()
     }
 
     /// Who the user would recognise by name in the servers they share: each server's ACCEPTED
@@ -598,6 +615,138 @@ final class ChatModel: ObservableObject {
             guard app.holds(asked) else { return }
             await app.contacts.check(userId, name: name)
         }
+    }
+
+    // MARK: Server actions (build 46)
+
+    /// server id → its owner's user id, from the server list (`GET /api/servers`, members only).
+    @Published var serverOwners: [String: String] = [:]
+
+    /// server id → this account's role there (owner / admin / member), from the server's lists.
+    @Published var serverRoles: [String: ServerRole] = [:]
+    private var rolesAskedAt: [String: Date] = [:]
+
+    /// server id → the owner this device has PINNED (`spaceOwner`), nil = none pinned.
+    @Published var pinnedOwners: [String: String?] = [:]
+
+    /// server id → whose @everyone counts there (`EveryoneRule`: the pinned owner, and admins
+    /// the server lists who are members this device is not holding and has not blocked).
+    @Published var everyoneSenders: [String: Set<String>] = [:]
+
+    func everyoneHonoured(_ sender: String?, in serverId: String) -> Bool {
+        guard let sender, !sender.isEmpty else { return false }
+        if let pinned = pinnedOwners[serverId] ?? nil, pinned == sender { return !BlockList.shared.contains(sender) }
+        return everyoneSenders[serverId]?.contains(sender) == true
+    }
+
+    func ownership(of serverId: String) -> ServerOwnership {
+        ServerOwnership.decide(me: app?.session?.userId ?? "", pinned: pinnedOwners[serverId] ?? nil, hostSays: serverOwners[serverId])
+    }
+
+    /// This account's role in a server, for its menu. Owner only by the PINNED owner.
+    func role(in serverId: String) -> ServerRole {
+        if ownership(of: serverId) == .me { return .owner }
+        return serverRoles[serverId] ?? .member
+    }
+
+    /// Ask each server (at most every 5 minutes) which roles this account holds there.
+    private func refreshRoles(_ serverIds: [String]) async {
+        guard let app, let client = app.client, let me = app.session?.userId, let token = app.session?.token,
+              let base = URL(string: app.serverURL), !app.serverURL.isEmpty, let asked = app.bindTicket() else { return }
+        for sid in serverIds {
+            if let at = rolesAskedAt[sid], Date().timeIntervalSince(at) < 300 { continue }
+            rolesAskedAt[sid] = Date()
+            var req = URLRequest(url: base.appendingPathComponent("api/servers/\(sid)/members"))
+            req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+            guard let (data, resp) = try? await URLSession.shared.data(for: req),
+                  (resp as? HTTPURLResponse)?.statusCode == 200,
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+                  let members = obj["members"] as? [[String: Any]],
+                  let roles = try? await client.listRoles(serverId: sid), app.holds(asked) else { continue }
+            let mine = members.first { $0["user_id"] as? String == me }?["role_ids"] as? [String] ?? []
+            let pinned = await client.spaceOwner(serverId: sid)
+            let held = Set(await client.heldMembers(serverId: sid))
+            guard app.holds(asked) else { return }
+            let ruleRoles: [ServerRoleRule.Role] = roles.map { .init(id: $0.roleId, permissions: $0.permissions, isDefault: $0.isDefault) }
+            pinnedOwners[sid] = .some(pinned)
+            serverRoles[sid] = ServerRoleRule.role(me: me, ownerId: pinned, myRoleIds: mine, roles: ruleRoles)
+            var perms: [String: Int64] = [:]
+            for m in members.prefix(5000) {
+                guard let uid = m["user_id"] as? String, !uid.isEmpty else { continue }
+                // Assigned roles only: the default role's bits are not an admin's (`everyonePermissions`).
+                perms[uid] = ServerRoleRule.everyonePermissions(memberRoleIds: (m["role_ids"] as? [String]) ?? [], roles: ruleRoles)
+            }
+            let allowed = EveryoneRule.allowed(pinnedOwner: pinned, memberPermissions: perms, held: held,
+                                               blocked: Set(perms.keys.filter { BlockList.shared.contains($0) }))
+            if everyoneSenders[sid] != allowed {
+                everyoneSenders[sid] = allowed
+                syncRealtimeTopics()
+            }
+        }
+    }
+
+    /// Ask the skwod which servers this account is in (and who owns them). A server this device
+    /// lists that the answer does NOT contain was deleted, or this account was removed from it:
+    /// it leaves the sidebar (its keys stay; the user did not ask to forget anything). Only a
+    /// complete, successful answer prunes.
+    func refreshServerList() async {
+        guard let app, let asked = app.bindTicket(), let token = app.session?.token,
+              let base = URL(string: app.serverURL), !app.serverURL.isEmpty else { return }
+        var req = URLRequest(url: base.appendingPathComponent("api/servers"))
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+              (resp as? HTTPURLResponse)?.statusCode == 200,
+              let owners = ServerListRule.owners(data), app.holds(asked) else { return }
+        serverOwners = owners
+        await refreshRoles(Array(owners.keys))
+        let gone = Set(spaces.map(\.serverId)).filter { !$0.isEmpty && $0 != "demo" && owners[$0] == nil }
+        if !gone.isEmpty { dropServers(gone) }
+    }
+
+    /// Leave a server (a member): the server removes the membership (the same route a kick uses
+    /// on oneself); this device then forgets the space's keys and drops it from the sidebar.
+    /// Returns a sentence when it failed.
+    func leaveServer(_ serverId: String) async -> String? {
+        guard let app, let client = app.client, let me = app.session?.userId, let token = app.session?.token,
+              let base = URL(string: app.serverURL), !app.serverURL.isEmpty else { return "Not connected — try again in a moment." }
+        var req = URLRequest(url: base.appendingPathComponent("api/servers/\(serverId)/members/\(me)"))
+        req.httpMethod = "DELETE"
+        req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
+        let code = ((try? await URLSession.shared.data(for: req))?.1 as? HTTPURLResponse)?.statusCode ?? 0
+        // 404: not a member any more — the same outcome.
+        guard code == 200 || code == 404 else {
+            return code == 400 ? "You own this server: delete it instead." : "Couldn't leave the server — check your connection and try again."
+        }
+        await client.forgetSpace(serverId: serverId)
+        dropServers([serverId])
+        return nil
+    }
+
+    /// Delete a server for everyone (its owner only; signed by this device through the core).
+    func deleteServer(_ serverId: String) async -> String? {
+        guard let client = app?.client else { return "Not connected — try again in a moment." }
+        do { try await client.deleteSpace(serverId: serverId) } catch {
+            return sendFailureText(error)
+        }
+        await client.forgetSpace(serverId: serverId)
+        dropServers([serverId])
+        return nil
+    }
+
+    /// Every channel of these servers leaves the sidebar (and the selection, if it was one).
+    /// Servers dropped from the sidebar (left, deleted, or no longer listed for this account):
+    /// work that was already in flight when it happened (a channel listing, a quiet discovery)
+    /// must not put them back. Only a new join of that server (`joinByCode`) clears the mark.
+    private var droppedServers: Set<String> = []
+
+    private func dropServers(_ ids: Set<String>) {
+        droppedServers.formUnion(ids)
+        // A join still being watched for one of them (waiting for keys) stops here.
+        for id in ids { discoveries[id]?.cancel(); discoveries[id] = nil }
+        if case .space(let open) = selection, ids.contains(open.serverId) { selection = nil }
+        if let rail = railServerId, ids.contains(rail) { railServerId = nil }
+        spaces.removeAll { ids.contains($0.serverId) }
+        Task { await persist(spaces, key: "sidebar.spaces") }
     }
 
     /// Remove a channel from the sidebar (client-side only — the space itself lives on).
@@ -657,6 +806,7 @@ final class ChatModel: ObservableObject {
             return message
         }
         record.serverId = result.serverId
+        droppedServers.remove(result.serverId)   // joined (again) on purpose
         record.hostUserId = result.hostUserId
         record.hostDeviceId = result.hostDeviceId
         record.awaitingApproval = result.pending
@@ -697,6 +847,8 @@ final class ChatModel: ObservableObject {
         guard let app, let address = app.current?.server else { return }
         var record = PendingJoinStore.get(address: address)
         if approved {
+            // A late decision about a server this device has since left or seen deleted.
+            if droppedServers.contains(serverId) && record?.serverId != serverId { return }
             if record?.serverId == serverId {
                 record?.awaitingApproval = false
                 if let record { PendingJoinStore.set(record, address: address) }
@@ -782,6 +934,8 @@ final class ChatModel: ObservableObject {
                 if !named.isEmpty {
                     let spaceName = (try? await client.serverName(serverId: serverId)).flatMap { $0 } ?? "Server"
                     guard stillThere(), app.bound?.workspaceId == origin else { return }
+                    // Left or deleted meanwhile (the watch was cancelled): it stays out.
+                    if Task.isCancelled || droppedServers.contains(serverId) { return }
                     for ch in named {
                         let space = RealSpace(name: spaceName, channelName: ch.name ?? "channel", serverId: serverId,
                                               channelId: ch.channelId, inviteCode: "", spaceKeyHex: "")
@@ -837,7 +991,7 @@ final class ChatModel: ObservableObject {
 
     /// Append a channel without touching selection/homeMode — for background discovery.
     private func addSpaceQuietly(_ s: RealSpace) {
-        guard !spaces.contains(where: { $0.channelId == s.channelId }) else { return }
+        guard !spaces.contains(where: { $0.channelId == s.channelId }), !droppedServers.contains(s.serverId) else { return }
         let wasEmpty = spaces.isEmpty
         spaces.append(s)
         // First channels to arrive after an empty load (re-login recovery) — open one so the skwod
@@ -1069,6 +1223,8 @@ final class ChatModel: ObservableObject {
                 keptAs = side
             }
         }
+        // (A server dropped since — left, deleted — is not read back from a list saved before.)
+        stored.removeAll { droppedServers.contains($0.serverId) }
         spaces = joinedMeanwhile.filter { j in !stored.contains(where: { $0.channelId == j.channelId }) } + stored
         spacesRead = true
         if keptAs != nil || !joinedMeanwhile.isEmpty { await persist(spaces, key: "sidebar.spaces") }

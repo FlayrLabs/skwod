@@ -68,6 +68,7 @@ struct MainView: View {
         .overlay(alignment: .top) {
             VStack(spacing: 6) {
                 UpdateBanner()
+                HostNewerBanner()
                 JoinStatusBanner(chat: chat)
             }
         }
@@ -99,6 +100,7 @@ struct MainView: View {
             .overlay(alignment: .top) {
                 VStack(spacing: 6) {
                     UpdateBanner()
+                    HostNewerBanner()
                     ConnectionBanner()
                     JoinStatusBanner(chat: chat)
                 }
@@ -956,6 +958,7 @@ private struct DrawerList: View {
                                 ChannelCard(name: s.channelName, selected: chat.highlightedChannelId == s.channelId)
                             }.buttonStyle(.plain)
                             .overlay(alignment: .trailing) { MutedMark(key: "channel:\(s.channelId)") }
+                            .overlay(alignment: .topTrailing) { TopicMentionBadge(topic: "channel:\(s.channelId)").padding(4) }
                             .contextMenu {
                                 MuteMenuItems(key: "channel:\(s.channelId)")
                                 Button { showInvite = true } label: { Label("Invite people", systemImage: "person.badge.plus") }

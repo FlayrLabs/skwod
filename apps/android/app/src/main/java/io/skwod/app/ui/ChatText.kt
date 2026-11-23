@@ -51,7 +51,19 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontStyle
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.withStyle
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.unit.dp
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.runtime.rememberUpdatedState
+import androidx.compose.ui.composed
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.input.pointer.PointerEventPass
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.semantics.onLongClick
 import androidx.compose.ui.unit.sp
 
 /** One reaction group on a message (emoji, count, whether I added it). Matches iOS ReactionPill. */
@@ -152,13 +164,19 @@ fun MessageRow(
     nameTrust: ContactTrust.Shown? = null,
     /** Mine and not delivered yet ([Outbox]): "Sending…" or "Not sent" with Retry / Discard. */
     sendState: SendState? = null,
+    /** It mentions me (or is an honoured @everyone, or replies to me): the row is highlighted. */
+    mentionsMe: Boolean = false,
+    /** How a mention's account is named here (trust-labelled); see [LocalMentionName]. */
+    mentionName: ((String, String) -> String)? = null,
 ) {
     val clipboard = LocalClipboardManager.current
     val parsed = remember(body) { ChatTags.parse(body) }
     var menu by remember { mutableStateOf(false) }
     Column(
         Modifier.fillMaxWidth()
-            .combinedClickable(onClick = {}, onLongClick = { if (!isDeleted) menu = true })
+            .then(if (mentionsMe) Modifier.background(Color(0xFFFFA726).copy(alpha = 0.08f)) else Modifier)
+            .messageLongPress(enabled = !isDeleted && actions != null) { menu = true }
+            .semantics { if (!isDeleted && actions != null) onLongClick("Message actions") { menu = true; true } }
             .padding(horizontal = 16.dp).padding(top = if (grouped) 1.dp else 10.dp, bottom = 1.dp)
     ) {
         replyPreview?.let {
@@ -180,7 +198,7 @@ fun MessageRow(
             if (isDeleted) {
                 Text("message deleted", color = Color.White.copy(alpha = 0.35f), fontStyle = FontStyle.Italic, fontSize = 14.sp)
             } else {
-                MessageBody(body)
+                androidx.compose.runtime.CompositionLocalProvider(LocalMentionName provides (mentionName ?: LocalMentionName.current)) { MessageBody(body) }
                 if (isEdited) Text("(edited)", color = Color.White.copy(alpha = 0.3f), fontSize = 10.sp)
                 if (sendState != null) SendStateLine(sendState, onRetry = { actions?.onRetry?.invoke(it) }, onDiscard = { actions?.onDiscard?.invoke(it) })
             }
@@ -245,6 +263,40 @@ fun MessageRow(
     }
 }
 
+/**
+ * Long-press anywhere on a message row opens its menu — also over a picture, a file card or a
+ * link, which have taps of their own and used to swallow the press (a `combinedClickable` on the
+ * row only sees what its children leave unconsumed). The press is watched in the Initial pass
+ * WITHOUT consuming it, so the children's taps and the list's scrolling work as before; moving
+ * past touch slop (a scroll, a swipe of the pager), lifting early or a second finger cancels it.
+ * Once it fires, the rest of that gesture is consumed so the child does not also see a tap.
+ */
+fun Modifier.messageLongPress(enabled: Boolean, onLongPress: () -> Unit): Modifier = composed {
+    val latest by rememberUpdatedState(onLongPress)
+    val haptic = LocalHapticFeedback.current
+    if (!enabled) Modifier else Modifier.pointerInput(Unit) {
+        awaitEachGesture {
+            val down = awaitFirstDown(requireUnconsumed = false, pass = PointerEventPass.Initial)
+            var cancelled = false
+            val finished = withTimeoutOrNull(viewConfiguration.longPressTimeoutMillis) {
+                while (!cancelled) {
+                    val ev = awaitPointerEvent(PointerEventPass.Initial)
+                    val c = ev.changes.firstOrNull { it.id == down.id }
+                    if (c == null || !c.pressed || ev.changes.size > 1 ||
+                        (c.position - down.position).getDistance() > viewConfiguration.touchSlop) cancelled = true
+                }
+            }
+            if (finished != null || cancelled) return@awaitEachGesture
+            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+            latest()
+            do {
+                val ev = awaitPointerEvent(PointerEventPass.Initial)
+                ev.changes.forEach { it.consume() }
+            } while (ev.changes.any { it.pressed })
+        }
+    }
+}
+
 /** True for a short all-emoji message — rendered oversized (matches iOS isEmojiOnly). */
 fun isEmojiOnly(s: String): Boolean {
     val t = s.trim()
@@ -265,15 +317,54 @@ fun isEmojiOnly(s: String): Boolean {
  * anything opens.
  */
 @Composable
-fun MarkdownOrEmoji(text: String) {
-    if (isEmojiOnly(text)) {
+fun MarkdownOrEmoji(text: String, mentions: List<Mentions.Mention> = emptyList()) {
+    if (mentions.isEmpty() && isEmojiOnly(text)) {
         Text(text, fontSize = 40.sp, color = Color.White)
         return
     }
     var pending by remember { mutableStateOf<String?>(null) }
-    val body = remember(text) { messageText(text) { pending = it } }
+    // A tapped mention: that person's card (the name this device has for them).
+    var card by remember { mutableStateOf<Pair<String, String>?>(null) }
+    val nameOf = LocalMentionName.current
+    val body = remember(text, mentions, nameOf) {
+        // Ranges are re-checked against THIS string (in bounds, from '@', sorted, no overlaps).
+        val ranges = Mentions.valid(text, mentions)
+        if (ranges.isEmpty()) messageText(text) { pending = it }
+        else buildAnnotatedString {
+            // A mention shows the name THIS device knows for the account (its trust label),
+            // never the text the sender typed.
+            var at = 0
+            for (m in ranges) {
+                if (m.start > at) append(messageText(text.substring(at, m.start)) { pending = it })
+                val label = nameOf(m.userId, text.substring(m.start + 1, m.start + m.length))
+                val style = TextLinkStyles(SpanStyle(color = SkAccent, background = SkAccent.copy(alpha = 0.18f), fontWeight = FontWeight.SemiBold))
+                withLink(LinkAnnotation.Clickable("mention:${m.userId}", style) { card = m.userId to label }) { append("@$label") }
+                at = m.start + m.length
+            }
+            if (at < text.length) append(messageText(text.substring(at)) { pending = it })
+        }
+    }
     Text(body, color = Color.White.copy(alpha = 0.92f))
     pending?.let { url -> ConfirmLinkDialog(url, onClose = { pending = null }) }
+    card?.let { (uid, label) -> MentionCard(uid, label, onClose = { card = null }) }
+}
+
+/** A mentioned person's card: their avatar, the name this device has for them, and a short id. */
+@Composable
+fun MentionCard(userId: String, label: String, onClose: () -> Unit) {
+    AlertDialog(
+        onDismissRequest = onClose,
+        title = null,
+        text = {
+            Column(horizontalAlignment = Alignment.CenterHorizontally, modifier = Modifier.fillMaxWidth()) {
+                AvatarImage(AvatarStore.userKey(userId), label, size = 64)
+                Spacer(Modifier.height(10.dp))
+                Text(label, color = Color.White, fontWeight = FontWeight.SemiBold)
+                Text("User ${userId.take(8)}…", color = Color.White.copy(alpha = 0.45f), fontFamily = FontFamily.Monospace, fontSize = 12.sp)
+            }
+        },
+        confirmButton = { TextButton(onClick = onClose) { Text("Close") } },
+    )
 }
 
 /** The message body as text with clickable, honest links. `onLink` gets the address to confirm. */
@@ -292,6 +383,12 @@ fun messageText(s: String, onLink: (String) -> Unit): AnnotatedString = buildAnn
         }
     }
 }
+
+/**
+ * How a mention's account is named where messages are shown: (userId, the typed name) → the
+ * label. Chat screens provide their trust-labelled lookup; the default is the typed text.
+ */
+val LocalMentionName = androidx.compose.runtime.staticCompositionLocalOf<(String, String) -> String> { { _, typed -> typed } }
 
 /** Nothing opens on a tap: the full address is shown first and the user decides. */
 @Composable
@@ -387,4 +484,37 @@ fun NameTrustMark(shown: ContactTrust.Shown) {
             Text("unverified", color = Color.White.copy(alpha = 0.35f), fontSize = 10.sp, maxLines = 1)
         }
     }
+}
+
+/**
+ * While the composer ends in "@…": the people (user id, how this device shows them) whose name
+ * matches, best first; a tap inserts the name's token ([Mentions.token], [Mentions.complete]) and reports the pick.
+ */
+@Composable
+fun MentionSuggestions(draft: String, candidates: List<Pair<String, ContactTrust.Shown>>, onPick: (String, String) -> Unit) {
+    val q = Mentions.query(draft) ?: return
+    val starts = candidates.filter { it.second.label.startsWith(q, ignoreCase = true) }
+    val contains = candidates.filter { !it.second.label.startsWith(q, ignoreCase = true) && it.second.label.contains(q, ignoreCase = true) }
+    val matches = (starts.sortedBy { it.second.label.lowercase() } + contains).take(5)
+    if (matches.isEmpty()) return
+    Column(Modifier.fillMaxWidth().padding(horizontal = 4.dp)) {
+        matches.forEach { (uid, shown) ->
+            Row(Modifier.fillMaxWidth().clip(RoundedCornerShape(10.dp)).clickable { onPick(uid, Mentions.token(shown.label)) }
+                .padding(horizontal = 8.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+                AvatarImage(AvatarStore.userKey(uid), shown.label, size = 24)
+                Spacer(Modifier.width(8.dp))
+                Text(shown.label, color = Color.White, fontSize = 14.sp)
+                NameTrustMark(shown)
+            }
+        }
+    }
+}
+
+/** The red "@ n": unseen mentions of me ([AppModel.mentionCount]); nothing when there are none. */
+@Composable
+fun MentionBadge(count: Int, modifier: Modifier = Modifier) {
+    if (count <= 0) return
+    Text("@ ${if (count > 99) "99+" else count}", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Bold,
+        modifier = modifier.background(Color(0xFFEF4444), RoundedCornerShape(50)).padding(horizontal = 5.dp, vertical = 1.dp)
+            .semantics { contentDescription = "$count unseen mention${if (count == 1) "" else "s"}" })
 }

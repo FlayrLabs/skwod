@@ -38,6 +38,13 @@ class AppSettings(ctx: Context) {
         get() = soundReceivedFlag.value
         set(v) { soundReceivedFlag.value = v }
 
+    private val typingIndicatorsFlag = flag(TypingState.SETTING_KEY, true)
+
+    /** "Send typing indicators" (on by default): off = neither sent nor shown ([TypingState]). */
+    var typingIndicators: Boolean
+        get() = typingIndicatorsFlag.value
+        set(v) { typingIndicatorsFlag.value = v }
+
     private val storyMusicTapToPlayFlag = flag("storyMusicTapToPlay", false)
 
     /**

@@ -8,7 +8,17 @@ struct AuthView: View {
     @EnvironmentObject private var app: AppState
     /// Called after a successful connect (used when adding a workspace from a sheet).
     var onConnected: (() -> Void)? = nil
+    /// "Log in again" for one signed-out skwod (from its rail tile): opens on Log in with its
+    /// address filled in.
+    var relogin: Workspace? = nil
+    /// Create account (needs the invite's code) vs Log in (an existing account: the skwod's
+    /// address, username and password — never a code). Set on appear: a device that already
+    /// knows a skwod opens on Log in.
     @State private var isSignup = true
+    /// The user picked "Log in" themselves: a pasted or scanned link never flips it back.
+    @State private var userChoseLogIn = false
+    /// Create account with an address that carries no code: the code, typed on its own.
+    @State private var typedCode = ""
     @State private var server = ""
     /// What we're doing while the button spins ("Finding your host…").
     @State private var statusText = ""
@@ -40,7 +50,7 @@ struct AuthView: View {
         case unreachable
     }
 
-    private enum Field { case server, joinCode, username, password }
+    private enum Field { case server, joinCode, code, username, password }
 
     var body: some View {
         ZStack {
@@ -73,6 +83,13 @@ struct AuthView: View {
         }
         .onAppear {
             knownServers = KnownServerStore.all()
+            // Someone who has used Skwod on this device before is most likely logging in.
+            if !knownServers.isEmpty || !app.workspaces.isEmpty { isSignup = false }
+            if let relogin {
+                isSignup = false; userChoseLogIn = true
+                server = relogin.server
+                focus = .username
+            }
             adoptSignedOut()
             adoptIncomingInvite()
             #if DEBUG
@@ -127,8 +144,8 @@ struct AuthView: View {
     /// The text currently in the address field (invite link on sign-up, address on log-in).
     private var entry: String { isSignup ? inviteLink : server }
 
-    /// The entry parsed, if it is valid so far.
-    private var parsedEntry: ParsedInvite? { try? InviteLink.parse(entry) }
+    /// The entry parsed, if it is valid so far. A bare 52-character host key counts.
+    private var parsedEntry: ParsedInvite? { try? InviteLink.parse(LoginEntry.canonical(entry)) }
 
     /// Take an invite that arrived from outside (deep link). Shown in the form; nothing is sent
     /// anywhere until the user fills in credentials and submits.
@@ -214,10 +231,14 @@ struct AuthView: View {
     /// as an error and never placed in a field.
     private func adopt(_ raw: String, source: InviteDialRule.Source = .userAction) {
         do {
-            let parsed = try InviteLink.parse(raw)
+            let parsed = try InviteLink.parse(LoginEntry.canonical(raw))
             errorText = ""
             let text = raw.trimmingCharacters(in: .whitespacesAndNewlines)
-            if parsed.joinCode != nil {
+            // A link with a code suggests a new member — unless the user chose "Log in" (a
+            // second device pasting the invite it once joined with).
+            let mode = LoginEntry.modeAfterAdopting(hasCode: parsed.joinCode != nil,
+                                                     userChoseLogIn: userChoseLogIn && !isSignup)
+            if mode == .createAccount {
                 isSignup = true
                 checkingLink = true
                 inviteLink = text
@@ -301,24 +322,60 @@ struct AuthView: View {
                 .glassEffect(.regular, in: .rect(cornerRadius: 16, style: .continuous))
                 .accessibilityIdentifier("auth.signedOut")
             }
-            Picker("", selection: $isSignup.animation(.smooth)) {
-                Text("Sign up").tag(true)
+            Picker("", selection: Binding(get: { isSignup }, set: { new in
+                withAnimation(.smooth) { isSignup = new }
+                userChoseLogIn = !new
+                // The same link serves both modes: carry it across instead of starting over.
+                if new, inviteLink.isEmpty, !server.isEmpty { inviteLink = server }
+                if !new, server.isEmpty, !inviteLink.isEmpty { server = inviteLink }
+            })) {
                 Text("Log in").tag(false)
+                Text("Create account").tag(true)
             }
             .pickerStyle(.segmented).labelsHidden()
+            .accessibilityIdentifier("auth.mode")
 
             if isSignup {
                 // Joining = one paste (or one tap on the link). It carries where the skwod is AND the code.
                 glassField(icon: "link", placeholder: "Invite link from your host", text: $inviteLink, field: .joinCode)
                 entryTools
+                // An address without a code (or a bare host key): the code on its own.
+                if let p = parsedEntry, p.joinCode == nil {
+                    glassField(icon: "number", placeholder: "Invite code (e.g. SKWD-AB12-CD34)", text: $typedCode, field: .code)
+                        .onChange(of: typedCode) { _, v in
+                            // Upper case as they type; spaces and dashes are tolerated.
+                            let upper = v.uppercased()
+                            if upper != v { typedCode = upper }
+                        }
+                }
                 inviteStatus
-            } else {
-                glassField(icon: "server.rack", placeholder: "Invite link or Skwod address", text: $server, field: .server)
-                    .onChange(of: server) { _, v in
-                        // A full invite link works here too — log-in just needs its address half.
-                        if let hash = v.firstIndex(of: "#") { server = String(v[..<hash]) }
+                // A second account on a skwod this device is already in is a second entry in the
+                // rail (it has its own keys): almost always a mistake — say so before it happens.
+                if let node = parsedEntry?.address.nodeId, let known = app.workspaces.first(where: { $0.nodeId == node }) {
+                    HStack(spacing: 8) {
+                        Text("You already have an account on \(known.displayName) on this device.")
+                            .font(.caption2).foregroundStyle(.orange.opacity(0.9))
+                            .fixedSize(horizontal: false, vertical: true)
+                        Spacer(minLength: 4)
+                        Button("Log in instead") {
+                            withAnimation(.smooth) { isSignup = false }
+                            userChoseLogIn = true
+                            if server.isEmpty { server = inviteLink }
+                        }
+                        .font(.caption2.weight(.semibold)).buttonStyle(.plain).foregroundStyle(.skAccent)
                     }
+                    .padding(.horizontal, 8)
+                    .accessibilityIdentifier("auth.alreadyMember")
+                }
+            } else {
+                // A full invite link works here too (its code is simply not used), and so do a
+                // skwod:// link and the bare host key. The text is never cut at "#": in the share
+                // link the host key itself is after the "#".
+                glassField(icon: "server.rack", placeholder: "Invite link, skwod:// link or host key", text: $server, field: .server)
                 entryTools
+                if parsedEntry?.joinCode != nil {
+                    fieldHint("Logging in doesn't need the invite code — only your username and password.")
+                }
                 // One-tap "log back into a skwod you've used" — addresses only, kept across sign-out.
                 // When this Mac hosts a skwod, a pinned "This Mac" chip comes first so the host never
                 // faces a blank address field, even with an empty history.
@@ -498,7 +555,8 @@ struct AuthView: View {
 
     private var formValid: Bool {
         usernameHint == nil && !username.isEmpty && !password.isEmpty && !inviteRefused
-            && (!isSignup || (password.count >= 8 && !inviteLink.isEmpty))
+            && (!isSignup || (password.count >= 8 && !inviteLink.isEmpty
+                              && (parsedEntry?.joinCode != nil || !JoinCode.normalize(typedCode).isEmpty)))
             && (isSignup || !server.isEmpty)
     }
 
@@ -509,8 +567,8 @@ struct AuthView: View {
 
     private var footerText: String {
         isSignup
-            ? "Open or paste your host's invite — it already says where their Skwod is. Nothing else to fill in."
-            : "Log in with the invite or address you joined with."
+            ? "New here? Open or paste your host's invite — it already says where their Skwod is."
+            : "Already have an account? Paste the invite link or address you joined with, or pick a skwod above — no code needed."
     }
 
     private func glassField(icon: String, placeholder: String, text: Binding<String>, field: Field, secure: Bool = false) -> some View {
@@ -529,7 +587,9 @@ struct AuthView: View {
         .padding(.horizontal, 16).padding(.vertical, 14)
         .glassEffect(.regular, in: .capsule)
         .contentShape(Capsule())
-        .onTapGesture { focus = field }   // one tap anywhere on the capsule focuses the field
+        // One tap on the capsule's padding focuses the field. A plain `.onTapGesture` here also
+        // sat over the text field itself, where it could take the click meant for the field.
+        .simultaneousGesture(TapGesture().onEnded { if focus != field { focus = field } })
     }
 
     /// Credential-free reconnect to a skwod you already belong to whose address moved.
@@ -548,12 +608,14 @@ struct AuthView: View {
         defer { busy = false; statusText = "" }
         // 1) Validate what was entered. Nothing touches the network before this passes.
         let invite: ParsedInvite
-        do { invite = try InviteLink.parse(entry) } catch {
+        do { invite = try InviteLink.parse(LoginEntry.canonical(entry)) } catch {
             errorText = error.localizedDescription
             return
         }
-        if isSignup && invite.joinCode == nil {
-            errorText = "That link has no invite code in it. Ask your host to send the full invite (it ends in #…)."
+        // Only a NEW account needs the code — from the link, or typed on its own.
+        let joinCode = LoginEntry.codeToSend(invite.joinCode ?? typedCode, mode: isSignup ? .createAccount : .logIn)
+        if isSignup && joinCode == nil {
+            errorText = "Creating an account needs the invite code. Paste the full invite link, or type the code. Already have an account? Choose Log in."
             return
         }
         // 2) Reach the skwod. For a p2p host this finds the host by its key and connects — the
@@ -568,7 +630,7 @@ struct AuthView: View {
         }
         statusText = ""
         // A typed link was never checked: ask now, before an account is created for nothing.
-        if isSignup, let code = invite.joinCode, let check = try? await checkInvite(baseUrl: base, joinCode: code) {
+        if isSignup, let code = joinCode, let check = try? await checkInvite(baseUrl: base, joinCode: code) {
             #if DEBUG
             E2E.noteInviteCheck(valid: check.valid, reason: check.reason, requiresApproval: check.requiresApproval)
             #endif
@@ -590,16 +652,16 @@ struct AuthView: View {
         }
         do {
             let s: AuthSession = isSignup
-                ? try await signup(baseUrl: base, username: username, password: password, joinCode: invite.joinCode ?? "")
+                ? try await signup(baseUrl: base, username: username, password: password, joinCode: joinCode ?? "")
                 : try await login(baseUrl: base, username: username, password: password)
             // Sign-up only creates the account — the shell joins the server with the same code
             // (membership + auto-provisioned keys + channel discovery) once the workspace is live.
             if isSignup {
-                app.pendingJoinCode = invite.joinCode
+                app.pendingJoinCode = joinCode
                 // …and remember it on disk until the join is finished: if the app is closed
                 // before then, the next launch carries on instead of leaving an account that
                 // is in no server.
-                if let code = invite.joinCode { PendingJoinStore.set(PendingJoin(code: code), address: invite.address.stored) }
+                if let code = joinCode { PendingJoinStore.set(PendingJoin(code: code), address: invite.address.stored) }
             }
             await app.signIn(s, address: invite.address, liveBase: base)
             // When the shell is already up (adding a second skwod), nothing re-runs its setup —

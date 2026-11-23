@@ -92,7 +92,7 @@ fun DmHomeView(chat: AppChat) {
                                 Icon(Icons.Filled.Groups, "Group", tint = Color.White.copy(alpha = 0.8f))
                             }
                         },
-                        trailingContent = { MutedMark(model, "dm:${g.conversationId}") },
+                        trailingContent = { Row(verticalAlignment = Alignment.CenterVertically) { MentionBadge(model.mentionCount(listOf("dm:${g.conversationId}"))); MutedMark(model, "dm:${g.conversationId}") } },
                         colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                         modifier = Modifier.combinedClickable(onClick = { chat.selection = SidebarItem.Group(g) },
                             onLongClick = { muteFor = "dm:${g.conversationId}" })
@@ -127,7 +127,7 @@ fun DmHomeView(chat: AppChat) {
                                     .clip(RoundedCornerShape(50)).background(presenceColor(status)))
                             }
                         },
-                        trailingContent = { MutedMark(model, "dm:${d.conversationId}") },
+                        trailingContent = { Row(verticalAlignment = Alignment.CenterVertically) { MentionBadge(model.mentionCount(listOf("dm:${d.conversationId}"))); MutedMark(model, "dm:${d.conversationId}") } },
                         colors = ListItemDefaults.colors(containerColor = Color.Transparent),
                         modifier = Modifier.combinedClickable(onClick = { chat.selection = SidebarItem.Dm(d) },
                             onLongClick = { muteFor = "dm:${d.conversationId}" })
@@ -238,6 +238,14 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
     val reactionsByMsg = remember(dm.conversationId) { mutableStateMapOf<String, List<ReactionPill>>() }
     var replyingTo by remember(dm.conversationId) { mutableStateOf<Message?>(null) }
     var editing by remember(dm.conversationId) { mutableStateOf<Message?>(null) }
+    // @mentions (build 46): who was picked in the composer (user id → the "@name" inserted); they
+    // ride inside the encrypted text ([Mentions]). No @everyone in a direct or group conversation.
+    val mentionPicks = remember(dm.conversationId) { mutableStateListOf<Pair<String, String>>() }
+    val mentionName: (String, String) -> String = { uid, _ ->
+        if (uid == me) (model.current?.username ?: "you") else shownAuthor(uid).label
+    }
+    // Opening the conversation clears its "@ n" (and again whenever a mention lands while it is open).
+    LaunchedEffect(scopeName, model.mentionCount(listOf(scopeName))) { model.clearMentionBadges(scopeName) }
     var blocking by remember { mutableStateOf<SafetyTarget?>(null) }
     var reporting by remember { mutableStateOf<SafetyTarget?>(null) }
     /**
@@ -330,9 +338,21 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
         model.contacts.setVerified(dm.peerUserId, st.verified, dm.name)
     }
 
+    // "I'm typing" at most every few seconds, never for an empty composer ([TypingState]).
+    var lastTyping by remember { mutableLongStateOf(0L) }
+    fun announceTyping(text: String) {
+        val now = System.currentTimeMillis()
+        if (TypingState.mayAnnounce(model.settings.typingIndicators, text, lastTyping, now)) {
+            lastTyping = now; model.realtime.sendTyping(scopeName)
+        }
+    }
+
     /** Send, reply or edit — queued in the core (shown at once as "Sending…"). */
     fun sendDraft() {
-        val text = draft.trim(); if (text.isEmpty()) return
+        val typed = draft.trim(); if (typed.isEmpty()) return
+        val text = Mentions.encode(typed, Mentions.locate(typed, mentionPicks.toList()))
+        mentionPicks.clear()
+        lastTyping = 0L
         val replyTarget = replyingTo; val editTarget = editing
         error = null; draft = ""; replyingTo = null; editing = null
         val c = model.client
@@ -356,8 +376,14 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
         }
     }
 
-    val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        if (uri == null) return@rememberLauncherForActivityResult
+    // A picture pasted from the clipboard: previewed (and removable) until Send.
+    // It belongs to this conversation only ([StagingRule]).
+    var pasted by remember(dm.conversationId) { mutableStateOf<PastedImage?>(null) }
+    val onScreen by rememberUpdatedState(dm.conversationId)
+    val clipHasImage = rememberClipboardHasImage()
+
+    /** Prepare a file (picked, or a pasted picture) and queue it in this conversation. */
+    fun sendFile(make: suspend () -> Uploads.Prepared) {
         uploading = true; error = null
         scope.launch {
             var prepared: Uploads.Prepared? = null
@@ -366,7 +392,7 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
                 // the upload: it goes out — and resumes — whenever the connection allows. A DM
                 // leaves nothing on the server that access to the blob could hang on, so the
                 // descriptor carries a download token: whoever can read the message can fetch the file.
-                val up = Uploads.prepare(ctx, model, uri, forDm = true)
+                val up = make()
                 prepared = up
                 withContext(Dispatchers.IO) { model.client!!.queueDm(dm.conversationId, peers, up.body, null, listOf(up.uploadId)) }
                 model.chat.claimDM(dm)
@@ -383,6 +409,10 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
             prepared?.let { Uploads.release(model, it.uploadId) }
             uploading = false
         }
+    }
+
+    val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
+        if (uri != null) sendFile { Uploads.prepare(ctx, model, uri, forDm = true) }
     }
 
     LaunchedEffect(dm.conversationId) {
@@ -545,10 +575,15 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
                     ?.takeIf { p -> !p.isSystem && !p.isUndecryptable &&
                         (if (group != null) DmReplyPolicy.quotable(p.authorId, p.isDeleted, me, group.others) else DmReplyPolicy.quotable(p.authorId, p.isDeleted, me, dm.peerUserId)) }
                     ?.let { p -> "${if (DmReplyPolicy.mine(p.authorId, me)) "you" else shownAuthor(p.authorId).name}: ${ChatTags.parse(p.content ?: "").text.take(60)}" }
+                // A mention of me (or, in a group, a reply to me) is highlighted like in a channel.
+                val replyToMine = group != null && m.replyToId?.let { id -> all.firstOrNull { it.messageId == id }?.authorId }?.let { DmReplyPolicy.mine(it, me) } == true
+                val mentionsMe = !mine && Mentions.mentionsMe(ChatTags.parse(m.content ?: "").mentions, me, m.authorId,
+                    everyoneHonoured = false, replyToMine = replyToMine)
                 MessageRow(if (mine) "you" else rowName, m.content ?: "", mine, m.createdAt, grouped, authorId,
                     isEdited = m.isEdited, isDeleted = m.isDeleted, replyPreview = replyPreview,
                     reactions = reactionsByMsg[m.messageId] ?: emptyList(), actions = actions,
-                    nameTrust = if (mine) null else rowShown, sendState = if (mine) sendStates[m.messageId] else null)
+                    nameTrust = if (mine) null else rowShown, sendState = if (mine) sendStates[m.messageId] else null,
+                    mentionsMe = mentionsMe, mentionName = mentionName)
             }
         }
         // Replying to / editing a message: say so, with a way out.
@@ -608,13 +643,32 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
         if (dm.isSplit) {
             Text("This arrived inside a conversation that belongs to someone else, so Skwod keeps it apart and you can't reply here. To write to this person, start a new chat with them.",
                 color = Color(0xFFFFA726), style = MaterialTheme.typography.bodySmall, modifier = Modifier.padding(8.dp))
-        } else Row(verticalAlignment = Alignment.CenterVertically) {
+        } else {
+        // Typing "@…": this conversation's other people whose names match, to insert as a mention.
+        MentionSuggestions(draft,
+            candidates = (group?.others ?: listOf(dm.peerUserId)).filter { it.isNotEmpty() && it != me && !model.isBlockedUser(it) }
+                .map { it to shownAuthor(it) },
+            onPick = { uid, label -> draft = Mentions.complete(draft, label); mentionPicks.add(uid to label) })
+        // Only this conversation's other people can show as typing here.
+        TypingLine(scopeName, accept = { uid -> if (group != null) uid in group.others else uid == dm.peerUserId },
+            nameOf = { uid -> shownAuthor(uid).label })
+        pasted?.let { p -> PastedImagePreview(p, onRemove = { pasted = null }) }
+            ?: run { if (clipHasImage && !uploading && editing == null) PasteImageChip {
+                // Tagged with the conversation it started in: a picture read after a switch is dropped.
+                val startedFor = dm.conversationId
+                scope.launch {
+                    val result = try { Result.success(ComposerPaste.take(ctx, model)) } catch (e: AttachmentException) { Result.failure(e) }
+                    if (!StagingRule.belongs(startedFor, onScreen)) return@launch
+                    result.onSuccess { pasted = it; error = null }.onFailure { error = it.message }
+                }
+            } }
+        Row(verticalAlignment = Alignment.CenterVertically) {
             IconButton(onClick = { picker.launch("*/*") }, enabled = !uploading) {
                 if (uploading) CircularProgressIndicator(Modifier.size(22.dp), color = SkAccent)
                 else Icon(Icons.Filled.AddCircle, "Attach", tint = SkAccent)
             }
             IconButton(onClick = { showMusic = true }) { Icon(Icons.Filled.MusicNote, "Share a song", tint = SkAccent) }
-            OutlinedTextField(draft, { draft = it }, placeholder = { Text("Encrypted message…", color = Color.White.copy(alpha = 0.4f)) },
+            OutlinedTextField(draft, { draft = it; announceTyping(it) }, placeholder = { Text("Encrypted message…", color = Color.White.copy(alpha = 0.4f)) },
                 modifier = Modifier.weight(1f), singleLine = false, maxLines = 4,
                 textStyle = LocalTextStyle.current.copy(color = Color.White),
                 colors = OutlinedTextFieldDefaults.colors(
@@ -623,9 +677,17 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
                     focusedBorderColor = Color.White.copy(alpha = 0.3f),
                     unfocusedBorderColor = Color.White.copy(alpha = 0.15f)))
             Spacer(Modifier.width(8.dp))
-            FilledIconButton(onClick = { sendDraft()             }, enabled = !sending && draft.isNotBlank(), shape = RoundedCornerShape(50)) {
+            FilledIconButton(onClick = {
+                // A pasted picture goes exactly like one picked with + (stripped, encrypted, queued).
+                pasted?.takeIf { editing == null }?.let { pic ->
+                    pasted = null
+                    sendFile { Uploads.prepareImage(ctx, model, pic.bytes, forDm = true) }
+                }
+                sendDraft()
+            }, enabled = !sending && (draft.isNotBlank() || (pasted != null && editing == null && !uploading)), shape = RoundedCornerShape(50)) {
                 Icon(Icons.Filled.ArrowUpward, "Send", tint = Color.Black)
             }
+        }
         }
     }
 }

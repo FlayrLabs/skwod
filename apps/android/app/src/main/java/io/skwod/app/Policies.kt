@@ -205,7 +205,7 @@ object NotifyPolicy {
 
     /** What a body looks like in one line of a notification; null when it has nothing to show. */
     fun preview(body: String): String? = when (tag(body)) {
-        null -> if (body.isNotEmpty() && body[0].code < 0x20) null else body.take(240).ifBlank { null }
+        null -> if (body.isNotEmpty() && body[0].code < 0x20) null else Mentions.visible(body).take(240).ifBlank { null }
         "skwod/attach|" -> "Sent an attachment"
         "skwod/music|" -> "Shared a song"
         "skwod/feed|" -> "Posted to the feed"

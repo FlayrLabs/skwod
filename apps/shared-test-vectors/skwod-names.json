@@ -1,0 +1,357 @@
+{
+ "_doc": "The rule for a skwod name a HOST supplies, identical on Apple (SkwodNameRule.acceptLearned) and Android (SkwodName.hostName / accepted). Allowed: ASCII letters, digits, space, - _ ' &; emoji: an Extended_Pictographic code point (an explicit table, minus letter-, punctuation- and arrow-like symbols such as (c) (R) TM !! i <-> and geometric shapes) optionally followed by a skin tone (U+1F3FB-1F3FF) or VS16, joined by ZWJ only to another such pictograph; flags as regional-indicator PAIRS. Refused: everything else (other scripts, combining marks, keycaps, tag-sequence flags, invisible/bidi characters, NBSP, other punctuation). Runs of spaces become one space and the ends are trimmed; a tab, newline or any other whitespace is refused (the host refuses control characters too). At most 32 units (an ASCII character or one whole emoji sequence). Reserved and address-like names are refused. 'expect' null = refused. One ZWJ sequence joins at most 4 pictographs; a name of more than 128 code points (after collapsing spaces) is refused before capping.",
+ "cases": [
+  {
+   "name": "Weekend Crew",
+   "expect": "Weekend Crew"
+  },
+  {
+   "name": "  Weekend   Crew  ",
+   "expect": "Weekend Crew"
+  },
+  {
+   "name": "Tab\there",
+   "expect": null
+  },
+  {
+   "name": "Line\nbreak",
+   "expect": null
+  },
+  {
+   "name": "Bob's Pub & Grill",
+   "expect": "Bob's Pub & Grill"
+  },
+  {
+   "name": "team_7-alpha",
+   "expect": "team_7-alpha"
+  },
+  {
+   "name": "Camp \ud83c\udfd5\ufe0f",
+   "expect": "Camp \ud83c\udfd5\ufe0f"
+  },
+  {
+   "name": "Fire \ud83d\udd25",
+   "expect": "Fire \ud83d\udd25"
+  },
+  {
+   "name": "Love \u2764\ufe0f",
+   "expect": "Love \u2764\ufe0f"
+  },
+  {
+   "name": "Love \u2764",
+   "expect": "Love \u2764"
+  },
+  {
+   "name": "Thumbs \ud83d\udc4d\ud83c\udffd",
+   "expect": "Thumbs \ud83d\udc4d\ud83c\udffd"
+  },
+  {
+   "name": "Family \ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67",
+   "expect": "Family \ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67"
+  },
+  {
+   "name": "Cook \ud83d\udc69\ud83c\udffe\u200d\ud83c\udf73",
+   "expect": "Cook \ud83d\udc69\ud83c\udffe\u200d\ud83c\udf73"
+  },
+  {
+   "name": "Runner \ud83c\udfc3\u200d\u2640\ufe0f",
+   "expect": "Runner \ud83c\udfc3\u200d\u2640\ufe0f"
+  },
+  {
+   "name": "Rainbow \ud83c\udff3\ufe0f\u200d\ud83c\udf08",
+   "expect": "Rainbow \ud83c\udff3\ufe0f\u200d\ud83c\udf08"
+  },
+  {
+   "name": "USA \ud83c\uddfa\ud83c\uddf8",
+   "expect": "USA \ud83c\uddfa\ud83c\uddf8"
+  },
+  {
+   "name": "Two flags \ud83c\uddef\ud83c\uddf5\ud83c\uddeb\ud83c\uddf7",
+   "expect": "Two flags \ud83c\uddef\ud83c\uddf5\ud83c\uddeb\ud83c\uddf7"
+  },
+  {
+   "name": "\u2615 Coffee",
+   "expect": "\u2615 Coffee"
+  },
+  {
+   "name": "\u26bd\u26be",
+   "expect": "\u26bd\u26be"
+  },
+  {
+   "name": "Crew \u00a9",
+   "expect": null
+  },
+  {
+   "name": "Crew \u00ae",
+   "expect": null
+  },
+  {
+   "name": "Crew\u2122",
+   "expect": null
+  },
+  {
+   "name": "Crew \u2122\ufe0f",
+   "expect": null
+  },
+  {
+   "name": "Wow \u203c",
+   "expect": null
+  },
+  {
+   "name": "Info \u2139\ufe0f",
+   "expect": null
+  },
+  {
+   "name": "Arrows \u2194",
+   "expect": null
+  },
+  {
+   "name": "Go \u27a1\ufe0f",
+   "expect": null
+  },
+  {
+   "name": "Wavy \u3030",
+   "expect": null
+  },
+  {
+   "name": "Box \u25aa",
+   "expect": null
+  },
+  {
+   "name": "Play \u25b6\ufe0f",
+   "expect": null
+  },
+  {
+   "name": "Lone tone \ud83c\udffd",
+   "expect": null
+  },
+  {
+   "name": "Odd flag \ud83c\uddfa",
+   "expect": null
+  },
+  {
+   "name": "Three RI \ud83c\uddfa\ud83c\uddf8\ud83c\uddeb",
+   "expect": null
+  },
+  {
+   "name": "Keycap 1\ufe0f\u20e3",
+   "expect": null
+  },
+  {
+   "name": "Scotland \ud83c\udff4\udb40\udc67\udb40\udc62\udb40\udc73\udb40\udc63\udb40\udc74\udb40\udc7f",
+   "expect": null
+  },
+  {
+   "name": "a\u200db",
+   "expect": null
+  },
+  {
+   "name": "\u200d\ud83d\udd25",
+   "expect": null
+  },
+  {
+   "name": "\ud83d\udd25\u200d",
+   "expect": null
+  },
+  {
+   "name": "\ud83d\udd25\u200d\u200d\ud83d\udd25",
+   "expect": null
+  },
+  {
+   "name": "\ufe0fx",
+   "expect": null
+  },
+  {
+   "name": "x\ufe0f",
+   "expect": null
+  },
+  {
+   "name": "\ud83c\uddfa\ud83c\udffd",
+   "expect": null
+  },
+  {
+   "name": "caf\u00e9",
+   "expect": null
+  },
+  {
+   "name": "cafe\u0301",
+   "expect": null
+  },
+  {
+   "name": "\u03a0\u03bf\u03b4",
+   "expect": null
+  },
+  {
+   "name": "\u6771\u4eac",
+   "expect": null
+  },
+  {
+   "name": "F\u0430mily",
+   "expect": null
+  },
+  {
+   "name": "a\u202eb",
+   "expect": null
+  },
+  {
+   "name": "a\u200bb",
+   "expect": null
+  },
+  {
+   "name": "a\u00adb",
+   "expect": null
+  },
+  {
+   "name": "no\u00a0break",
+   "expect": null
+  },
+  {
+   "name": "my.host",
+   "expect": null
+  },
+  {
+   "name": "host:443",
+   "expect": null
+  },
+  {
+   "name": "a/b",
+   "expect": null
+  },
+  {
+   "name": "me@home",
+   "expect": null
+  },
+  {
+   "name": "x\u3002y",
+   "expect": null
+  },
+  {
+   "name": "x\uff0ey",
+   "expect": null
+  },
+  {
+   "name": "Hi!",
+   "expect": null
+  },
+  {
+   "name": "Hi?",
+   "expect": null
+  },
+  {
+   "name": "(crew)",
+   "expect": null
+  },
+  {
+   "name": "#crew",
+   "expect": null
+  },
+  {
+   "name": "crew+",
+   "expect": null
+  },
+  {
+   "name": "a,b",
+   "expect": null
+  },
+  {
+   "name": "\"q\"",
+   "expect": null
+  },
+  {
+   "name": "",
+   "expect": null
+  },
+  {
+   "name": "   ",
+   "expect": null
+  },
+  {
+   "name": "Skwod",
+   "expect": null
+  },
+  {
+   "name": "my skwod",
+   "expect": null
+  },
+  {
+   "name": "MY SKWOD",
+   "expect": null
+  },
+  {
+   "name": "This Mac",
+   "expect": null
+  },
+  {
+   "name": "home",
+   "expect": null
+  },
+  {
+   "name": "Direct Messages",
+   "expect": null
+  },
+  {
+   "name": "feed",
+   "expect": null
+  },
+  {
+   "name": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+   "expect": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  },
+  {
+   "name": "\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67",
+   "expect": null
+  },
+  {
+   "name": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA B",
+   "expect": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  },
+  {
+   "name": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\ud83c\uddfa\ud83c\uddf8xyz",
+   "expect": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\ud83c\uddfa\ud83c\uddf8"
+  },
+  {
+   "name": "Family of four \ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\u200d\ud83d\udc66",
+   "expect": "Family of four \ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\u200d\ud83d\udc66"
+  },
+  {
+   "name": "Chain of five \ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68",
+   "expect": null
+  },
+  {
+   "name": "\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68\u200d\ud83d\udc68",
+   "expect": null
+  },
+  {
+   "name": "\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67",
+   "expect": "\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67"
+  },
+  {
+   "name": "\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67\ud83d\udc68\u200d\ud83d\udc69\u200d\ud83d\udc67",
+   "expect": null
+  },
+  {
+   "name": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+   "expect": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  },
+  {
+   "name": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+   "expect": null
+  }
+ ],
+ "clash": [
+  {
+   "name": "Crew",
+   "others": [
+    "crew"
+   ],
+   "expect": null
+  },
+  {
+   "name": "Crew",
+   "others": [
+    "Other"
+   ],
+   "expect": "Crew"
+  }
+ ]
+}

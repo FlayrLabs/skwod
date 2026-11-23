@@ -32,6 +32,7 @@ import kotlinx.coroutines.withContext
 /** Turn a failed sign-up / log-in into one sentence a person can act on (never the raw error). */
 internal fun authError(e: Exception, signup: Boolean): String {
     if (e is InviteException) return e.message ?: "That doesn't look like a Skwod invite."
+    if (e is SkwodIdentityException) return e.message ?: "Couldn't confirm this Skwod. Try again."
     if (e is uniffi.skwod_core.CoreException.UpdateRequired) {
         return "Update required: this Skwod and this app use different encryption versions. Update Skwod, or ask your host to update the server."
     }
@@ -79,9 +80,13 @@ fun AuthScreen(onDone: () -> Unit) {
         d.setBounds(0, 0, 192, 192); d.draw(canvas)
         bmp.asImageBitmap()
     }
-    var signup by remember { mutableStateOf(true) }
+    // "Create account" needs an invite; "Log in" (an account made on another device) needs only
+    // the address, username and password. Someone who has used a skwod here starts on Log in.
+    var signup by remember { mutableStateOf(model.workspaces.isEmpty() && model.knownServers().isEmpty()) }
     var server by remember { mutableStateOf("") }
     var inviteLink by remember { mutableStateOf("") }
+    // The invite's code typed by hand, when the link (or host key) came without it. Create account only.
+    var code by remember { mutableStateOf("") }
     var password by remember { mutableStateOf("") }
     var username by remember { mutableStateOf("") }
     var busy by remember { mutableStateOf(false) }
@@ -99,23 +104,36 @@ fun AuthScreen(onDone: () -> Unit) {
     var adopted by remember { mutableStateOf<String?>(null) }
     fun mayDial(field: String, address: SkwodAddress): Boolean = InviteDial.mayDial(field, adopted, knownHost = model.workspaceFor(address) != null)
 
-    /** Take an invite from a deep link, a QR scan or the clipboard: validate, then prefill. */
-    fun adoptInvite(raw: String) {
-        val parsed = try { InviteLink.parse(raw) } catch (e: InviteException) { error = e.message; info = null; return }
+    /**
+     * Take an invite from a deep link, a QR scan or the clipboard: validate, then prefill.
+     * [fromUser]: the user pressed Scan / Paste, so the mode they picked stays ([AuthForm.modeAfterAdopting]).
+     */
+    fun adoptInvite(raw: String, fromUser: Boolean = false) {
+        val parsed = try { LoginAddress.parse(raw) } catch (e: InviteException) { error = e.message; info = null; return }
         error = null
-        if (parsed.joinCode != null) {
-            signup = true; inviteLink = raw.trim(); adopted = inviteLink
-            info = if (parsed.address is SkwodAddress.P2p) "Invite ready. Pick a username and password to join."
-                   else "Invite ready for ${Workspace.defaultName(parsed.address.stored)}. Pick a username and password to join."
+        signup = AuthForm.modeAfterAdopting(signup, parsed.joinCode != null, fromUser)
+        if (signup) {
+            inviteLink = raw.trim(); adopted = inviteLink
+            info = when {
+                parsed.joinCode == null -> "Address ready. Type the invite code your host gave you, then pick a username and password."
+                parsed.address is SkwodAddress.P2p -> "Invite ready. Pick a username and password to join."
+                else -> "Invite ready for ${Workspace.defaultName(parsed.address.stored)}. Pick a username and password to join."
+            }
         } else {
-            signup = false; server = parsed.address.stored; adopted = server
+            // Log in: the address is all that is needed; a code in the link is ignored.
+            server = parsed.address.stored; adopted = server
             info = "Address ready. Log in with your username and password."
         }
     }
 
-    // A tapped skwod:// link (or one handed over while the app was already open).
+    // A tapped skwod:// link (or one handed over while the app was already open), or a skwod
+    // asking to be logged in to again (address + username prefilled).
     LaunchedEffect(model.pendingInvite) {
-        model.pendingInvite?.let { adoptInvite(it); model.pendingInvite = null }
+        model.pendingInvite?.let {
+            adoptInvite(it); model.pendingInvite = null
+            model.pendingLoginName?.let { name -> if (!signup && username.isEmpty()) username = name }
+            model.pendingLoginName = null
+        }
     }
 
     val usernameHint: String? = when {
@@ -126,8 +144,13 @@ fun AuthScreen(onDone: () -> Unit) {
     }
     val passwordHint: String? = if (signup && password.isNotEmpty() && password.length < 8)
         "Passwords need at least 8 characters." else null
-    val formValid = usernameHint == null && username.isNotBlank() && password.isNotBlank() &&
-        (if (signup) password.length >= 8 && inviteLink.isNotBlank() && inviteProblem == null else server.isNotBlank())
+    // What the Create-account field holds, and the code to sign up with (the link's, or the typed one).
+    val signupParsed = if (signup) try { LoginAddress.parse(inviteLink) } catch (_: InviteException) { null } else null
+    val linkHasCode = signupParsed?.joinCode != null
+    val signupCode = if (signup) AuthForm.signupCode(signupParsed?.joinCode, code) else null
+    val formValid = usernameHint == null &&
+        AuthForm.canSubmit(signup, if (signup) inviteLink else server, username, password, signupCode) &&
+        (!signup || inviteProblem == null)
 
     // Debounced, classic https skwods only: if the pasted address is a skwod you already belong to
     // (its tunnel address just moved), offer a credential-free Reconnect. A p2p address is a key
@@ -135,7 +158,7 @@ fun AuthScreen(onDone: () -> Unit) {
     val pastedAddr = if (signup) inviteLink.substringBefore("#") else server
     LaunchedEffect(pastedAddr) {
         reconnectName = null
-        val a = try { InviteLink.parse(pastedAddr).address } catch (_: InviteException) { return@LaunchedEffect }
+        val a = try { LoginAddress.forLogin(pastedAddr) } catch (_: InviteException) { return@LaunchedEffect }
         if (a !is SkwodAddress.Https || !a.url.startsWith("https://")) return@LaunchedEffect
         // An address that only arrived in a link is not contacted until the user acts.
         if (!mayDial(if (signup) inviteLink else server, a)) return@LaunchedEffect
@@ -146,11 +169,11 @@ fun AuthScreen(onDone: () -> Unit) {
     // Debounced so typing / pasting settles first. The check is unauthenticated and sends only
     // the code to the host the link names; it never joins anything. It runs for what the user
     // typed or pasted into the field themselves — not for a link that was merely opened.
-    LaunchedEffect(inviteLink, signup) {
+    LaunchedEffect(inviteLink, signupCode, signup) {
         inviteProblem = null; inviteNote = null; checkingInvite = false
         if (!signup) return@LaunchedEffect
-        val parsed = try { InviteLink.parse(inviteLink.trim()) } catch (_: InviteException) { return@LaunchedEffect }
-        val code = parsed.joinCode ?: return@LaunchedEffect
+        val parsed = try { LoginAddress.parse(inviteLink.trim()) } catch (_: InviteException) { return@LaunchedEffect }
+        val code = signupCode ?: return@LaunchedEffect
         // A tapped link only prefills: its host learns nothing (this device's address, that
         // Skwod is installed) until the user presses the button — the join itself then checks.
         if (!mayDial(inviteLink, parsed.address)) { inviteNote = InviteDial.HELD_NOTE; return@LaunchedEffect }
@@ -171,14 +194,15 @@ fun AuthScreen(onDone: () -> Unit) {
         if (busy) return
         error = null
         val raw = (if (signup) inviteLink else server).trim()
-        val parsed = try { InviteLink.parse(raw) } catch (e: InviteException) { error = e.message; return }
-        if (signup && parsed.joinCode == null) {
-            error = "That link has no join code. Ask your host for an invite link — or choose Log in if you already have an account."
+        // Log in needs the address only; Create account needs the address and an invite code.
+        val address = try { if (signup) LoginAddress.parse(raw).address else LoginAddress.forLogin(raw) }
+            catch (e: InviteException) { error = e.message; return }
+        val joinCode = if (signup) signupCode ?: run {
+            error = "Type the invite code from your host — or choose Log in if you already have an account."
             return
-        }
+        } else null
         // Classic links may still carry a beacon suffix after the code (address-move lookup).
-        val beacon = if (parsed.address is SkwodAddress.Https && raw.contains('#')) InviteBeacon.parse(raw.substringAfter('#')) else null
-        val address = parsed.address
+        val beacon = if (signup && address is SkwodAddress.Https && raw.contains('#')) InviteBeacon.parse(raw.substringAfter('#')) else null
         val name = username.trim().lowercase()
         busy = true
         scope.launch {
@@ -188,7 +212,7 @@ fun AuthScreen(onDone: () -> Unit) {
                 val existing = model.workspaceFor(address)
                 if (existing != null && signup && existing.username == name && !existing.isSignedOut) {
                     withContext(Dispatchers.IO) { model.activate(existing) }
-                    parsed.joinCode?.let { model.joins.begin(it) }
+                    joinCode?.let { model.joins.begin(it) }
                     onDone(); return@launch
                 }
                 if (address is SkwodAddress.Https && address.url.startsWith("https://")) {
@@ -204,7 +228,7 @@ fun AuthScreen(onDone: () -> Unit) {
                 }
                 val ok = withContext(Dispatchers.IO) {
                     try {
-                        if (signup) model.signUp(address, name, password, parsed.joinCode ?: "", beacon?.second, beacon?.third)
+                        if (signup) model.signUp(address, name, password, joinCode ?: "", beacon?.second, beacon?.third)
                         else model.logIn(address, name, password)
                     } catch (e: Exception) { error = authError(e, signup); false }
                 }
@@ -228,7 +252,7 @@ fun AuthScreen(onDone: () -> Unit) {
         QrScannerDialog(
             title = "Scan an invite",
             hint = "Point the camera at the QR code your host is showing. Works offline.",
-            onResult = { scanning = false; adoptInvite(it) },
+            onResult = { scanning = false; adoptInvite(it, fromUser = true) },
             onClose = { scanning = false })
     }
 
@@ -247,20 +271,34 @@ fun AuthScreen(onDone: () -> Unit) {
         Text("end-to-end encrypted", color = Color.White.copy(alpha = 0.55f), fontSize = 14.sp)
         Spacer(Modifier.height(22.dp))
 
-        // Segmented Sign up / Log in.
+        // Segmented Create account / Log in.
         SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
-            SegmentedButton(selected = signup, onClick = { signup = true; error = null },
-                shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2)) { Text("Sign up") }
-            SegmentedButton(selected = !signup, onClick = { signup = false; error = null },
+            SegmentedButton(selected = signup, onClick = { if (!signup && inviteLink.isBlank()) inviteLink = server; signup = true; error = null },
+                shape = SegmentedButtonDefaults.itemShape(index = 0, count = 2)) { Text("Create account") }
+            SegmentedButton(selected = !signup, onClick = {
+                // The address carries over; the invite's code is simply not needed to log in.
+                if (signup && server.isBlank()) server = try { LoginAddress.parse(inviteLink).address.stored } catch (_: InviteException) { "" }
+                signup = false; error = null
+            },
                 shape = SegmentedButtonDefaults.itemShape(index = 1, count = 2)) { Text("Log in") }
         }
-        Spacer(Modifier.height(16.dp))
+        Spacer(Modifier.height(6.dp))
+        Text(if (signup) "New to this Skwod? You need an invite from its host."
+             else "Already have an account (on another device)? Just the address, your username and password — no invite code.",
+            color = Color.White.copy(alpha = 0.55f), fontSize = 12.sp, modifier = Modifier.fillMaxWidth(),
+            textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+        Spacer(Modifier.height(12.dp))
 
         if (signup) {
-            PillField(inviteLink, { inviteLink = it; info = null }, "Invite link from your host", Icons.Filled.Link, KeyboardType.Uri)
+            PillField(inviteLink, { inviteLink = it; info = null }, "Invite link or host key", Icons.Filled.Link, KeyboardType.Uri)
+            if (inviteLink.isNotBlank() && !linkHasCode) {
+                Spacer(Modifier.height(8.dp))
+                // Typing is never blocked or rewritten here: the code is tidied up on submit (JoinCode.normalise).
+                PillField(code, { code = it; info = null }, "Invite code (e.g. ABCD2345)", Icons.Filled.Key, KeyboardType.Ascii, characters = true)
+            }
         } else {
-            PillField(server, { v -> server = if (v.contains("#")) v.substringBefore("#") else v; info = null },
-                "Invite link or Skwod address", Icons.Filled.Dns, KeyboardType.Uri)
+            PillField(server, { server = it; info = null },
+                "Skwod address, host key or invite link", Icons.Filled.Dns, KeyboardType.Uri)
         }
         Spacer(Modifier.height(8.dp))
         Row(Modifier.fillMaxWidth(), horizontalArrangement = Arrangement.spacedBy(8.dp)) {
@@ -270,7 +308,7 @@ fun AuthScreen(onDone: () -> Unit) {
             OutlinedButton(onClick = {
                 val cm = ctx.getSystemService(android.content.Context.CLIPBOARD_SERVICE) as? android.content.ClipboardManager
                 val text = try { cm?.primaryClip?.takeIf { it.itemCount > 0 }?.getItemAt(0)?.coerceToText(ctx)?.toString() } catch (_: Exception) { null }
-                if (text.isNullOrBlank()) error = "There's no invite on the clipboard." else adoptInvite(text)
+                if (text.isNullOrBlank()) error = "There's no invite on the clipboard." else adoptInvite(text, fromUser = true)
             }, modifier = Modifier.weight(1f), shape = RoundedCornerShape(50)) {
                 Icon(Icons.Filled.ContentPaste, null, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("Paste")
             }
@@ -365,7 +403,7 @@ fun AuthScreen(onDone: () -> Unit) {
         Spacer(Modifier.height(10.dp))
         Text(
             (if (signup) "Ask your host for an invite — tap it, scan it, or paste it here."
-            else "Log in with the invite link or address you joined with.") +
+            else "Log in with the address you joined with — a link, the host key, or pick one above.") +
                 (if (signup) PaywallGate.SIGNUP_NOTE else ""),
             color = Color.White.copy(alpha = 0.4f), fontSize = 12.sp,
             textAlign = androidx.compose.ui.text.style.TextAlign.Center
@@ -379,7 +417,7 @@ fun AuthScreen(onDone: () -> Unit) {
 private fun PillField(
     value: String, onValueChange: (String) -> Unit, placeholder: String,
     icon: androidx.compose.ui.graphics.vector.ImageVector, keyboard: KeyboardType = KeyboardType.Text,
-    secure: Boolean = false, isError: Boolean = false,
+    secure: Boolean = false, isError: Boolean = false, characters: Boolean = false,
 ) {
     OutlinedTextField(
         value, onValueChange,
@@ -387,7 +425,9 @@ private fun PillField(
         leadingIcon = { Icon(icon, null, tint = Color.White.copy(alpha = 0.8f)) },
         singleLine = true, isError = isError,
         visualTransformation = if (secure) PasswordVisualTransformation() else androidx.compose.ui.text.input.VisualTransformation.None,
-        keyboardOptions = KeyboardOptions(keyboardType = keyboard),
+        keyboardOptions = KeyboardOptions(keyboardType = keyboard,
+            capitalization = if (characters) androidx.compose.ui.text.input.KeyboardCapitalization.Characters else androidx.compose.ui.text.input.KeyboardCapitalization.None,
+            autoCorrectEnabled = if (characters) false else null),
         shape = RoundedCornerShape(50),
         colors = OutlinedTextFieldDefaults.colors(
             unfocusedContainerColor = Color.White.copy(alpha = 0.05f),

@@ -1,0 +1,591 @@
+{
+ "_doc": "Mention trailers a SENDER controls. Shared by apps/apple/Tests and the Android unit tests: each case is the visible text and the ASCII payload after U+2063 (the test writes it as TAG characters); 'mentions' is what must be read, 'everyone' too. Nothing may crash.",
+ "cases": [
+  {
+   "name": "valid",
+   "visible": "hi @Sam",
+   "payload": "M1{\"m\":[[\"u-sam\",3,4]]}",
+   "mentions": [
+    [
+     "u-sam",
+     3,
+     4
+    ]
+   ],
+   "everyone": false
+  },
+  {
+   "name": "int max start",
+   "visible": "@ab",
+   "payload": "M1{\"m\":[[\"u\",9223372036854775807,2]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "int max length",
+   "visible": "@ab",
+   "payload": "M1{\"m\":[[\"u\",1,9223372036854775807]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "int32 max length",
+   "visible": "@ab",
+   "payload": "M1{\"m\":[[\"u\",1,2147483647]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "wraps to small",
+   "visible": "@ab",
+   "payload": "M1{\"m\":[[\"u\",0,4294967298]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "huge exponent",
+   "visible": "@ab",
+   "payload": "M1{\"m\":[[\"u\",0,1e300]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "beyond int64",
+   "visible": "@ab",
+   "payload": "M1{\"m\":[[\"u\",0,99999999999999999999999]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "negative start",
+   "visible": "@ab",
+   "payload": "M1{\"m\":[[\"u\",-1,2]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "negative length",
+   "visible": "@ab",
+   "payload": "M1{\"m\":[[\"u\",0,-2]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "int min",
+   "visible": "@ab",
+   "payload": "M1{\"m\":[[\"u\",-9223372036854775808,2]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "fraction",
+   "visible": "@ab",
+   "payload": "M1{\"m\":[[\"u\",0.5,2]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "NaN bare",
+   "visible": "@ab",
+   "payload": "M1{\"m\":[[\"u\",NaN,2]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "NaN string",
+   "visible": "@ab",
+   "payload": "M1{\"m\":[[\"u\",\"NaN\",2]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "Infinity",
+   "visible": "@ab",
+   "payload": "M1{\"m\":[[\"u\",0,Infinity]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "string numbers",
+   "visible": "@ab",
+   "payload": "M1{\"m\":[[\"u\",\"0\",\"2\"]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "bool numbers",
+   "visible": "@ab",
+   "payload": "M1{\"m\":[[\"u\",false,true]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "nested arrays",
+   "visible": "@ab",
+   "payload": "M1{\"m\":[[\"u\",[0],[2]],[[[[[\"u\"]]]]]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "object for list",
+   "visible": "@ab",
+   "payload": "M1{\"m\":{\"u\":[0,2]}}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "id not a string",
+   "visible": "@ab",
+   "payload": "M1{\"m\":[[7,0,2]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "too many entries",
+   "visible": "@ab",
+   "payload": "M1{\"m\":[[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2],[\"u\",0,2]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "everyone string",
+   "visible": "@everyone",
+   "payload": "M1{\"e\":\"true\"}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "everyone number",
+   "visible": "@everyone",
+   "payload": "M1{\"e\":1}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "everyone",
+   "visible": "@everyone",
+   "payload": "M1{\"e\":true}",
+   "mentions": [],
+   "everyone": true
+  },
+  {
+   "name": "oversized trailer",
+   "visible": "@ab",
+   "payload": "M1{\"m\":[[\"u\",0,2]],\"x\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "past the end",
+   "visible": "@ab",
+   "payload": "M1{\"m\":[[\"u\",2,2]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "at end exactly",
+   "visible": "x @ab",
+   "payload": "M1{\"m\":[[\"u\",2,3]]}",
+   "mentions": [
+    [
+     "u",
+     2,
+     3
+    ]
+   ],
+   "everyone": false
+  },
+  {
+   "name": "64 units is the longest",
+   "visible": "@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "payload": "M1{\"m\":[[\"u\",0,64]]}",
+   "mentions": [
+    [
+     "u",
+     0,
+     64
+    ]
+   ],
+   "everyone": false
+  },
+  {
+   "name": "over 64 units",
+   "visible": "@aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "payload": "M1{\"m\":[[\"u\",0,65]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "space inside",
+   "visible": "hi @Sam Smith",
+   "payload": "M1{\"m\":[[\"u\",3,10]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "newline inside",
+   "visible": "@Sam\nhidden",
+   "payload": "M1{\"m\":[[\"u\",0,11]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "tab inside",
+   "visible": "@Sam\tx",
+   "payload": "M1{\"m\":[[\"u\",0,6]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "whole message",
+   "visible": "@a look at this link",
+   "payload": "M1{\"m\":[[\"u\",0,20]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "zero width inside",
+   "visible": "@a\u200bb",
+   "payload": "M1{\"m\":[[\"u\",0,4]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "bidi mark inside",
+   "visible": "@a\u202eb",
+   "payload": "M1{\"m\":[[\"u\",0,4]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "no-break space inside",
+   "visible": "@a\u00a0b",
+   "payload": "M1{\"m\":[[\"u\",0,4]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "second at sign",
+   "visible": "@a@b",
+   "payload": "M1{\"m\":[[\"u\",0,4]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "non-ascii name",
+   "visible": "hey @Zo\u00eb",
+   "payload": "M1{\"m\":[[\"u\",4,4]]}",
+   "mentions": [
+    [
+     "u",
+     4,
+     4
+    ]
+   ],
+   "everyone": false
+  },
+  {
+   "name": "emoji is not a name character",
+   "visible": "@\ud83d\ude00x",
+   "payload": "M1{\"m\":[[\"u\",0,4]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "splits a surrogate pair",
+   "visible": "@\ud83d\ude00",
+   "payload": "M1{\"m\":[[\"u\",0,2]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "dotted and dashed name",
+   "visible": "@sam.o-k_2 hi",
+   "payload": "M1{\"m\":[[\"u\",0,10]]}",
+   "mentions": [
+    [
+     "u",
+     0,
+     10
+    ]
+   ],
+   "everyone": false
+  },
+  {
+   "name": "hangul choseong filler inside",
+   "visible": "@a\u115fb",
+   "payload": "M1{\"m\":[[\"u\",0,4]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "hangul jungseong filler inside",
+   "visible": "@a\u1160b",
+   "payload": "M1{\"m\":[[\"u\",0,4]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "hangul filler inside",
+   "visible": "@a\u3164b",
+   "payload": "M1{\"m\":[[\"u\",0,4]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "halfwidth hangul filler inside",
+   "visible": "@a\uffa0b",
+   "payload": "M1{\"m\":[[\"u\",0,4]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "braille blank inside",
+   "visible": "@a\u2800b",
+   "payload": "M1{\"m\":[[\"u\",0,4]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "arabic letter mark inside",
+   "visible": "@a\u061cb",
+   "payload": "M1{\"m\":[[\"u\",0,4]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "combining grapheme joiner inside",
+   "visible": "@a\u034fb",
+   "payload": "M1{\"m\":[[\"u\",0,4]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "variation selector 16 inside",
+   "visible": "@a\ufe0fb",
+   "payload": "M1{\"m\":[[\"u\",0,4]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "variation selector 1 inside",
+   "visible": "@a\ufe00b",
+   "payload": "M1{\"m\":[[\"u\",0,4]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "tag latin capital a inside",
+   "visible": "@a\udb40\udc41b",
+   "payload": "M1{\"m\":[[\"u\",0,5]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "cancel tag inside",
+   "visible": "@a\udb40\udc7fb",
+   "payload": "M1{\"m\":[[\"u\",0,5]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "khmer inherent vowel inside",
+   "visible": "@a\u17b4b",
+   "payload": "M1{\"m\":[[\"u\",0,4]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "mongolian free variation selector inside",
+   "visible": "@a\u180bb",
+   "payload": "M1{\"m\":[[\"u\",0,4]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "variation selector 17 inside",
+   "visible": "@a\udb40\udd00b",
+   "payload": "M1{\"m\":[[\"u\",0,5]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "only a hangul filler",
+   "visible": "@\u3164",
+   "payload": "M1{\"m\":[[\"u\",0,2]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "hangul fillers only",
+   "visible": "@\u3164\u3164\u3164",
+   "payload": "M1{\"m\":[[\"u\",0,4]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "ranges touch",
+   "visible": "@a.@b",
+   "payload": "M1{\"m\":[[\"u\",0,3],[\"v\",3,2]]}",
+   "mentions": [
+    [
+     "u",
+     0,
+     3
+    ]
+   ],
+   "everyone": false
+  },
+  {
+   "name": "ranges overlap",
+   "visible": "@ab",
+   "payload": "M1{\"m\":[[\"u\",0,3],[\"v\",0,2]]}",
+   "mentions": [
+    [
+     "u",
+     0,
+     3
+    ]
+   ],
+   "everyone": false
+  },
+  {
+   "name": "adjacent with a space",
+   "visible": "@a @b",
+   "payload": "M1{\"m\":[[\"u\",0,2],[\"v\",3,2]]}",
+   "mentions": [
+    [
+     "u",
+     0,
+     2
+    ],
+    [
+     "v",
+     3,
+     2
+    ]
+   ],
+   "everyone": false
+  },
+  {
+   "name": "after a letter",
+   "visible": "mail@sam",
+   "payload": "M1{\"m\":[[\"u\",4,4]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "after a digit",
+   "visible": "1@sam",
+   "payload": "M1{\"m\":[[\"u\",1,4]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "after an emoji",
+   "visible": "\ud83d\udc4b@sam",
+   "payload": "M1{\"m\":[[\"u\",2,4]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "after punctuation",
+   "visible": "(@sam)",
+   "payload": "M1{\"m\":[[\"u\",1,4]]}",
+   "mentions": [
+    [
+     "u",
+     1,
+     4
+    ]
+   ],
+   "everyone": false
+  },
+  {
+   "name": "after a newline",
+   "visible": "hi\n@sam",
+   "payload": "M1{\"m\":[[\"u\",3,4]]}",
+   "mentions": [
+    [
+     "u",
+     3,
+     4
+    ]
+   ],
+   "everyone": false
+  },
+  {
+   "name": "combining mark after a letter",
+   "visible": "@Zoe\u0308",
+   "payload": "M1{\"m\":[[\"u\",0,5]]}",
+   "mentions": [
+    [
+     "u",
+     0,
+     5
+    ]
+   ],
+   "everyone": false
+  },
+  {
+   "name": "combining mark first",
+   "visible": "@\u0308a",
+   "payload": "M1{\"m\":[[\"u\",0,3]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "combining mark after a digit",
+   "visible": "@1\u0308",
+   "payload": "M1{\"m\":[[\"u\",0,3]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "parenthesis inside",
+   "visible": "@Sam(x)",
+   "payload": "M1{\"m\":[[\"u\",0,7]]}",
+   "mentions": [],
+   "everyone": false
+  },
+  {
+   "name": "cjk name",
+   "visible": "@\u5c71\u7530",
+   "payload": "M1{\"m\":[[\"u\",0,3]]}",
+   "mentions": [
+    [
+     "u",
+     0,
+     3
+    ]
+   ],
+   "everyone": false
+  },
+  {
+   "name": "arabic name",
+   "visible": "@\u0633\u0627\u0645",
+   "payload": "M1{\"m\":[[\"u\",0,4]]}",
+   "mentions": [
+    [
+     "u",
+     0,
+     4
+    ]
+   ],
+   "everyone": false
+  },
+  {
+   "name": "digits and dashes",
+   "visible": "@r2-d2",
+   "payload": "M1{\"m\":[[\"u\",0,6]]}",
+   "mentions": [
+    [
+     "u",
+     0,
+     6
+    ]
+   ],
+   "everyone": false
+  }
+ ]
+}

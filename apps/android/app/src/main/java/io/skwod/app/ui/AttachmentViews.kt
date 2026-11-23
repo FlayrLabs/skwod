@@ -38,7 +38,7 @@ fun MessageBody(body: String) {
         parsed.attachment?.let { AttachmentContent(it); if (parsed.text.isNotBlank()) Spacer(Modifier.height(6.dp)) }
         parsed.music?.let { MusicContent(it); if (parsed.text.isNotBlank()) Spacer(Modifier.height(6.dp)) }
         if (parsed.text.isNotBlank() || (parsed.attachment == null && parsed.music == null)) {
-            MarkdownOrEmoji(parsed.text)
+            MarkdownOrEmoji(parsed.text, parsed.mentions.mentions)
         }
     }
 }

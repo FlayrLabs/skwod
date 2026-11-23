@@ -346,9 +346,18 @@ enum NotificationDecryptor {
         // messages are neither announced nor a reason for the visible generic banner.
         let mutes = MuteStore.load(workspaceId: w.id)
         let wokenAt = Date().timeIntervalSince1970
-        for scope in names.keys {
+        // A whole-skwod mute silences everything, mentions too. A muted conversation is still
+        // read, for one thing only: a message that mentions this account always alerts
+        // (`MentionAlertRule`).
+        let skwodMuted = mutes.holds(MuteList.skwod, now: wokenAt)
+        var mentionIds: Set<String> = []
+        // scope → the mentions of me found there (each counted once on the badge, app or here).
+        var mentionsByScope: [String: [String]] = [:]
+        // (`person:` entries are names for mention banners, not conversations.)
+        for scope in names.keys where MentionNotice.isConversation(scope) {
             if stop() { complete = false; break }
-            if mutes.isMuted(scope: scope, now: wokenAt) { fetched = true; continue }
+            if skwodMuted { fetched = true; continue }
+            let scopeMuted = mutes.isMuted(scope: scope, now: wokenAt)
             var rows: [Message]?
             if scope.hasPrefix("channel:") {
                 rows = try? await client.fetchChannelMessages(channelId: String(scope.dropFirst(8)), myUserId: w.userId)
@@ -358,11 +367,26 @@ enum NotificationDecryptor {
             if rows != nil { fetched = true }
             // New rows from someone else. Whether a decrypted body deserves a notification is
             // the core's rule (`messageNotifies`): not likes, comments, avatars, game moves.
-            let fresh = rows?.filter { m in
+            let newRows = rows?.filter { m in
                 AnnounceWindow.isNew(messageId: m.messageId, createdAt: m.createdAt, floor: floor, seen: seen)
                     && !m.isDeleted && m.authorId != w.userId && m.authorId != "__me__"
                     && !m.isSystem && !blocked.contains(m.authorId ?? "")
             }
+            // A mention of me, an @everyone from someone the app found may use it in this
+            // channel (`EveryoneRule`, left in the sender sets — the extension asks the server
+            // nothing about roles), or a reply to one of my messages on the same page.
+            let everyone = Set(senders?[EveryoneRule.sendersKey(channelId: String(scope.dropFirst(8)))] ?? [])
+            let mine = Set((rows ?? []).filter { $0.authorId == w.userId || $0.authorId == "__me__" }.map(\.messageId))
+            for m in newRows ?? [] where MentionRule.mentionsMe(
+                MentionCodec.decode(m.content ?? "").payload, me: w.userId,
+                senderMayMentionEveryone: scope.hasPrefix("channel:") && everyone.contains(m.authorId ?? ""),
+                // (In a one-to-one conversation everything is to me: a reply is no mention.)
+                replyToMine: (scope.hasPrefix("channel:") || (senders?[scope]?.count ?? 0) > 1)
+                    && MentionNotice.replyToMine(m.replyToId, mine: mine)) {
+                mentionIds.insert(m.messageId)
+                mentionsByScope[scope, default: []].append(m.messageId)
+            }
+            let fresh = scopeMuted ? newRows?.filter { mentionIds.contains($0.messageId) } : newRows
             // Looked at now: none of it is new to a later wake, under whatever date.
             if let rows {
                 seenIds = AnnounceWindow.remembering(page: rows.map(\.messageId), fresh: (fresh ?? []).map(\.messageId), in: seenIds)
@@ -387,6 +411,10 @@ enum NotificationDecryptor {
         // so nothing is remembered as seen and nothing is claimed — the next wake finds it.
         if abandoned.isSet || Task.isCancelled { return nil }
         if stop() { complete = false }
+        // The red "@ n" in the app (`MentionBadgeLedger`, in the app group): each mention once.
+        for (scope, ids) in mentionsByScope {
+            MentionBadgeLedger.update(SharedContainer.defaults) { $0.add(ids: ids, topic: scope, workspaceId: w.id) }
+        }
         // One banner per conversation with something new, the newest first; what is beyond
         // what one wake shows is not marked as looked at, and is found again by the next.
         let picked = WakePick.pick(ranks: candidates.map { AnnounceWindow.rank(createdAt: $0.message.createdAt, now: nowMs) })
@@ -405,8 +433,14 @@ enum NotificationDecryptor {
             let (scope, message) = candidates[i]
             guard claimed.contains(message.messageId) else { return nil }
             let name = names[scope] ?? "New message"
-            let title = scope.hasPrefix("channel:") ? "#\(name)" : name
-            return (Result(title: title, body: preview(message.content ?? ""), thread: scope),
+            var title = scope.hasPrefix("channel:") ? "#\(name)" : name
+            // A mention says so (labels exist only while previews are on and app lock is off;
+            // otherwise the generic line, like every other banner).
+            if mentionIds.contains(message.messageId) {
+                title = MentionNotice.title(sender: MentionNotice.senderName(authorId: message.authorId, names: names),
+                                            place: names[scope] != nil ? title : nil)
+            }
+            return (Result(title: title, body: preview(MentionCodec.visible(message.content ?? "")), thread: scope),
                     AnnounceWindow.rank(createdAt: message.createdAt, now: nowMs))
         }
         // The quiet line only when everything was read and none of it needs the user;

@@ -389,10 +389,10 @@ failing `./check-deps.sh`; the commit id is inside the signed manifest statement
    label of the current `latest`. All publishing shares one concurrency group (`image-publish`).
    It then pushes the two tested
    archives byte for byte (`<n>-amd64`, `<n>-arm64`), merges them into one multi-arch index tagged
-   `<n>`, and signs that digest keylessly: `cosign sign --yes …@sha256:<digest>`. That is a Fulcio
+   `<n>-candidate`, and signs that digest keylessly: `cosign sign --yes …@sha256:<digest>`. That is a Fulcio
    certificate bound to the workflow and its ref, with an entry in Rekor; there is no long-lived key
    to steal. The job then checks the signature with `deploy/verify-image.sh`, the same check hosts
-   run. **Only then** does it move `latest` to that digest, after checking once more that this only moves
+   run. **Only then** does it tag that digest `<n>` and move `latest` to it, after checking once more that this only moves
    it forward. The run summary prints the digest; put
    it in the release notes.
 3. **Tags.** `<n>` is never overwritten; the workflow refuses. `latest` exists for Unraid's "check for updates" and always points at a

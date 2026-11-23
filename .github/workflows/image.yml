@@ -11,10 +11,10 @@
 #      Unraid template's privilege drop, livekit-server running). Nothing is pushed here; the
 #      tested archive itself is what leaves the job.
 #   2. publish (only after both architectures passed): pushes exactly those tested archives,
-#      (as `<build>-amd64` / `<build>-arm64`), merges them into one multi-arch image tagged
-#      `<build>`, signs its digest with cosign keyless (GitHub OIDC → Fulcio, logged in Rekor),
+#      (as `<build>-amd64` / `<build>-arm64`), merges them into one multi-arch image (tagged
+#      `<build>-candidate`), signs its digest with cosign keyless (GitHub OIDC → Fulcio, logged in Rekor),
 #      checks the signature with deploy/verify-image.sh — the same check hosts run — and only
-#      then points `latest` at it.
+#      then tags it `<build>` and points `latest` at it.
 #
 # Rules for this file (CODEOWNERS covers .github/, so changes here get the maintainer's review):
 #   - Never triggered by pull_request or pull_request_target: fork code never reaches this.
@@ -164,7 +164,7 @@ jobs:
         run: |
           command -v skopeo >/dev/null || { sudo apt-get update -qq && sudo apt-get install -y -qq skopeo; }
           if ! tags="$(skopeo list-tags --authfile "$HOME/.docker/config.json" "docker://$IMAGE" 2>"$RUNNER_TEMP/err")"; then
-            grep -qiE 'name unknown|not found|404' "$RUNNER_TEMP/err" || { cat "$RUNNER_TEMP/err" >&2; exit 1; }
+            grep -qiE 'name unknown|not found|404|denied|unauthorized' "$RUNNER_TEMP/err" || { cat "$RUNNER_TEMP/err" >&2; exit 1; }
             tags='{"Tags":[]}'   # first publish: the package does not exist yet
           fi
           if jq -e --arg t "$BUILD" '.Tags | index($t)' <<<"$tags" >/dev/null; then
@@ -194,14 +194,16 @@ jobs:
 
       # `latest` moves only after the merged image is signed and the signature verified, so a
       # failed signing never leaves an unsigned `latest` behind.
-      - name: Merge into one multi-arch image, tagged ${{ env.BUILD }}
+      # Merged under a candidate tag: `<n>` itself appears only once the image is signed and the
+      # signature verified, so a failed run can simply be re-run on the same tag.
+      - name: Merge into one multi-arch image (candidate)
         id: merge
         env:
           DIR: ${{ runner.temp }}/images
         run: |
-          docker buildx imagetools create -t "$IMAGE:$BUILD" \
+          docker buildx imagetools create -t "$IMAGE:$BUILD-candidate" \
             "$IMAGE@$(cat "$DIR/amd64.digest")" "$IMAGE@$(cat "$DIR/arm64.digest")"
-          digest="$(docker buildx imagetools inspect "$IMAGE:$BUILD" --format '{{json .Manifest}}' | jq -r .digest)"
+          digest="$(docker buildx imagetools inspect "$IMAGE:$BUILD-candidate" --format '{{json .Manifest}}' | jq -r .digest)"
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::could not read the merged digest"; exit 1; }
           docker buildx imagetools inspect "$IMAGE@$digest"
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
@@ -215,6 +217,11 @@ jobs:
         env:
           DIGEST: ${{ steps.merge.outputs.digest }}
         run: deploy/verify-image.sh "$IMAGE@$DIGEST"
+
+      - name: Tag the signed image ${{ env.BUILD }}
+        env:
+          DIGEST: ${{ steps.merge.outputs.digest }}
+        run: docker buildx imagetools create -t "$IMAGE:$BUILD" "$IMAGE@$DIGEST"
 
       - name: Move latest to the signed image (re-checked, forward only)
         env:

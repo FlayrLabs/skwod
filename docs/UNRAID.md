@@ -358,9 +358,10 @@ same members. Nobody has to be invited again.
 
 1. On the **old** box, stop the container (Docker tab → icon → **Stop**). **Keep it stopped**
    from now on. Two copies of the same Skwod must never run at the same time.
-2. Make an encrypted backup ([Backups](#backups), step 2). The container must run for
-   `docker exec`, so start it, run the backup, and stop it again. Or simply copy the whole
-   `/mnt/user/appdata/skwod` folder while it's stopped.
+2. With the container stopped, copy the whole `/mnt/user/appdata/skwod` folder (for example to
+   a share, then to the new box). Because the container is stopped, nothing can change while
+   you copy. (An encrypted backup also works, but `docker exec` needs the container running:
+   ask everyone to stop posting, make the backup, then stop the container.)
 3. On the **new** box, add the template ([step 2](#2-add-the-skwod-template)) but **don't
    press Apply yet**. Instead:
    - **If you copied the folder:** put it at `/mnt/user/appdata/skwod` on the new box, then
@@ -399,20 +400,27 @@ the move keeps its **address** (its key), so your friends don't need new invites
 > first. Some messages then land on one copy and some on the other, and the two copies never
 > merge. So the Mac's server is switched **off** before the Unraid one starts, and stays off.
 
-**Before you start**, tell your group that the Skwod will be down for a few minutes, and that
-everyone will have to **sign in once more** afterwards with their username and password. Make
-sure they know their password. Their messages stay on their phones; nothing else changes.
+**Before you start:**
 
-### On the Mac: export, then switch the Mac's server off
+- Tell your group that the Skwod will be down for a few minutes, and that everyone will have to
+  **sign in once more** afterwards with their username and password. Make sure they know their
+  password. Their messages stay on their phones; nothing else changes.
+- **Save your own recovery key** if you haven't yet (in the app: your profile → recovery key).
+  Your phone keeps everything, but the Mac app's own entry for this Skwod gets replaced (see
+  [What your friends notice](#what-your-friends-notice)).
 
-1. Open Skwod on the Mac. Open the **Start server** window (from the Skwod icon in the menu bar,
-   or the app's **Start server** button) and click **Options**.
-2. Under **Backup**, click **Export…**. Choose where to save the file (for example, the Desktop).
-3. Choose a **passphrase** of at least 14 characters, type it twice, and **write it down**.
+### On the Mac: switch the server off, then export
+
+Stop first, then export. That way nothing can be posted after the backup is made.
+
+1. Click the Skwod icon in the **menu bar** and choose **Stop server**. From now on, friends
+   can't reach the Mac's copy.
+2. Open the **Start server** window (from the app's **Start server** button) and click
+   **Options**.
+3. Under **Backup**, click **Export…**. Choose where to save the file (for example, the Desktop).
+4. Choose a **passphrase** of at least 14 characters, type it twice, and **write it down**.
    Without it, nobody can open the file, you included. You get a file ending in
    `.skwodbackup`.
-4. Click the Skwod icon in the **menu bar** and choose **Stop server**. From now on, friends
-   can't reach the Mac's copy.
 5. Make sure the Mac never starts it again by itself. **Quit Skwod** (menu bar icon → **Quit
    Skwod**). In Finder, choose **Go → Go to Folder…**, type
    `~/Library/Application Support/` and press **Enter**. Rename the folder `skwod-host-data` to
@@ -469,13 +477,15 @@ sure they know their password. Their messages stay on their phones; nothing else
 - **You, on the Mac**: the Mac app reached its own server through a local address, which now
   has nothing behind it. Sign in to the Unraid Skwod from the Mac like any member: open your
   profile → **Add a skwod**, choose **Log in**, paste the server's invite or address (from the
-  Unraid admin page, or any invite), and use your owner username and password. Then remove the
-  old entry. Your phones are not affected; they already connect by address.
+  Unraid admin page, or any invite), and use your owner username and password. The Mac then
+  counts as a new device of your account. Keep the old entry until the new one shows your
+  history (your recovery key brings it back if it doesn't). Your phones are not affected; they
+  already connect by address. *(This Mac-side step has not been tested yet.)*
 
 ### The other way: Unraid back to a Mac
 
-1. Make an encrypted backup on Unraid ([Backups](#backups), step 2), then **stop** the container
-   right away. On the Docker tab, turn its **Autostart** switch off, so a reboot of the Unraid
+1. Ask everyone to stop posting for a few minutes. Make an encrypted backup on Unraid
+   ([Backups](#backups), step 2), then **stop** the container right away. On the Docker tab, turn its **Autostart** switch off, so a reboot of the Unraid
    box doesn't start it again.
 2. Copy the `.skwodbackup` file to the Mac.
 3. In the Skwod Mac app: open **Start server → Options → Backup → Import…**, choose the file, and

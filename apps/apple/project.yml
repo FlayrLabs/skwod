@@ -17,8 +17,8 @@ packages:
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "0.1.0"
-    CURRENT_PROJECT_VERSION: "47"
+    MARKETING_VERSION: "0.48"
+    CURRENT_PROJECT_VERSION: "48"
     ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     # --- build-time switches (docs/APPLE.md) -------------------------------------------------
     # Blind push gateway base URL (https://…). Empty = remote push disabled; the app then only
@@ -107,7 +107,7 @@ targets:
         INFOPLIST_KEY_UISupportedInterfaceOrientations: "UIInterfaceOrientationPortrait UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
         INFOPLIST_KEY_UISupportedInterfaceOrientations_iPad: "UIInterfaceOrientationPortrait UIInterfaceOrientationPortraitUpsideDown UIInterfaceOrientationLandscapeLeft UIInterfaceOrientationLandscapeRight"
         INFOPLIST_KEY_NSAppleMusicUsageDescription: "Skwod uses Apple Music to add songs to your posts and stories."
-        INFOPLIST_KEY_NSCameraUsageDescription: "Skwod uses the camera for end-to-end encrypted video calls, to send photos in chat, and to scan invite QR codes."
+        INFOPLIST_KEY_NSCameraUsageDescription: "Skwod uses the camera for end-to-end encrypted video calls, to send photos in chat, and to scan invite and “Add a device” QR codes."
         INFOPLIST_KEY_NSMicrophoneUsageDescription: "Skwod uses the microphone for end-to-end encrypted voice and video calls."
         INFOPLIST_KEY_NSPhotoLibraryUsageDescription: "Skwod accesses your photos so you can send them in chat."
         CODE_SIGN_ENTITLEMENTS: Skwod-iOS.entitlements
@@ -219,6 +219,11 @@ targets:
       # Build 47: who is in a voice room, and a left server staying gone.
       - path: Sources/VoiceRoster.swift
       - path: Sources/LeaveRules.swift
+      # Build 48: a p2p connect always ends (deadline that does not wait on a stalled call), and
+      # what the log-in screen says when the host can't be reached.
+      - path: Sources/ConnectRules.swift
+      # Build 48: what a device pairing by QR says (never a password prompt).
+      - path: Sources/PairingCopy.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.skwod.logic-tests

@@ -36,6 +36,9 @@ internal fun authError(e: Exception, signup: Boolean): String {
     if (e is uniffi.skwod_core.CoreException.UpdateRequired) {
         return "Update required: this Skwod and this app use different encryption versions. Update Skwod, or ask your host to update the server."
     }
+    if (e is P2PConnectTimeout) {
+        return "Couldn't reach your host. Their computer may be off, asleep or offline — or this network may block the connection. Try again, or switch between Wi-Fi and mobile data, and check that “Use a relay when needed” is on in Skwod's settings."
+    }
     val d = (when (e) {
         is uniffi.skwod_core.CoreException.Engine -> e.detail
         is uniffi.skwod_core.CoreException.Invalid -> e.detail
@@ -43,7 +46,7 @@ internal fun authError(e: Exception, signup: Boolean): String {
     }).lowercase()
     return when {
         d.contains("could not reach") || d.contains("unreachable") || d.contains("timed out") || d.contains("timeout") ->
-            "Can't reach your host right now. Their computer may be off, asleep or offline — try again in a moment."
+            "Couldn't reach your host. Their computer may be off, asleep or offline — or this network may block the connection. Try again, or switch between Wi-Fi and mobile data, and check that “Use a relay when needed” is on in Skwod's settings."
         // A valid invite whose waiting places are taken (the server says so in words): the
         // invite is fine, the host has to let people in. Same sentence as the Apple app.
         d.contains("invite full") -> "This invite already has a lot of people waiting to be let in. Ask your host to approve them (or send you a new invite), then try again."
@@ -94,6 +97,8 @@ fun AuthScreen(onDone: () -> Unit) {
     var info by remember { mutableStateOf<String?>(null) }
     var reconnectName by remember { mutableStateOf<String?>(null) }
     var scanning by remember { mutableStateOf(false) }
+    // A device pairing by a scanned "Add a device" QR (build 48).
+    var pairing by remember { mutableStateOf<uniffi.skwod_core.PairingOffer?>(null) }
     // What the host says about the invite in the form, asked BEFORE any name or password is
     // typed: an expired / used / unknown invite is reported here, not after "Create account".
     var inviteProblem by remember { mutableStateOf<String?>(null) }
@@ -109,6 +114,18 @@ fun AuthScreen(onDone: () -> Unit) {
      * [fromUser]: the user pressed Scan / Paste, so the mode they picked stays ([AuthForm.modeAfterAdopting]).
      */
     fun adoptInvite(raw: String, fromUser: Boolean = false) {
+        // An "Add a device" QR (build 48). Anyone can print a QR, so a scanned one never leads to a
+        // password prompt: pairing needs none. The dialog names the host and account, and the
+        // person approves on the device they already use (PairNewDeviceDialog).
+        if (raw.trim().startsWith("skwod-pair:")) {
+            try {
+                pairing = uniffi.skwod_core.pairingQrDecode(raw.trim(), (System.currentTimeMillis() / 1000).toULong())
+                error = null; info = null
+            } catch (e: Exception) {
+                error = "That QR code isn't from Skwod's “Add a device”, or it expired. Make a new one on your other device."; info = null
+            }
+            return
+        }
         val parsed = try { LoginAddress.parse(raw) } catch (e: InviteException) { error = e.message; info = null; return }
         error = null
         signup = AuthForm.modeAfterAdopting(signup, parsed.joinCode != null, fromUser)
@@ -248,10 +265,12 @@ fun AuthScreen(onDone: () -> Unit) {
         submit()
     }
 
+    pairing?.let { offer -> PairNewDeviceDialog(offer) { pairing = null } }
+
     if (scanning) {
         QrScannerDialog(
-            title = "Scan an invite",
-            hint = "Point the camera at the QR code your host is showing. Works offline.",
+            title = "Scan a QR code",
+            hint = "Point the camera at your host's invite, or at “Add a device” on your other device. Works offline.",
             onResult = { scanning = false; adoptInvite(it, fromUser = true) },
             onClose = { scanning = false })
     }
@@ -271,6 +290,15 @@ fun AuthScreen(onDone: () -> Unit) {
         Text("end-to-end encrypted", color = Color.White.copy(alpha = 0.55f), fontSize = 14.sp)
         Spacer(Modifier.height(22.dp))
 
+        // Build 48: signing in on a new phone is one scan of the QR your other device shows
+        // (Profile → Devices → Add a device). The link field below stays as the fallback.
+        run {
+            Button(onClick = { scanning = true }, modifier = Modifier.fillMaxWidth(), shape = RoundedCornerShape(50)) {
+                Icon(Icons.Filled.QrCodeScanner, null, modifier = Modifier.size(18.dp)); Spacer(Modifier.width(6.dp)); Text("Scan from your other device")
+            }
+            Text("Have a link instead? Paste it below.", color = Color.White.copy(alpha = 0.45f), fontSize = 12.sp)
+            Spacer(Modifier.height(12.dp))
+        }
         // Segmented Create account / Log in.
         SingleChoiceSegmentedButtonRow(Modifier.fillMaxWidth()) {
             SegmentedButton(selected = signup, onClick = { if (!signup && inviteLink.isBlank()) inviteLink = server; signup = true; error = null },

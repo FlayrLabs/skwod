@@ -29,6 +29,7 @@ pub use content::{AbuseReport, GroupDm, ReportReceipt};
 pub use outbox::{OutboxReport, PendingSend};
 pub use upload::{decrypt_attachment_file, PreparedUpload, UploadProgress};
 pub mod p2p;
+pub mod pairing;
 pub use p2p::{p2p_connect, p2p_format_invite, p2p_format_share_link, p2p_parse_invite, P2pInvite, P2pPath, P2pSession, P2pVoiceStats};
 
 #[derive(Debug, thiserror::Error, uniffi::Error)]
@@ -352,6 +353,53 @@ pub struct ContactStatus {
     /// Read it with the rest of this status when the banner is drawn and pass it back to
     /// `accept_identity_change`: only that exact set is accepted.
     pub accept_fingerprint: String,
+}
+
+/// A device that finished QR pairing: its session and its new device id.
+#[derive(uniffi::Record)]
+pub struct PairedDevice {
+    pub session: AuthSession,
+    pub device_id: String,
+}
+
+/// A skwod's p2p address as its server reports it (members only).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct InstanceP2p {
+    pub node_id: String,
+    /// The host's current home relay (allow-listed n0 relays only), if it has one.
+    pub relay_url: Option<String>,
+    /// Whether the host lets new devices pair by QR (`SKWOD_QR_PAIRING`).
+    pub qr_pairing: bool,
+}
+
+/// Burn a QR pairing `offer` on this device and say why.
+fn burn_offer(offer: &pairing::PairingOffer, why: &str) -> CoreError {
+    pairing::PairingGuard::consume(&offer.code);
+    pairing::forget(&offer.code);
+    CoreError::Invalid { detail: why.into() }
+}
+
+/// Where a QR pairing stands on the NEW device ([`SkwodClient::pair_poll`]).
+#[derive(uniffi::Enum)]
+pub enum PairProgress {
+    /// Waiting for the other device to see this one.
+    Waiting,
+    /// The other device has seen this one: show these five emoji until it approves.
+    Confirm { emoji: String },
+    /// Approved: this device is linked and registered.
+    Paired { device: PairedDevice },
+}
+
+/// A device asking to be linked through a QR pairing offer (see `pairing.rs`).
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PairingCandidate {
+    /// The sets to pick from ([`pairing::CHOICES`], shuffled): exactly one is what the new device
+    /// shows. The real one is not marked — the person must read it off the new device.
+    pub choices: Vec<String>,
+    /// The new device's identity key (base64).
+    pub identity_key: String,
+    /// The server's id for the request — pass the whole candidate back unchanged.
+    pub request_id: String,
 }
 
 /// The async network + E2EE client bound into the apps. Methods are UniFFI async; the platform
@@ -839,6 +887,156 @@ impl SkwodClient {
         let ok = self.engine.lock().await.approve_link(&code).await?;
         self.persist().await;
         Ok(ok)
+    }
+
+    // ---- QR pairing (build 48, `pairing.rs`): the existing device mints the code ----
+
+    /// This skwod's p2p address and current home relay (`GET /api/instance/p2p`), for the QR an
+    /// existing device shows. `None` when the skwod has no p2p endpoint.
+    pub async fn instance_p2p(&self) -> Result<Option<InstanceP2p>, CoreError> {
+        let v = self.api.get("/api/instance/p2p").await.map_err(|e| CoreError::Engine { detail: e.to_string() })?;
+        if v["enabled"].as_bool() != Some(true) {
+            return Ok(None);
+        }
+        let Some(node_id) = v["node_id"].as_str().filter(|n| skwod_net::invite::parse_node_id(n).is_ok()) else { return Ok(None) };
+        let relay_url = v["relay_url"].as_str().and_then(skwod_net::invite::is_allowed_relay);
+        let qr_pairing = v["qr_pairing"].as_bool() == Some(true);
+        Ok(Some(InstanceP2p { node_id: node_id.to_string(), relay_url, qr_pairing }))
+    }
+
+    /// On the NEW device, WITHOUT signing in (no password): start pairing with a scanned offer
+    /// (`pairing_qr_decode`), once the person said yes to "Join … as …?". Make this client with
+    /// the loopback base URL of a p2p session to `offer.node_id` and an EMPTY token, and attach
+    /// its cache first (that creates this device's identity). Then poll [`SkwodClient::pair_poll`]:
+    /// the emoji come once the other device has seen this one.
+    pub async fn pair_begin(&self, offer: pairing::PairingOffer, now: u64) -> Result<(), CoreError> {
+        self.require_cache()?;
+        if now > offer.expires_at {
+            return Err(CoreError::Invalid { detail: "this code has expired — make a new one on your other device".into() });
+        }
+        let commitment = pairing::commitment_bytes(&offer.commitment).ok_or_else(|| CoreError::Invalid { detail: "malformed commitment".into() })?;
+        self.engine.lock().await.pair_begin(&offer.code, &offer.user_id, &offer.username, commitment).await?;
+        self.persist().await;
+        Ok(())
+    }
+
+    /// Poll a pairing (pass the same offer): [`PairProgress::Confirm`] with the five emoji once
+    /// the other device has seen this one (its nonce checked against the QR's commitment); then,
+    /// once approved, this device is linked and registered and [`PairProgress::Paired`] carries
+    /// the session the server issued for it (store it as for a log-in). Errors when the pairing
+    /// expired, was refused, or the nonce does not match the QR.
+    pub async fn pair_poll(&self, offer: pairing::PairingOffer) -> Result<PairProgress, CoreError> {
+        let mut engine = self.engine.lock().await;
+        let polled = engine.pair_poll().await;
+        let identity = engine.identity_key();
+        drop(engine);
+        self.persist().await;
+        Ok(match polled? {
+            skwod_sync::PairPoll::Waiting => PairProgress::Waiting,
+            skwod_sync::PairPoll::Revealed(nonce) => PairProgress::Confirm { emoji: pairing::confirm_emoji(&offer.code, &offer.user_id, &identity, &nonce) },
+            skwod_sync::PairPoll::Paired(session, device_id) => PairProgress::Paired {
+                device: PairedDevice {
+                    session: AuthSession {
+                        user_id: session["user_id"].as_str().unwrap_or_default().to_string(),
+                        token: session["token"].as_str().unwrap_or_default().to_string(),
+                        expires_at: session["expires_at"].as_i64().unwrap_or_default(),
+                    },
+                    device_id,
+                },
+            },
+        })
+    }
+
+    /// On the EXISTING device, before showing the QR: register the offer with the server
+    /// (signed by this device). A new device can only ask to pair with a registered offer.
+    pub async fn register_pairing_offer(&self, offer: pairing::PairingOffer) -> Result<(), CoreError> {
+        let expires_ms = i64::try_from(offer.expires_at).unwrap_or(i64::MAX / 2000) * 1000;
+        self.engine.lock().await.register_pair_offer(&offer.code, &offer.username, expires_ms).await?;
+        Ok(())
+    }
+
+    /// On the EXISTING device showing the QR: the device that asked to be linked with this offer,
+    /// if one has, and the sets to pick its emoji from. Approves nothing. `None` while nobody has
+    /// asked yet; an error once the offer expired or was used.
+    ///
+    /// The first time it sees a (proof-verified) request it pins that identity key and releases
+    /// the offer's nonce for it — never for another key: a different key later burns the offer.
+    /// Two devices presenting the offer's code means someone else has it: the server marks the
+    /// offer contested, this burns it and errors — nobody is approved.
+    pub async fn pairing_candidate(&self, offer: pairing::PairingOffer, now: u64) -> Result<Option<PairingCandidate>, CoreError> {
+        pairing::PairingGuard::check(&offer.code, offer.expires_at, now)?;
+        let mut engine = self.engine.lock().await;
+        let Some((user_id, request_id, identity, contested)) = engine.find_pair_request(&offer.code).await? else { return Ok(None) };
+        if contested {
+            return Err(burn_offer(&offer, pairing::TWO_DEVICES));
+        }
+        let nonce = pairing::offer_nonce(&offer.code).ok_or_else(|| CoreError::Invalid { detail: pairing::OFFER_LOST.into() })?;
+        match pairing::pin(&offer.code, &identity) {
+            pairing::Pin::New | pairing::Pin::Same => {}
+            pairing::Pin::Other => return Err(burn_offer(&offer, pairing::TWO_DEVICES)),
+            pairing::Pin::Unknown => return Err(CoreError::Invalid { detail: pairing::OFFER_LOST.into() }),
+        }
+        match engine.reveal_pair(&request_id, &identity, &nonce).await {
+            Ok(()) => {}
+            Err(skwod_sync::EngineError::Client(skwod_sync::ClientError::Status { status: 409, .. })) => return Err(burn_offer(&offer, pairing::TWO_DEVICES)),
+            Err(e) => return Err(e.into()),
+        }
+        drop(engine);
+        let real = pairing::confirm_emoji(&offer.code, &user_id, &identity, &nonce);
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        Ok(Some(PairingCandidate { choices: pairing::choices_for(&offer.code, &real), identity_key: B64.encode(identity), request_id }))
+    }
+
+    /// On the EXISTING device: approve the candidate if `picked` is the set the new device shows.
+    /// A wrong pick denies the request and burns the offer (one try). Single use: the offer can
+    /// approve one device, and none after it expired. Waits about two seconds and checks once
+    /// more that the request is still uncontested and still that device before approving. The
+    /// server refuses a contested offer or any other identity key.
+    pub async fn approve_pairing(&self, offer: pairing::PairingOffer, candidate: PairingCandidate, picked: String, now: u64) -> Result<bool, CoreError> {
+        pairing::PairingGuard::check(&offer.code, offer.expires_at, now)?;
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine as _;
+        let identity = B64.decode(&candidate.identity_key).map_err(|_| CoreError::Invalid { detail: "identity key".into() })?;
+        let nonce = pairing::offer_nonce(&offer.code).ok_or_else(|| CoreError::Invalid { detail: pairing::OFFER_LOST.into() })?;
+        if pairing::pin(&offer.code, &identity) != pairing::Pin::Same {
+            return Err(burn_offer(&offer, pairing::TWO_DEVICES));
+        }
+        let user_id = self.engine.lock().await.user_id().map(str::to_string).ok_or_else(|| CoreError::Invalid { detail: "not signed in".into() })?;
+        if picked != pairing::confirm_emoji(&offer.code, &user_id, &identity, &nonce) {
+            let _ = self.engine.lock().await.deny_pair(&candidate.request_id).await;
+            return Err(burn_offer(&offer, pairing::WRONG_PICK));
+        }
+        if !pairing::PairingGuard::consume(&offer.code) {
+            return Err(CoreError::Invalid { detail: "this code was already used — make a new one".into() });
+        }
+        pairing::forget(&offer.code);
+        // A moment for a racing second request to land, then look again (without holding the
+        // engine for the wait).
+        tokio::time::sleep(std::time::Duration::from_millis(pairing::APPROVE_RECHECK_MS)).await;
+        let mut engine = self.engine.lock().await;
+        match engine.find_pair_request(&offer.code).await? {
+            Some((_, id, key, false)) if id == candidate.request_id && key == identity => {}
+            Some((_, _, _, true)) => return Err(CoreError::Invalid { detail: pairing::TWO_DEVICES.into() }),
+            _ => return Ok(false),
+        }
+        let result = engine.approve_pair(&offer.code, &candidate.request_id, &identity).await;
+        drop(engine);
+        self.persist().await;
+        match result {
+            Ok(()) => Ok(true),
+            Err(skwod_sync::EngineError::Client(skwod_sync::ClientError::Status { status: 409, .. })) => Err(CoreError::Invalid { detail: pairing::TWO_DEVICES.into() }),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// On the EXISTING device: refuse the candidate ("None of these", or "not mine"). The offer
+    /// is burned too.
+    pub async fn deny_pairing(&self, offer: pairing::PairingOffer, candidate: PairingCandidate) -> Result<(), CoreError> {
+        pairing::PairingGuard::consume(&offer.code);
+        pairing::forget(&offer.code);
+        self.engine.lock().await.deny_pair(&candidate.request_id).await?;
+        Ok(())
     }
 
     /// Set, change or remove the registration-lock PIN (`pin = null` removes it; `current_pin` is

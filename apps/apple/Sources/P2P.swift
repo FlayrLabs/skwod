@@ -126,7 +126,12 @@ final class P2PManager: ObservableObject {
         if let pending = inflight[nodeId] { return try await pending.value.baseUrl() }
         if quality[nodeId] == nil || quality[nodeId] == .offline { quality[nodeId] = .connecting }
         let fallback = Self.publicFallback
-        let task = Task { try await p2pConnect(nodeId: nodeId, publicFallback: fallback) }
+        // The home relay from the invite or an earlier session: dial through it at once instead
+        // of waiting for the DHT / n0 lookup (the core ignores it without public fallback).
+        let hint = RelayHintStore.get(nodeId)
+        let task = Task { try await Self.withDeadline(Self.connectDeadline) {
+            try await p2pConnectHinted(nodeId: nodeId, publicFallback: fallback, relayUrl: hint)
+        } }
         inflight[nodeId] = task
         defer { inflight[nodeId] = nil }
         do {
@@ -136,8 +141,19 @@ final class P2PManager: ObservableObject {
             return session.baseUrl()
         } catch {
             quality[nodeId] = .offline
+            // A stale hint only costs a lookup, but the next attempt need not repeat it.
+            RelayHintStore.clear(nodeId)
             throw error
         }
+    }
+
+    /// The core gives up after `p2pConnectTimeoutSecs()` (20 s); this is the app's own backstop
+    /// a little later, so the login screen can never spin forever even if the core stalls.
+    nonisolated static var connectDeadline: Duration { ConnectDeadline.backstop(coreSeconds: p2pConnectTimeoutSecs()) }
+
+    /// Run `body`, or throw `P2PConnectTimeout` once `limit` has passed (see `ConnectDeadline`).
+    nonisolated static func withDeadline<T: Sendable>(_ limit: Duration, _ body: @escaping @Sendable () async throws -> T) async throws -> T {
+        try await ConnectDeadline.run(limit, body)
     }
 
     /// Re-read direct/relayed + latency for one host (cheap; local only).

@@ -53,6 +53,8 @@ pub struct AppState {
     pub lan_key: Arc<std::sync::Mutex<Option<skwod_net::lan::LanKey>>>,
     /// The p2p endpoint's public facts (node id, fallback policy), set once `skwod run` starts it.
     pub p2p: Arc<std::sync::OnceLock<crate::p2p::P2pStatus>>,
+    /// The live p2p endpoint (replaced if p2p is restarted in-process), for its home relay.
+    pub p2p_endpoint: Arc<std::sync::Mutex<Option<skwod_net::Endpoint>>>,
     /// Calls that are ringing right now (one per voice channel, ~45 s), so a device that
     /// connects late — woken by a push — still learns which room to join (`voice.rs`).
     pub rings: crate::voice::Rings,
@@ -83,6 +85,9 @@ pub struct AppState {
     /// install. On from build 45; `SKWOD_REQUIRE_DEVICE_PROOFS=0` turns it off. See
     /// `keydir::destructive_authority`.
     pub require_device_proofs: bool,
+    /// "Add a device" by QR without a password (build 48, `pairing.rs`). OFF unless the operator
+    /// sets `SKWOD_QR_PAIRING=1`, until the client flow has shipped and been reviewed.
+    pub qr_pairing: bool,
     /// How many accounts created with one invite may be unadmitted at once
     /// (`SKWOD_INVITE_PENDING_SIGNUPS`, default 10). See `join.rs`.
     pub invite_pending_signups: i64,
@@ -150,6 +155,7 @@ impl AppState {
             serving: Arc::new(std::sync::atomic::AtomicBool::new(true)),
             lan_key: Arc::default(),
             p2p: Arc::default(),
+            p2p_endpoint: Arc::default(),
             rings: crate::voice::Rings::default(),
             voice_states: crate::voice_state::VoiceStates::default(),
             voice_room_lock: Arc::default(),
@@ -161,6 +167,7 @@ impl AppState {
             message_quota_bytes: env_num::<i64>("SKWOD_MESSAGE_QUOTA_MB").unwrap_or(512).max(0).saturating_mul(1024 * 1024),
             usage: Default::default(),
             require_device_proofs: env_on_by_default("SKWOD_REQUIRE_DEVICE_PROOFS"),
+            qr_pairing: env_off_by_default("SKWOD_QR_PAIRING"),
             require_bound_sessions: env_on_by_default("SKWOD_REQUIRE_BOUND_SESSIONS"),
             invite_pending_signups: env_num::<i64>("SKWOD_INVITE_PENDING_SIGNUPS").unwrap_or(crate::join::DEFAULT_INVITE_PENDING_SIGNUPS).max(1),
             session_ttl_ms: env_num::<i64>("SKWOD_SESSION_TTL_SECS").unwrap_or(30 * 24 * 60 * 60).max(60) * 1000,
@@ -240,6 +247,11 @@ pub fn new_id() -> String {
 
 /// A switch that is ON unless the operator turns it off (`0`, `false`, `no`, `off`). The
 /// in-process test state leaves both strict modes off, so each test opts in by itself.
+/// A switch that is OFF unless the operator turns it on (`1`, `true`, `yes`, `on`).
+fn env_off_by_default(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+}
+
 fn env_on_by_default(name: &str) -> bool {
     match std::env::var(name) {
         Ok(v) => !matches!(v.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off"),

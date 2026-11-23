@@ -34,6 +34,9 @@ pub struct P2pInvite {
     pub join_code: Option<String>,
     /// An `https://` address of the same skwod, if the host has one (VPS). Not used for p2p.
     pub fallback_url: Option<String>,
+    /// The host's home relay when the link was made (`&r=`, allow-listed n0 relays only). Pass it
+    /// to [`p2p_connect_hinted`] so the first dial needs no lookup.
+    pub relay_url: Option<String>,
 }
 
 /// Parse an invite link. Errors with `Invalid` unless it is a well-formed `skwod://join/…` link
@@ -41,7 +44,7 @@ pub struct P2pInvite {
 #[uniffi::export]
 pub fn p2p_parse_invite(link: String) -> Result<P2pInvite, CoreError> {
     let inv = Invite::parse(&link).map_err(net_err)?;
-    Ok(P2pInvite { node_id: inv.node_id.to_z32(), join_code: inv.join_code, fallback_url: inv.fallback_url })
+    Ok(P2pInvite { node_id: inv.node_id.to_z32(), join_code: inv.join_code, fallback_url: inv.fallback_url, relay_url: inv.relay_url })
 }
 
 /// Build an invite link from the host's node id (`GET /api/instance/p2p`) and a join code.
@@ -51,21 +54,24 @@ pub fn p2p_format_invite(node_id: String, join_code: Option<String>) -> Result<S
     Ok(Invite::new(node, join_code.filter(|c| !c.trim().is_empty())).to_string())
 }
 
-/// Build the link people SHARE: `https://skwod.io/join#<node id>[.<join code>][&u=<https url>]`.
+/// Build the link people SHARE: `https://skwod.io/join#<node id>[.<join code>][&u=<https url>][&r=<relay url>]`.
 /// It opens a static page (or, through universal links / app links, the app itself) that hands the
 /// invite to the app. Everything identifying the skwod sits in the URL fragment, which is never
 /// sent to a server. [`p2p_parse_invite`] accepts it, as do builds from 42 on; older builds only
 /// understand the `skwod://` form from [`p2p_format_invite`], which the page forwards to.
-/// `fallback_url` is kept only if it is an `https://` address.
+/// `fallback_url` is kept only if it is an `https://` address; `relay_url` (the host's home relay,
+/// `relay_url` in `GET /api/instance/p2p`) only if it is an allow-listed relay.
 #[uniffi::export]
 pub fn p2p_format_share_link(
     node_id: String,
     join_code: Option<String>,
     fallback_url: Option<String>,
+    relay_url: Option<String>,
 ) -> Result<String, CoreError> {
     let node = skwod_net::invite::parse_node_id(&node_id).map_err(net_err)?;
     let mut invite = Invite::new(node, join_code.map(|c| c.trim().to_string()).filter(|c| !c.is_empty()));
     invite.fallback_url = fallback_url.filter(|u| u.starts_with("https://"));
+    invite.relay_url = relay_url.as_deref().and_then(skwod_net::invite::is_allowed_relay);
     let link = invite.share_link();
     // Never hand out a link we would refuse ourselves (e.g. a code outside the charset).
     Invite::parse(&link).map_err(net_err)?;
@@ -118,16 +124,43 @@ pub(crate) fn session_for(base_url: &str) -> Option<Arc<P2pSession>> {
 /// The member uses a fresh throwaway key per call, so the host cannot link sessions by node id.
 #[uniffi::export(async_runtime = "tokio")]
 pub async fn p2p_connect(node_id: String, public_fallback: bool) -> Result<Arc<P2pSession>, CoreError> {
+    p2p_connect_hinted(node_id, public_fallback, None).await
+}
+
+/// [`p2p_connect`] with the host's home relay from the invite (`P2pInvite::relay_url`) or a
+/// previous session. The hint is used only with `public_fallback` and only if it is an
+/// allow-listed relay; the host is still identified by its key, so a wrong hint costs nothing.
+///
+/// Never hangs: the whole call (endpoint, lookup, dial) is bounded by
+/// [`P2P_CONNECT_TIMEOUT_SECS`] and fails with `Engine { "could not reach the host: timed out" }`.
+#[uniffi::export(async_runtime = "tokio")]
+pub async fn p2p_connect_hinted(node_id: String, public_fallback: bool, relay_url: Option<String>) -> Result<Arc<P2pSession>, CoreError> {
     let node = skwod_net::invite::parse_node_id(&node_id).map_err(net_err)?;
     let mut cfg = NetConfig::member();
     cfg.public_fallback = public_fallback;
-    connect_with(&cfg, EndpointAddr::new(node)).await
+    connect_with(&cfg, skwod_net::invite::dial_addr(node, relay_url.as_deref(), public_fallback)).await
 }
+
+/// Seconds [`p2p_connect`] may take in total before it gives up (the apps add a small margin).
+#[uniffi::export]
+pub fn p2p_connect_timeout_secs() -> u32 {
+    P2P_CONNECT_TIMEOUT_SECS
+}
+pub const P2P_CONNECT_TIMEOUT_SECS: u32 = 20;
 
 /// [`p2p_connect`] with an explicit network configuration / dialing info (tests, same-machine dial).
 pub async fn connect_with(cfg: &NetConfig, host: EndpointAddr) -> Result<Arc<P2pSession>, CoreError> {
-    let member = Member::connect(cfg, host).await.map_err(net_err)?;
-    let proxy = LocalProxy::start(member.clone()).await.map_err(net_err)?;
+    let budget = std::time::Duration::from_secs(P2P_CONNECT_TIMEOUT_SECS.into());
+    let deadline = tokio::time::Instant::now() + budget;
+    let member = Member::connect_within(cfg, host, budget).await.map_err(net_err)?;
+    // The loopback proxy is local and instant, but it is under the same budget all the same.
+    let proxy = match tokio::time::timeout_at(deadline, LocalProxy::start(member.clone())).await {
+        Ok(p) => p.map_err(net_err)?,
+        Err(_) => {
+            let _ = tokio::time::timeout(std::time::Duration::from_secs(3), member.close()).await;
+            return Err(net_err(skwod_net::NetError::Unreachable("timed out".into())));
+        }
+    };
     let session = Arc::new(P2pSession { member, proxy });
     let mut map = sessions().lock().unwrap_or_else(|e| e.into_inner());
     map.retain(|_, s| s.strong_count() > 0);
@@ -194,7 +227,7 @@ mod share_link_tests {
     #[test]
     fn the_share_link_parses_back_to_the_same_invite_as_the_app_link() {
         let node = node_id();
-        let share = p2p_format_share_link(node.clone(), Some("SKWD-AB12-CD34".into()), None).unwrap();
+        let share = p2p_format_share_link(node.clone(), Some("SKWD-AB12-CD34".into()), None, None).unwrap();
         assert_eq!(share, format!("https://skwod.io/join#{node}.SKWD-AB12-CD34"));
         let app = p2p_format_invite(node.clone(), Some("SKWD-AB12-CD34".into())).unwrap();
         assert_eq!(app, format!("skwod://join/{node}#SKWD-AB12-CD34"));
@@ -209,17 +242,56 @@ mod share_link_tests {
     #[test]
     fn the_share_link_keeps_an_https_fallback_and_nothing_else() {
         let node = node_id();
-        let with = p2p_format_share_link(node.clone(), Some("abc".into()), Some("https://chat.example.org".into())).unwrap();
+        let with = p2p_format_share_link(node.clone(), Some("abc".into()), Some("https://chat.example.org".into()), None).unwrap();
         assert_eq!(with, format!("https://skwod.io/join#{node}.abc&u=https://chat.example.org"));
         assert_eq!(p2p_parse_invite(with).unwrap().fallback_url.as_deref(), Some("https://chat.example.org"));
-        let dropped = p2p_format_share_link(node.clone(), Some("  ".into()), Some("http://chat.example.org".into())).unwrap();
+        let dropped = p2p_format_share_link(node.clone(), Some("  ".into()), Some("http://chat.example.org".into()), None).unwrap();
         assert_eq!(dropped, format!("https://skwod.io/join#{node}"));
     }
 
     #[test]
     fn the_share_link_refuses_bad_input() {
-        assert!(matches!(p2p_format_share_link("notakey".into(), None, None), Err(CoreError::Invalid { .. })));
-        assert!(matches!(p2p_format_share_link(node_id(), Some("bad code!".into()), None), Err(CoreError::Invalid { .. })));
+        assert!(matches!(p2p_format_share_link("notakey".into(), None, None, None), Err(CoreError::Invalid { .. })));
+        assert!(matches!(p2p_format_share_link(node_id(), Some("bad code!".into()), None, None), Err(CoreError::Invalid { .. })));
         assert!(matches!(p2p_parse_invite("https://evil.example/join#x.y".into()), Err(CoreError::Invalid { .. })));
+    }
+
+    #[test]
+    fn the_share_link_carries_the_home_relay_only_if_allowed() {
+        let node = node_id();
+        let link = p2p_format_share_link(node.clone(), None, None, Some("https://use1-1.relay.n0.iroh.link./".into())).unwrap();
+        assert_eq!(link, format!("https://skwod.io/join#{node}&r=https://use1-1.relay.n0.iroh.link/"));
+        assert_eq!(p2p_parse_invite(link).unwrap().relay_url.as_deref(), Some("https://use1-1.relay.n0.iroh.link/"));
+        let dropped = p2p_format_share_link(node.clone(), None, None, Some("https://evil.example/".into())).unwrap();
+        assert_eq!(dropped, format!("https://skwod.io/join#{node}"));
+    }
+}
+
+#[cfg(test)]
+mod connect_timeout_tests {
+    use super::*;
+
+    /// An unreachable host (nothing to look up, no relay, no address) fails with a clear error
+    /// inside the budget instead of hanging.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unreachable_host_fails_within_the_budget() {
+        let mut cfg = NetConfig::member();
+        cfg.public_fallback = false;
+        cfg.discovery = skwod_net::Discovery::None;
+        let node = skwod_net::SecretKey::generate().public();
+        let started = std::time::Instant::now();
+        let budget = std::time::Duration::from_secs(3);
+        let err = match Member::connect_within(&cfg, EndpointAddr::new(node), budget).await {
+            Err(e) => e,
+            Ok(_) => panic!("connected to a host that does not exist"),
+        };
+        assert!(started.elapsed() < budget + std::time::Duration::from_secs(2), "took {:?}", started.elapsed());
+        let msg = net_err(err).to_string();
+        assert!(msg.contains("could not reach the host"), "{msg}");
+    }
+
+    #[test]
+    fn the_budget_is_about_twenty_seconds() {
+        assert_eq!(p2p_connect_timeout_secs(), 20);
     }
 }

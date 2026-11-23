@@ -10,7 +10,9 @@ import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import uniffi.skwod_core.P2pSession
-import uniffi.skwod_core.p2pConnect
+import kotlinx.coroutines.withTimeoutOrNull
+import uniffi.skwod_core.p2pConnectHinted
+import uniffi.skwod_core.p2pConnectTimeoutSecs
 
 /** How we are reaching the active skwod right now, in words a person can act on. */
 sealed class ConnectionQuality {
@@ -79,6 +81,9 @@ sealed class ConnectionQuality {
  * network changes (`networkChanged()` is REQUIRED on Android: the QUIC socket does not notice a
  * Wi-Fi ↔ cellular switch by itself).
  */
+/** The host could not be reached in time (the app's backstop; the core normally fails first). */
+class P2PConnectTimeout : Exception("could not reach the host: timed out")
+
 object P2PManager {
     /** Connection state per host key, for the indicator. */
     val quality = mutableStateOf<Map<String, ConnectionQuality>>(emptyMap())
@@ -122,7 +127,14 @@ object P2PManager {
         // instead of flickering to "connecting" every few seconds.
         if (before == null || (before == ConnectionQuality.Offline && !retry)) setQuality(nodeId, ConnectionQuality.Connecting)
         try {
-            val session = p2pConnect(nodeId, AppSettings.get(ctx).publicFallback)
+            // The home relay from the invite (if any) lets the first dial skip the lookup. The
+            // core gives up after ~20 s; this is the app's backstop, so a login can never spin
+            // forever.
+            // withTimeoutOrNull, not withTimeout: a CancellationException would be swallowed by
+            // waiters instead of shown as "couldn't reach your host".
+            val session = withTimeoutOrNull((p2pConnectTimeoutSecs().toLong() + 5) * 1000) {
+                p2pConnectHinted(nodeId, AppSettings.get(ctx).publicFallback, RelayHints.get(nodeId))
+            } ?: throw P2PConnectTimeout()
             synchronized(sessions) { sessions[nodeId] = session }
             lock.withLock { inflight.remove(nodeId) }
             deferred.complete(session)

@@ -123,6 +123,8 @@ async fn http_and_websocket_round_trip_through_the_tunnel() {
     assert_eq!(status, 200);
     assert_eq!(body["node_id"].as_str().unwrap(), w.host.node_id().to_z32());
     assert_eq!(body["public_fallback"], false);
+    // No public fallback: no n0 relay to hint at in share links (build 48).
+    assert!(body["relay_url"].is_null(), "{body}");
     assert_eq!(w.member_send(Method::GET, "/api/instance/p2p", None, None).await.0, 401);
 
     assert_eq!(w.member.path().await.kind, PathKind::Direct);

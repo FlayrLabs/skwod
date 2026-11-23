@@ -629,6 +629,8 @@ final class HostManager: ObservableObject {
               info["enabled"] as? Bool == true, let raw = info["node_id"] as? String,
               let id = HostReliability.validNodeId(raw) else { return }
         if nodeId == nil { nodeId = id }
+        // This Mac's own home relay, for `&r=` in the invites it hands out.
+        RelayHintStore.set(info["relay_url"] as? String, for: id)
     }
 
     /// Everyone in the owner's servers on this Mac's skwod, minus the owner.

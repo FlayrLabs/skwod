@@ -407,6 +407,10 @@ const MAX_PASSWORD: usize = 1024;
 /// Body limit for the auth routes: a name, a password, a join code.
 const AUTH_BODY_LIMIT: usize = 16 * 1024;
 
+pub(crate) fn is_valid_username(u: &str) -> bool {
+    valid_username(u)
+}
+
 fn valid_username(u: &str) -> bool {
     (3..=32).contains(&u.len())
         && u.chars().all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
@@ -426,7 +430,7 @@ pub(crate) fn verify_secret(password: &str, phc: &str) -> bool {
         .unwrap_or(false)
 }
 
-async fn create_session(state: &AppState, user_id: &str) -> Result<SessionResponse, ApiError> {
+pub(crate) async fn create_session(state: &AppState, user_id: &str) -> Result<SessionResponse, ApiError> {
     let mut raw = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut raw);
     let token = hex::encode(raw);

@@ -23,7 +23,7 @@ pub use engine::{
     is_undecryptable, undecryptable_body, DeviceInfo, DeviceState, MemorySentStore, OutgoingRow, ResentMessage, RetryEvent, SentStore, StateSink, SENT_RETENTION_MS, UNDECRYPTABLE_TAG,
 };
 pub use engine::{
-    ChannelDelete, ChannelPage, ChannelPlaintext, DmConversation, DmOp, DmOpKind, Engine, EngineError, EventSink, InboundDm, InboundMessage, InboundReport, InboxOutcome, LoadOutcome, PageCursor, PeerId, Reaction,
-    SecurityNotice, SystemEvent, Traffic, MAX_GROUP_DM, MAX_REPORT_EXCERPT, MAX_TEXT, PAGE, SELF_AUTHOR, SYSTEM_AUTHOR, SYSTEM_TAG,
+    ChannelDelete, ChannelPage, ChannelPlaintext, DmConversation, DmOp, DmOpKind, Engine, EngineError, EventSink, InboundDm, InboundMessage, InboundReport, InboxOutcome, LoadOutcome, PageCursor, PairPoll, PeerId, Reaction,
+    SecurityNotice, SystemEvent, Traffic, MAX_GROUP_DM, MAX_REPORT_EXCERPT, MAX_TEXT, PAGE, PAIR_NONCE_MISMATCH, SELF_AUTHOR, SYSTEM_AUTHOR, SYSTEM_TAG,
 };
 pub use realtime::{RealtimeClient, RtEvent};

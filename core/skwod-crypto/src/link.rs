@@ -26,6 +26,8 @@ use sha2::{Digest, Sha256};
 const LINK_TAG: &[u8] = b"skwod-device-link-v1";
 const REQUEST_TAG: &[u8] = b"skwod-link-request-v1";
 const APPROVAL_TAG: &[u8] = b"skwod-link-approval-v1";
+const CONFIRM_TAG: &[u8] = b"skwod-pair-confirm-v2";
+const COMMIT_TAG: &[u8] = b"skwod-pair-commit-v1";
 
 fn framed(tag: &[u8], parts: &[&[u8]]) -> Vec<u8> {
     let mut out = tag.to_vec();
@@ -270,6 +272,36 @@ pub fn verify_request_proof(code: &str, user_id: &str, new_identity_key: &[u8], 
 /// Existing device → new device: proof that the linker is the device the code was typed into.
 pub fn approval_mac(code: &str, user_id: &str, linker_identity_key: &[u8], new_identity_key: &[u8]) -> Vec<u8> {
     mac(code, &framed(APPROVAL_TAG, &[user_id.as_bytes(), linker_identity_key, new_identity_key]))
+}
+
+/// The short check both devices show during a QR pairing (build 48): five 6-bit indices (30 bits,
+/// into an emoji table) derived from the link code, the account, the NEW device's identity key and
+/// the existing device's commit-then-reveal `nonce`.
+///
+/// The nonce is what makes 30 bits enough. The QR carries only [`pair_commitment`] of it, and the
+/// existing device releases it after the server holds the requester's key and the existing device
+/// has seen that key. Someone with the code (a photographed QR) and the server can no longer grind
+/// an identity key whose emoji match the real device's: the key is fixed before the nonce exists
+/// for them, so each attempt is one 2^-30 guess, and the offer allows one.
+pub fn pair_confirm_indices(code: &str, user_id: &str, new_identity_key: &[u8], nonce: &[u8]) -> [u8; 5] {
+    let m = mac(code, &framed(CONFIRM_TAG, &[user_id.as_bytes(), new_identity_key, nonce]));
+    [m[0] & 63, m[1] & 63, m[2] & 63, m[3] & 63, m[4] & 63]
+}
+
+/// The commitment to a pairing nonce that the QR carries (16 bytes): binding (the server cannot
+/// find another nonce for it) and hiding (the QR says nothing about the nonce).
+pub fn pair_commitment(code: &str, nonce: &[u8]) -> [u8; 16] {
+    let d = Sha256::digest(framed(COMMIT_TAG, &[normalize_code(code).as_bytes(), nonce]));
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&d[..16]);
+    out
+}
+
+/// The id a QR pairing offer is known by on the server (build 48): a hash of its code, so the
+/// server learns nothing that would let it make a request proof.
+pub fn pair_offer_id(code: &str) -> String {
+    let d = Sha256::digest(framed(b"skwod-pair-offer-v1", &[normalize_code(code).as_bytes()]));
+    d[..16].iter().map(|b| format!("{b:02x}")).collect()
 }
 
 pub fn verify_approval_mac(code: &str, user_id: &str, linker_identity_key: &[u8], new_identity_key: &[u8], tag: &[u8]) -> bool {

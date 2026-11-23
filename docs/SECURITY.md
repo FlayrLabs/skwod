@@ -204,6 +204,98 @@ not let a token holder replay it or swap the payload. Reading the encrypted back
 blob still needs only the token — that is what makes recovery on a new device possible — which is
 why its passphrase must withstand offline guessing.
 
+### Adding a device by QR (build 48)
+
+The same linking, with the code going the other way, and **no password on the new device**.
+A device already on the account shows a QR (Profile → Devices → Add a device):
+`skwod-pair:1:<node id>.<relay region|->.<username>.<user id>.<code>.<expires>.<commitment>`
+(`core/skwod-core/src/pairing.rs`, strictly versioned and parsed). The server side is
+`server/src/pairing.rs`; its tests are `server/src/pairing_tests.rs`, and
+`core/skwod-core/tests/linked_devices_live.rs` runs the whole exchange against a real server.
+
+- **Off unless the host turns it on.** The routes answer 404 unless the operator sets
+  `SKWOD_QR_PAIRING=1`; `GET /api/instance/p2p` reports it as `qr_pairing`, and the apps offer
+  "Add a device" / "Scan from your other device" only when it is on.
+- **The QR is not a credential, and never a reason to type a password.** Anyone can print one,
+  so it might name a host and an account the person never chose. The new device therefore asks
+  for nothing secret. Before it dials anything it asks **"Join <skwod> as @<username>?"**, naming
+  the skwod only by a workspace this device already has, otherwise by the host's short key (never
+  by a name from the QR or the host), and saying that a code from someone else would add this
+  device to *their* account. Only on Continue does it dial the node id (the transport proves the
+  host holds that key) and open its encrypted store. Cancel, denial or expiry delete the store
+  and key it created.
+- **What a forged QR can still do (the residual).** Someone who hands the person a QR of their
+  own (their host, their account, their offer) can approve the resulting request on their own
+  device. The new device then joins **the attacker's account**: it holds nothing of the person's
+  (no keys, contacts or messages of the person's account ever reach it), but whatever the person
+  goes on to type there is the attacker's to read. The two questions are the defence: "Join … as
+  …?" before dialling, and **"Approved on your other device · <host short key>"** before entering,
+  so a host or account the person does not recognise can be cancelled (Cancel there deletes the
+  local store; the device row the attacker's server created is left with nothing behind it).
+- **Only offers the existing device registered can be asked for.** Before showing the QR the
+  existing device registers the offer with a device-signed `POST /api/e2ee/pair-offers` (offer id
+  = a hash of the QR's code, the username, an expiry the server stores as at most 5 minutes; a
+  minute of clock skew is cut back, not refused). The new device's session-less
+  `POST /api/e2ee/pair-requests` (offer id, username, identity key, an HMAC under the code, the
+  hash of a poll secret only it knows) is stored only for a registered, unexpired, unconsumed
+  offer for that username. Anything else gets an identical 200 with a decoy request id that never
+  completes, and nothing is stored: no oracle for usernames or offers, and nobody without the QR
+  can fill an account's requests or block its pairing.
+- **Its own table.** Pair requests live in `device_pair_requests` (migrations 0019, 0020), not in
+  `device_link_requests`: nothing in the typed-code `/link-requests` flow can list, approve or
+  replace one.
+- **Commit, then reveal.** The QR carries a 128-bit commitment (`skwod_crypto::link::pair_commitment`)
+  to a 32-byte nonce that stays inside the existing device's core. When that device first reads a
+  request whose proof verifies, it **pins** the requester's identity key and only then releases
+  the nonce for exactly that key (`POST …/:id/reveal`, once; a different nonce or key is refused,
+  and a different key showing up later burns the offer on the device). The claim hands the nonce
+  to the request's own (key- and secret-proving) device, which checks it against the QR's
+  commitment and stops if it does not match.
+- **Five emoji, picked among decoys.** Both devices compute five emoji (30 bits) as an HMAC under
+  the code over the account, the requester's key and the nonce
+  (`skwod_crypto::link::pair_confirm_indices`). Because the key is fixed before the nonce exists for
+  anyone but the existing device, someone holding the code (a photographed QR) **and** the server
+  can no longer grind a key until its emoji match: each attempt is a single 2^-30 guess, and the
+  offer allows one. The existing device does not show the real set to approve with a tap: it shows
+  **four sets** (one real, three random decoys that each differ from it in at least two places,
+  shuffled, stable for the offer) and the person picks the one the new device shows, or "None of
+  these". A wrong pick denies the request and burns the offer. A right pick waits about two
+  seconds, checks once more that the request is uncontested and still that key, and approves only
+  that identity key (its link signature over the key is verified by the server, which also refuses
+  an approval before the reveal). Residual: if someone who photographed the QR is the only one to
+  ask (the person has not scanned it yet), the person has no new device to read from and should
+  choose "None of these"; a blind pick would still be right 1 time in 4.
+- **Two devices presenting one code: nobody is approved.** A second request for the same offer
+  never replaces the first; it silently marks the offer contested (and consumed), and a contested
+  offer is never revealed, approved or claimed. The existing device then says "Someone else also
+  scanned this code…".
+- **The session goes only to the approved key, and is never left loose.** After approval the new
+  device claims ONE session (`POST /api/e2ee/pair-requests/:id/claim`), signing with the approved
+  identity key over the request, the offer and the poll secret; the poll secret alone gets nothing.
+  The session is created first and the row is claimed and records it in one conditional UPDATE; a
+  claim that loses deletes its session. Registering the device takes the row in its own
+  transaction with one conditional UPDATE (uncontested, claimed, not yet registered, by that very
+  session, offer unexpired) and refuses otherwise; binding fails if the session is gone. A session
+  claimed but not yet registered is **revoked** when the request is contested or expires. The link
+  bundle stays sealed to the new device's identity key and authenticated under the code, exactly
+  as for a typed code.
+- **Consumed, expiring, single use.** The server consumes the offer on approve, deny, contest and
+  register; register marks the request instead of deleting it, so a later request for the same
+  offer opens nothing. Every step (read by offer, reveal, approve, claim, register) checks the
+  offer's own expiry. Contested, denied and expired are told only to the request's own
+  key-proving device. The new device refuses an expired offer (or one claiming a longer life), and
+  the existing device refuses to look up or approve with it after the expiry or after one use.
+  Pairing raises no "a device wants to join" alert.
+- **Rate limits.** The session-less create is gated like signup and login: over p2p it needs a
+  proof-of-work stamp (the app's local proxy attaches it), then per-caller and per-population
+  limits. The claim is polled every couple of seconds, so it asks no work: a per-caller window,
+  then the cheap check (the 256-bit poll secret matches) before anything else, then a ceiling of
+  60 signature checks a minute **per request** — only the request's holder can reach it, so a
+  flood of wrong guesses never blocks the real device. Deny needs a session bound to a current
+  device and is limited per account; offer registration, reveal and reads are limited per account.
+- **Platforms.** iOS and Android scan with the camera. The Mac shows the QR and can read one from
+  an image; it has no camera scan.
+
 ## Key backup (opt-in)
 
 Signal protects PIN recovery with an enclave that rate-limits guesses. A self-hosted server has no

@@ -23,6 +23,7 @@ import LiveKit
 /// |---|---|
 /// | `SKWOD_E2E_USER`, `SKWOD_E2E_PASSWORD` | once an invite is in the connect form, fill these in and submit (after `SKWOD_E2E_DELAY` s, default 4) |
 /// | `SKWOD_E2E_INVITE` | adopt this invite at launch (same code path as a pasted link) |
+/// | `SKWOD_E2E_PAIR_QR` | adopt this "Add a device" QR text at launch, as if scanned (the Simulator has no camera), answer "Continue" on the "Join … as …?" and "Approved on your other device" screens a second after each appears; the pairing's phases (`join`, `connecting`, `waiting`, `confirm` + `emoji`, `approved`, `finishing`, `done`, `failed`) go to `<out>/pair.json` |
 /// | `SKWOD_E2E_SPACE` | after sign-in, create a server with this name if there is none |
 /// | `SKWOD_E2E_MINT` | `token` or `code`: mint an invite and write the link to `SKWOD_E2E_OUT`/invite.txt |
 /// | `SKWOD_E2E_AUTOAPPROVE` | `1`: approve + provision every pending join request |
@@ -134,6 +135,29 @@ enum E2E {
 
     @MainActor static func sawJoinRequest(serverId: String, waiting: Int) {
         joinRequests.append(["server_id": serverId, "waiting": waiting, "at": Int(Date().timeIntervalSince1970 * 1000)])
+    }
+
+    /// The raw error behind the last failed pairing, for `pair.json` (the screen shows friendly text).
+    @MainActor static var pairingErrorDetail: String?
+
+    /// Where the new device's QR pairing stands (`<out>/pair.json`).
+    @MainActor static func notePairing(_ phase: NewDevicePairing.Phase) {
+        var state: [String: Any] = ["at": Int(Date().timeIntervalSince1970 * 1000)]
+        if let detail = pairingErrorDetail { state["detail"] = detail }
+        switch phase {
+        case .join: state["phase"] = "join"
+        case .connecting: state["phase"] = "connecting"
+        case .waiting: state["phase"] = "waiting"
+        case .confirm(let emoji): state["phase"] = "confirm"; state["emoji"] = emoji
+        case .approved: state["phase"] = "approved"
+        case .finishing: state["phase"] = "finishing"
+        case .done: state["phase"] = "done"
+        case .failed(let why): state["phase"] = "failed"; state["error"] = why
+        }
+        try? FileManager.default.createDirectory(at: outDir, withIntermediateDirectories: true)
+        if let data = try? JSONSerialization.data(withJSONObject: state, options: [.prettyPrinted, .sortedKeys]) {
+            try? data.write(to: outDir.appendingPathComponent("pair.json"), options: .atomic)
+        }
     }
 
     @MainActor static func noteInviteCheck(valid: Bool, reason: String?, requiresApproval: Bool) {

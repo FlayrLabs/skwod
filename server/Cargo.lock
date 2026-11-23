@@ -4726,7 +4726,7 @@ dependencies = [
 
 [[package]]
 name = "skwod-crypto"
-version = "0.0.0"
+version = "0.48.0"
 dependencies = [
  "aes 0.8.4",
  "argon2",
@@ -4750,7 +4750,7 @@ dependencies = [
 
 [[package]]
 name = "skwod-net"
-version = "0.0.0"
+version = "0.48.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -4772,7 +4772,7 @@ dependencies = [
 
 [[package]]
 name = "skwod-server"
-version = "0.0.0"
+version = "0.48.0"
 dependencies = [
  "argon2",
  "axum",

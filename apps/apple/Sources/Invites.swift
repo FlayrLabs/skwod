@@ -30,6 +30,44 @@ struct ParsedInvite: Equatable {
     let address: SkwodAddress
     /// The join code, if the link carried one.
     let joinCode: String?
+    /// The host's home relay from the link (`&r=`, allow-listed by the core), if it carried one.
+    var relayHint: String? = nil
+}
+
+/// The last known home relay of each p2p host, by node id. Learned from invites (`&r=`) and from
+/// `GET /api/instance/p2p`; used to dial a host at once (no lookup) and put into the share links
+/// this device hands out. Only allow-listed relay URLs are kept (the core checks), and a relay URL
+/// is not a secret: it names one of n0's public relays, never the host's IP. In memory only: a
+/// host's home relay can change, and a stale hint should not outlive the launch that learned it.
+enum RelayHintStore {
+    private static let lock = NSLock()
+    nonisolated(unsafe) private static var hints: [String: String] = [:]
+
+    static func get(_ nodeId: String) -> String? {
+        lock.lock(); defer { lock.unlock() }
+        return hints[nodeId]
+    }
+
+    /// Keep `relay` for `nodeId` if the core accepts it as an allow-listed relay; anything else
+    /// is ignored.
+    static func set(_ relay: String?, for nodeId: String) {
+        guard let relay, let checked = allowed(relay, nodeId: nodeId) else { return }
+        lock.lock(); defer { lock.unlock() }
+        hints[nodeId] = checked
+    }
+
+    /// Forget the hint for `nodeId` (a dial through it failed).
+    static func clear(_ nodeId: String) {
+        lock.lock(); defer { lock.unlock() }
+        hints[nodeId] = nil
+    }
+
+    /// The canonical relay URL if the core's invite grammar keeps it (one rule, in Rust).
+    static func allowed(_ relay: String, nodeId: String) -> String? {
+        guard let link = try? p2pFormatShareLink(nodeId: nodeId, joinCode: nil, fallbackUrl: nil, relayUrl: relay),
+              let inv = try? p2pParseInvite(link: link) else { return nil }
+        return inv.relayUrl
+    }
 }
 
 enum InviteError: LocalizedError, Equatable {
@@ -79,7 +117,7 @@ enum InviteLink {
             if let code = inv.joinCode, !isValidCode(code) { throw InviteError.badCode }
             // The core already drops non-https fallbacks; re-check here so the rule is visible.
             let fallback = inv.fallbackUrl.flatMap { try? normalizedServer($0, allowLoopbackHTTP: false) }
-            return ParsedInvite(address: .p2p(nodeId: inv.nodeId, fallbackURL: fallback), joinCode: inv.joinCode)
+            return ParsedInvite(address: .p2p(nodeId: inv.nodeId, fallbackURL: fallback), joinCode: inv.joinCode, relayHint: inv.relayUrl)
         }
 
         // Classic `<address>#<code>` (VPS hosts), or a bare address for log-in.
@@ -135,11 +173,15 @@ enum InviteLink {
         host == "127.0.0.1" || host == "localhost" || host == "::1" || host == "[::1]"
     }
 
-    /// Build the link people share: `https://skwod.io/join#<node>[.<code>][&u=https://…]`.
+    /// Build the link people share: `https://skwod.io/join#<node>[.<code>][&u=https://…][&r=<relay>]`.
     /// Use this for Copy, Share and QR codes. Builds ≤ 41 cannot parse it when pasted, but the
-    /// page it opens forwards to the `skwod://` form, which they handle.
-    static func shareLink(nodeId: String, joinCode: String?, fallbackURL: String? = nil) -> String? {
-        guard let link = try? p2pFormatShareLink(nodeId: nodeId, joinCode: joinCode, fallbackUrl: fallbackURL)
+    /// page it opens forwards to the `skwod://` form, which they handle. The host's home relay
+    /// (`RelayHintStore`) rides along so a new device can dial without a lookup; builds ≤ 47
+    /// ignore it.
+    static func shareLink(nodeId: String, joinCode: String?, fallbackURL: String? = nil,
+                          relayURL: String? = nil) -> String? {
+        let relay = relayURL ?? RelayHintStore.get(nodeId)
+        guard let link = try? p2pFormatShareLink(nodeId: nodeId, joinCode: joinCode, fallbackUrl: fallbackURL, relayUrl: relay)
         else { return nil }
         // Round-trip through the parser so we never hand out a link we would refuse ourselves.
         return (try? parse(link)) != nil ? link : nil

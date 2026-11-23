@@ -24,7 +24,22 @@ sealed class SkwodAddress {
 }
 
 /** An invite (or a bare address) after validation. */
-data class ParsedInvite(val address: SkwodAddress, val joinCode: String?)
+data class ParsedInvite(val address: SkwodAddress, val joinCode: String?, val relayHint: String? = null)
+
+/**
+ * The last known home relay of each p2p host (`&r=` in a link, or `relay_url` from
+ * `GET /api/instance/p2p`). Used to dial a host at once without a lookup, and put into the links
+ * this device shares. Only allow-listed relays ([InviteLink.allowedRelay]) are ever stored; a relay
+ * URL names one of n0's public relays, never the host's IP. In memory: a hint is an optimisation,
+ * and the DHT / n0 lookup still finds the host without it.
+ */
+object RelayHints {
+    private val hints = java.util.concurrent.ConcurrentHashMap<String, String>()
+    fun get(nodeId: String): String? = hints[nodeId]
+    fun set(nodeId: String, relay: String?) {
+        InviteLink.allowedRelay(relay ?: return)?.let { hints[nodeId] = it }
+    }
+}
 
 class InviteException(val reason: Reason) : Exception(reason.message) {
     enum class Reason(val message: String) {
@@ -161,7 +176,27 @@ object InviteLink {
                 else try { normalizedServer(value, allowLoopbackHttp = false) } catch (_: InviteException) { null }
             break
         }
-        return ParsedInvite(SkwodAddress.P2p(nodeId, fallback), code)
+        // `r=`: the host's home relay (build 48). Allow-listed n0 relays only; anything else is
+        // dropped. Remembered so the dial goes straight through it.
+        val relay = query.split('&').firstOrNull { it.startsWith("r=") }?.substring(2)?.let { allowedRelay(it) }
+        if (relay != null) RelayHints.set(nodeId, relay)
+        return ParsedInvite(SkwodAddress.P2p(nodeId, fallback), code, relay)
+    }
+
+    /**
+     * `https://<host>/` (lowercase, no trailing dot) if [url] names an allow-listed relay
+     * (`*.relay.n0.iroh.link`) with no port, path, query or credentials; else null. Same rule as
+     * `is_allowed_relay` in core/skwod-net/src/invite.rs and RELAY in the website's invite.js.
+     */
+    fun allowedRelay(url: String): String? {
+        if (!url.startsWith("https://", ignoreCase = true)) return null
+        val host = url.substring(8).removeSuffix("/").removeSuffix(".").lowercase()
+        if (host.isEmpty() || host.length > 253) return null
+        if (!host.all { it in 'a'..'z' || it in '0'..'9' || it == '-' || it == '.' }) return null
+        if (host.split('.').any { it.isEmpty() || it.length > 63 || it.startsWith('-') || it.endsWith('-') }) return null
+        val suffix = ".relay.n0.iroh.link"
+        if (host.length <= suffix.length || !host.endsWith(suffix)) return null
+        return "https://$host/"
     }
 
     /** Join codes are server-minted: `SKWD-XXXX-XXXX`, or a URL-safe token. */
@@ -197,10 +232,11 @@ object InviteLink {
      * Use this for Copy, Share and QR codes. Builds ≤ 41 cannot parse it when pasted, but the
      * page it opens forwards to the `skwod://` form, which they handle.
      */
-    fun shareLink(nodeId: String, joinCode: String?, fallbackUrl: String? = null): String? {
+    fun shareLink(nodeId: String, joinCode: String?, fallbackUrl: String? = null, relayUrl: String? = RelayHints.get(nodeId)): String? {
         var link = "$SHARE_ORIGIN$SHARE_PATH#$nodeId"
         if (!joinCode.isNullOrEmpty()) link += ".$joinCode"
         if (fallbackUrl != null && fallbackUrl.startsWith("https://")) link += "&u=$fallbackUrl"
+        relayUrl?.let { allowedRelay(it) }?.let { link += "&r=$it" }
         // Round-trip through the parser so we never hand out a link we would refuse ourselves.
         return try { parse(link); link } catch (_: InviteException) { null }
     }

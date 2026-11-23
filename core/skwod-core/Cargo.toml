@@ -15,11 +15,11 @@ name = "skwod_core"
 workspace = true
 
 [dependencies]
-skwod-crypto = { path = "../skwod-crypto", version = "0.0.0" }
-skwod-sync = { path = "../skwod-sync", version = "0.0.0" }
-skwod-net = { path = "../skwod-net", version = "0.0.0" }   # p2p transport (iroh): host addressed by its key
+skwod-crypto = { path = "../skwod-crypto", version = "0.48.0" }
+skwod-sync = { path = "../skwod-sync", version = "0.48.0" }
+skwod-net = { path = "../skwod-net", version = "0.48.0" }   # p2p transport (iroh): host addressed by its key
 uniffi = { version = "0.28", features = ["tokio", "cli"] }
-tokio = { version = "1", features = ["sync", "rt-multi-thread"] }
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "time"] }
 thiserror = "1"
 hex = "0.4"
 base64 = "0.22"

@@ -1599,7 +1599,7 @@ checksum = "3a219298ac11a56ea9a6d2120044824d6f01aeb034955e7af7bc16858527deea"
 
 [[package]]
 name = "skwod-host"
-version = "0.0.0"
+version = "0.48.0"
 dependencies = [
  "ctrlc",
  "getrandom 0.3.4",

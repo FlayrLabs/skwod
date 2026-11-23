@@ -798,3 +798,32 @@ Bindings must be regenerated (`build-core.sh`) for four additions.
   server's word, so an admin counts only when listed as a member, not held (`held_members`) and not
   blocked. The iOS notification extension gets the resulting ids per channel from the app (in the
   sender sets, key `everyone:channel:<id>`); it asks the server nothing about roles.
+
+## Build 48 — p2p connect never hangs; relay hint in links
+
+| Function | What changed |
+|---|---|
+| `p2p_connect_hinted(node_id, public_fallback, relay_url)` *free, new* | `p2p_connect` plus the host's home relay (`P2pInvite.relay_url`). The hint is dialed only with `public_fallback` and only if it is an allow-listed n0 relay. |
+| `p2p_connect(node_id, public_fallback)` *free* | Same signature. The WHOLE call (bind, lookup, dial, admission proof, loopback proxy start) is now bounded by 20 s and fails with `Engine { "could not reach the host: timed out" }`. A failed endpoint is closed off the caller's path. |
+| `p2p_connect_timeout_secs() -> u32` *free, new* | The budget above, for the apps' own backstop timer. |
+| `p2p_format_share_link(node_id, join_code, fallback_url, relay_url)` *free* | **New 4th argument** `relay_url`: kept as `&r=` only if allow-listed (`*.relay.n0.iroh.link`). |
+| `P2pInvite.relay_url` | New field: the `&r=` / `?r=` hint, or `None`. |
+| `GET /api/instance/p2p` (server) | Adds `relay_url`: the host's current home relay (only with public fallback, only allow-listed). |
+
+## Build 48 — "Add a device" by QR (`pairing.rs`, docs/SECURITY.md "Adding a device by QR")
+
+| Function | What it does |
+|---|---|
+| `pairing_new_offer(node_id, relay_url, username, user_id, now)` *free, new* | Existing device: a fresh offer (new 80-bit link code, expires `now + 300`, and `commitment`: 32 hex chars committing to a nonce kept inside this process's core). `PairingOffer` has a `commitment` field. |
+| `pairing_qr_encode(offer)` / `pairing_qr_decode(text, now)` *free, new* | The strict, versioned QR text `skwod-pair:1:…` (seven fields, the last the commitment); decode refuses expired / over-long offers. |
+| `pairing_offer_link(offer)` *free, new* | The share link (node id + relay hint) to dial the host. |
+| `SkwodClient.instance_p2p() -> InstanceP2p?` *new* | `GET /api/instance/p2p`: node id, current home relay, and `qr_pairing` (the host set `SKWOD_QR_PAIRING=1`). Offer QR pairing only when `qr_pairing` is true. |
+| `SkwodClient.register_pairing_offer(offer)` *new* | Existing device, BEFORE showing the QR: registers the offer (device-signed). A new device can only pair with a registered offer. |
+| `SkwodClient.pair_begin(offer, now)` *new* | New device, NO session (client made with the p2p loopback base URL and an empty token, cache attached first), only after the person said yes to "Join … as …?": opens a session-less pair request. Returns nothing: the emoji come from `pair_poll`. |
+| `SkwodClient.pair_poll(offer) -> PairProgress` *new* | New device: `Waiting`; `Confirm { emoji }` (five) once the existing device revealed its nonce (checked against the offer's commitment); `Paired { device }` once approved — ONE session claimed (signed by its identity key), linked and registered. Show "Approved on your other device · <short key>" before signing in with `device.session`. Errors when the offer expired, was denied or contested, or the nonce does not match ("did not match"). `PairedDevice { session, device_id }`. |
+| `SkwodClient.pairing_candidate(offer, now) -> PairingCandidate?` *new* | Existing device: `PairingCandidate { choices, identity_key, request_id }` — four shuffled five-emoji sets, one real, stable per offer — approving nothing; `None` while nobody has asked. The first call that sees a request pins its key and reveals the nonce for it. Errors once expired / used, when the offer is contested, when another key appears after the reveal, or when the app restarted since making the offer (the nonce is gone: make a new code). |
+| `SkwodClient.approve_pairing(offer, candidate, picked, now) -> bool` *new* | Existing device: `picked` is the set the person chose. A wrong pick denies the request and burns the offer (error). A right one waits ~2 s, re-checks the request is uncontested and the same key, then approves. Single use, refused after expiry or when contested. |
+| `SkwodClient.deny_pairing(offer, candidate)` *new* | Existing device ("None of these"): refuse the candidate; the offer is burned. Needs a session bound to this device (the core binds first). |
+| Server `POST /api/e2ee/pair-offers` (device-signed), `POST /api/e2ee/pair-requests` (no session), `GET /api/e2ee/pair-requests/by-offer/:offer_id`, `POST …/:id/reveal` (bound session; the nonce for the key seen, once), `POST …/:id/approve` (only after the reveal), `DELETE …/:id` (deny; bound session, limited), `POST …/:id/claim` (signed by the request's identity key; carries the nonce once revealed) | All 404 unless `SKWOD_QR_PAIRING=1`. An unknown / expired / consumed / other-username offer gets a decoy request id and nothing is stored. Offers are stored for at most 5 minutes and consumed on approve, deny, contest and register; every step checks the offer's expiry; a claimed but unregistered session is revoked on contest or expiry. Migration 0019 adds `device_pair_offers` and `device_pair_requests` (separate from `device_link_requests`); 0020 adds `consumed`, `nonce`, `registered`, `session_hash`. |
+| p2p proxy (`skwod-net/src/proxy.rs`) | Also stamps `POST /api/e2ee/pair-requests` with proof of work, as for signup/login (the host answers 428 without it). The polled `…/claim` is not stamped; the host asks no work for it. |
+| Apps | Apple: `NewDevicePairing.swift` (join question → waiting → five emoji → approved → enter), `PairingViews.swift` (pick among four, "None of these"), `PairingCopy.swift`; `signIn(…, pairedLocalId:)`. Android: `AppModel.pairingStart/pairingPoll/pairingEnter/pairingDrop`, `adopt(…, pairedLocalId)`, `PairNewDeviceDialog`, `AddDeviceDialog`, `PairingCopy.kt`. The Mac reads a QR from an image (no camera scan). |

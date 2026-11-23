@@ -60,6 +60,7 @@ fun DevicesDialog(onClose: () -> Unit) {
     var markingLost by remember { mutableStateOf<uniffi.skwod_core.ErasedDevice?>(null) }
     // Devices a backup restore brought back that no other device has confirmed yet (audit M2).
     var unconfirmed by remember { mutableStateOf<List<String>>(emptyList()) }
+    var addingByQr by remember { mutableStateOf(false) }
     var linking by remember { mutableStateOf(false) }
     val revision = model.account.revision.intValue
     val requests = model.linkRequests.intValue
@@ -93,6 +94,7 @@ fun DevicesDialog(onClose: () -> Unit) {
     }
 
     if (linking) { DeviceLinkApproveDialog { linking = false; scope.launch { load() } }; return }
+    if (addingByQr) { AddDeviceDialog { addingByQr = false; scope.launch { load() } }; return }
 
     Dialog(onDismissRequest = onClose) {
         Surface(color = GlassDialogTone, shape = RoundedCornerShape(20.dp)) {
@@ -147,6 +149,12 @@ fun DevicesDialog(onClose: () -> Unit) {
                 }
                 if (message.isNotEmpty()) { Spacer(Modifier.height(6.dp)); Text(message, color = Warn, style = MaterialTheme.typography.labelSmall) }
                 Spacer(Modifier.height(12.dp))
+                // Build 48: the new device scans a QR shown here — nothing to type or paste.
+                run {
+                    Button(enabled = !busy && loaded && !DeviceRows.atLimit(rows.size, max), onClick = { addingByQr = true }, modifier = Modifier.fillMaxWidth()) {
+                        Text("Add a device")
+                    }
+                }
                 OutlinedButton(enabled = !busy && loaded && !DeviceRows.atLimit(rows.size, max), onClick = { linking = true }, modifier = Modifier.fillMaxWidth()) {
                     Text(if (requests > 0) "Link a device… (a device is waiting)" else "Link a device…")
                 }

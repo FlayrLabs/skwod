@@ -1606,6 +1606,95 @@ class AppModel private constructor(private val ctx: Context) {
         return adopt(s, address, base, username = username.trim().lowercase())
     }
 
+    /**
+     * The NEW device's QR pairing (build 48), between [pairingStart] and success or [pairingDrop].
+     * No password at any point (docs/SECURITY.md "Adding a device by QR").
+     */
+    class PairingRun internal constructor(
+        val offer: uniffi.skwod_core.PairingOffer,
+        internal val address: SkwodAddress,
+        internal val base: String,
+        internal val localId: String,
+        internal var client: uniffi.skwod_core.SkwodClient?,
+    ) {
+        /** Set once approved: the session the server issued, used by [pairingEnter]. */
+        internal var paired: uniffi.skwod_core.PairedDevice? = null
+    }
+
+    /** One poll of a QR pairing on the new device. */
+    sealed class PairStep {
+        object Waiting : PairStep()
+        data class Confirm(val emoji: String) : PairStep()
+        /** Approved: say so (with the host's key) before [pairingEnter]. */
+        object Approved : PairStep()
+    }
+
+    /**
+     * Dial the host by its node id, set up this device's store under the workspace id it will
+     * keep, and open a session-less pair request. Call only after the person said yes to "Join …
+     * as …?". The emoji come from [pairingPoll] once the other device has seen this one.
+     */
+    suspend fun pairingStart(offer: uniffi.skwod_core.PairingOffer): PairingRun {
+        if (!workspacesLoaded) {
+            workspaces = loadWorkspaces() ?: throw IllegalStateException("Couldn't read this phone's secure storage. Close Skwod and open it again.")
+            workspacesLoaded = true
+        }
+        if (workspaces.any { it.nodeId == offer.nodeId && it.userId == offer.userId && !it.isSignedOut }) {
+            throw IllegalStateException("This account is already on this device.")
+        }
+        RelayHints.set(offer.nodeId, offer.relayUrl)
+        val address = SkwodAddress.P2p(offer.nodeId, null)
+        val base = dial(address)
+        val localId = workspaces.firstOrNull { it.nodeId == offer.nodeId && it.userId == offer.userId }?.localId
+            ?: WorkspaceMatch.newLocalId(workspaces, address, offer.userId)
+        val file = InstanceIds.cacheFileName(localId) ?: throw IllegalStateException("workspace id is not a file name")
+        val probe = Workspace(address.stored, offer.userId, "", 0, "", localId = localId, nodeId = offer.nodeId)
+        val key = cacheKeyHex(probe) ?: throw IllegalStateException("Skwod couldn't set up its encrypted storage. Try again.")
+        val c = uniffi.skwod_core.SkwodClient(base, "")
+        val run = PairingRun(offer, address, base, localId, c)
+        try {
+            c.attachCache(File(ctx.filesDir, file).absolutePath, key)
+            uniffi.skwod_core.fetchServerIdentity(base).let { c.setPinnedServerKey(it.serverPublic) }
+            c.pairBegin(offer, (System.currentTimeMillis() / 1000).toULong())
+            return run
+        } catch (e: Exception) {
+            pairingDrop(run)
+            throw e
+        }
+    }
+
+    /** One poll: waiting, the emoji to show, or approved (this device is linked and registered). */
+    suspend fun pairingPoll(run: PairingRun): PairStep {
+        if (run.paired != null) return PairStep.Approved
+        val c = run.client ?: return PairStep.Waiting
+        return when (val p = try { c.pairPoll(run.offer) } catch (e: Exception) { pairingDrop(run); throw e }) {
+            is uniffi.skwod_core.PairProgress.Waiting -> PairStep.Waiting
+            is uniffi.skwod_core.PairProgress.Confirm -> PairStep.Confirm(p.emoji)
+            is uniffi.skwod_core.PairProgress.Paired -> {
+                run.client = null   // the pairing client lets go of the store; signing in opens it again
+                run.paired = p.device
+                PairStep.Approved
+            }
+        }
+    }
+
+    /** "Continue" after "Approved on your other device": sign in with the paired session. */
+    suspend fun pairingEnter(run: PairingRun): Boolean {
+        val paired = run.paired ?: return false
+        return adopt(paired.session, run.address, run.base, username = run.offer.username, pairedLocalId = run.localId)
+    }
+
+    /** Remove what an unfinished pairing created (never a signed-out workspace's own store). */
+    fun pairingDrop(run: PairingRun) {
+        run.client = null
+        run.paired = null
+        if (workspaces.any { it.localId == run.localId }) return
+        InstanceIds.cacheFileName(run.localId)?.let { name ->
+            for (suffix in listOf("", "-wal", "-shm")) File(ctx.filesDir, name + suffix).delete()
+        }
+        try { prefs.edit().remove(LocalData.cacheKeyName(run.localId)).commit() } catch (_: Exception) {}
+    }
+
     /** The workspace for a skwod we are already signed in to at `address`, if any. */
     /** Address match only (node id, or exact https URL) — the caller also checks the account. */
     fun workspaceFor(address: SkwodAddress): Workspace? = when (address) {
@@ -1615,7 +1704,7 @@ class AppModel private constructor(private val ctx: Context) {
 
     private suspend fun adopt(s: AuthSession, address: SkwodAddress, base: String,
                               beaconPubkey: String? = null, beaconContentKey: String? = null,
-                              username: String? = null): Boolean {
+                              username: String? = null, pairedLocalId: String? = null): Boolean {
         val stored = address.stored
         val nodeId = (address as? SkwodAddress.P2p)?.nodeId
         // The list is about to be written back: it must have been read first, or the skwods
@@ -1643,7 +1732,7 @@ class AppModel private constructor(private val ctx: Context) {
         val existing = (decision as? LoginReuse.Decision.Reuse)?.existing
         // A p2p skwod logged into through its https address keeps its p2p address (the key is its identity).
         val keepsP2p = (decision as? LoginReuse.Decision.Reuse)?.keepsP2p == true
-        val localId = existing?.localId ?: WorkspaceMatch.newLocalId(workspaces, address, s.userId)
+        val localId = existing?.localId ?: pairedLocalId ?: WorkspaceMatch.newLocalId(workspaces, address, s.userId)
         val w = Workspace(if (keepsP2p) existing!!.server else stored, s.userId, s.token, s.expiresAt,
             existing?.name ?: Workspace.defaultName(stored),
             localId = localId, instanceId = existing?.instanceId ?: instanceId,

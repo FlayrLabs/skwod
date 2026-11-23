@@ -153,6 +153,7 @@ struct DevicesView: View {
     /// Devices a backup restore brought back that no other device has confirmed yet (M2).
     @State private var unconfirmed: [String] = []
     @State private var showLink = false
+    @State private var showAddDevice = false
     @State private var busy = false
     @ObservedObject private var deferred = DeferredRecoveries.shared
     @State private var reviewing: RecoveryRequest?
@@ -215,6 +216,15 @@ struct DevicesView: View {
                 .padding(14).glassEffect(.regular, in: .rect(cornerRadius: 16, style: .continuous))
             }
             if !message.isEmpty { statusLine(message, ok: false) }
+            // Build 48: the new device scans a QR shown here — nothing to type or paste.
+            do {
+                Button { showAddDevice = true } label: {
+                    Label("Add a device", systemImage: "qrcode").frame(maxWidth: .infinity).padding(.vertical, 2)
+                }
+                .controlSize(.large).buttonStyle(.glassProminent).tint(.skAccent).foregroundStyle(.black)
+                .disabled(atLimit || list == nil)
+                .accessibilityIdentifier("devices.addByQR")
+            }
             Button { showLink = true } label: {
                 Label("Link a device…", systemImage: "link.badge.plus").frame(maxWidth: .infinity).padding(.vertical, 2)
             }
@@ -224,6 +234,7 @@ struct DevicesView: View {
         .task { await load() }
         .onReceive(NotificationCenter.default.publisher(for: .skwodAccountChanged)) { _ in Task { await load() } }
         .sheet(isPresented: $showLink, onDismiss: { Task { await load() } }) { DeviceLinkApproveSheet() }
+        .sheet(isPresented: $showAddDevice, onDismiss: { Task { await load() } }) { AddDeviceSheet() }
         .sheet(item: $reviewing) { request in
             RecoveryApprovalSheet(request: request, onClose: { reviewing = nil }).environmentObject(app)
         }

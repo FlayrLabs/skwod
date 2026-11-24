@@ -297,7 +297,7 @@ object ClipboardImage {
  * and a server has no link other than an invite.
  */
 object ServerMenu {
-    enum class Item { MUTE, INVITE, ICON, PERMISSIONS, LEAVE, DELETE }
+    enum class Item { MUTE, INVITE, RENAME, ICON, PERMISSIONS, LEAVE, DELETE }
 
     /** Who owns a server, as far as THIS device can tell. */
     enum class Ownership {
@@ -328,7 +328,7 @@ object ServerMenu {
     fun items(ownership: Ownership, hostSaysOwner: Boolean = false): List<Item> = buildList {
         add(Item.MUTE); add(Item.INVITE)
         val owner = ownership == Ownership.OWNER
-        if (owner) { add(Item.ICON); add(Item.PERMISSIONS) }
+        if (owner) { add(Item.RENAME); add(Item.ICON); add(Item.PERMISSIONS) }
         add(when (ownership) {
             Ownership.OWNER -> Item.DELETE
             Ownership.MEMBER -> Item.LEAVE

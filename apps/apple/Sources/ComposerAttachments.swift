@@ -184,19 +184,11 @@ struct EmojiPickerPopover: View {
     ]
 
     var body: some View {
-        ScrollView {
-            LazyVGrid(columns: Array(repeating: GridItem(.fixed(34), spacing: 4), count: 8), spacing: 4) {
-                ForEach(Self.emoji, id: \.self) { e in
-                    Button { onPick(e) } label: {
-                        Text(e).font(.system(size: 22)).frame(width: 34, height: 34).contentShape(Rectangle())
-                    }
-                    .buttonStyle(.plain)
-                }
-            }
-            .padding(10)
-        }
-        .frame(width: 320, height: 260)
-        .accessibilityIdentifier("composer.emojiPicker")
+        // Build 49: the same picker as the iPhone sheet (search, recents, categories), in the
+        // popover anchored to the composer's emoji button. It stays open for several picks.
+        EmojiPickerView(onPick: onPick, dismissOnPick: false)
+            .frame(width: 360, height: 380)
+            .accessibilityIdentifier("composer.emojiPicker")
     }
 }
 
@@ -283,6 +275,13 @@ struct ComposerTextView: UIViewRepresentable {
         view.accessibilityLabel = placeholder
         #if DEBUG
         E2E.composerField = view
+        // Screenshots: bring the keyboard up on the composer (`SKWOD_E2E_FOCUS_COMPOSER=<s>`).
+        if let delay = E2E.env("SKWOD_E2E_FOCUS_COMPOSER").flatMap(Double.init) {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak view] in
+                view?.becomeFirstResponder()
+                if let typed = E2E.env("SKWOD_E2E_TYPE") { view?.insertText(typed) }
+            }
+        }
         #endif
         return view
     }

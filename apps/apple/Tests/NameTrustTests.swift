@@ -97,4 +97,78 @@ final class NameTrustTests: XCTestCase {
         XCTAssertFalse(WaitingTrust.mayLetIn(WaitingTrust.assess(userId: "u-new", username: "newbie", lookup: nil, known: known)))
         XCTAssertFalse(WaitingTrust.mayLetIn(WaitingTrust.assess(userId: "u-new", username: "n\u{0435}wbie", lookup: .some("u-new"), known: known)))
     }
+
+    /// Build 49: every surface a name appears on, and its form — table-driven. Styled rows show
+    /// the plain name with a badge; everything without a badge keeps the words.
+    func testEverySurfaceHasItsForm() {
+        let table: [(ContactTrust.Surface, ContactTrust.Form)] = [
+            (.messageHeader, .badge), (.memberRow, .badge), (.dmRow, .badge), (.mentionChip, .badge), (.profileCard, .badge),
+            (.mentionPicker, .text), (.replyPreview, .text), (.notification, .text), (.incomingCall, .text),
+            (.dialogTitle, .text), (.kickBanDialog, .text), (.actionSheet, .text), (.approvalRow, .text),
+            (.joinConfirmation, .text), (.groupConfirmation, .text), (.securityNotice, .text), (.typing, .text),
+            (.blockReportTarget, .text),
+        ]
+        XCTAssertEqual(Set(table.map(\.0)), Set(ContactTrust.Surface.allCases), "a new surface needs its form decided here")
+        let shown = ContactTrust.display(userId: "u-carol", claimedName: "carol", book: [:], lookup: true)
+        for (surface, form) in table {
+            XCTAssertEqual(ContactTrust.form(surface), form, "\(surface)")
+            XCTAssertEqual(shown.label(for: surface), form == .badge ? "carol" : "carol (unverified)", "\(surface)")
+        }
+        XCTAssertTrue(shown.needsBadge, "a row that drops the words must draw the badge")
+        let known = ContactTrust.display(userId: "u-k", claimedName: "x", book: ["u-k": Contact(name: "kim", level: .known)])
+        XCTAssertEqual(known.label(for: .notification), "kim")
+        XCTAssertFalse(known.needsBadge)
+        // A chip keeps words only for flagged names.
+        XCTAssertNil(shown.chipWords)
+        XCTAssertEqual(ContactTrust.display(userId: "u-c", claimedName: "carol", book: [:], lookup: nil).chipWords, "unconfirmed")
+    }
+
+    /// A read of the core's state never creates or raises a pinned name; un-verifying falls back
+    /// to KNOWN only for someone the user made known themself.
+    func testAStatusReadNeverRaisesTrust() {
+        XCTAssertNil(ContactTrust.afterStatusRead(nil, verified: true))
+        XCTAssertNil(ContactTrust.afterStatusRead(Contact(name: "a", level: .unverified), verified: true))
+        XCTAssertNil(ContactTrust.afterStatusRead(Contact(name: "a", level: .known), verified: true))
+        XCTAssertEqual(ContactTrust.afterStatusRead(Contact(name: "a", level: .verified, known: true), verified: false)?.level, .known)
+        XCTAssertEqual(ContactTrust.afterStatusRead(Contact(name: "a", level: .verified, known: false), verified: false)?.level, .unverified)
+        // Verified straight from unverified (never made known): un-verify returns to UNVERIFIED.
+        let v = ContactTrust.withVerification(Contact(name: "a", level: .unverified), name: "a", verified: true)!
+        XCTAssertEqual(ContactTrust.withVerification(v, name: "a", verified: false)?.level, .unverified)
+        let k = ContactTrust.withVerification(ContactTrust.merged(existing: nil, name: "b", level: .known), name: "b", verified: true)!
+        XCTAssertEqual(ContactTrust.withVerification(k, name: "b", verified: false)?.level, .known)
+        XCTAssertFalse(ContactTrust.mayPinOnVerify(.impersonation))
+        XCTAssertFalse(ContactTrust.mayPinOnVerify(.unconfirmed))
+        XCTAssertTrue(ContactTrust.mayPinOnVerify(.unverified))
+    }
+
+    /// The raise path has a registry: every call of `noteVerification` that can raise trust
+    /// (anything but a literal `verified: false`) is in one of the listed places — the explicit
+    /// verify in the safety-number screen, and the sibling merge (both gated in the store).
+    func testOnlyTheListedCallersCanRaiseTrust() throws {
+        let sources = URL(fileURLWithPath: #filePath).deletingLastPathComponent().deletingLastPathComponent().appendingPathComponent("Sources")
+        let files = try FileManager.default.contentsOfDirectory(at: sources, includingPropertiesForKeys: nil).filter { $0.pathExtension == "swift" }
+        var raisers: [String] = []
+        for f in files {
+            let lines = try String(contentsOf: f, encoding: .utf8).components(separatedBy: "\n")
+            for line in lines where line.contains("noteVerification(") && !line.contains("func noteVerification") && !line.trimmingCharacters(in: .whitespaces).hasPrefix("//") && !line.trimmingCharacters(in: .whitespaces).hasPrefix("///") {
+                if !line.contains("verified: false") { raisers.append(f.lastPathComponent) }
+            }
+        }
+        XCTAssertEqual(Set(raisers), ["SafetyNumberView.swift", "SiblingSync.swift"], "a new caller can raise trust: route it through the explicit verify")
+        XCTAssertEqual(raisers.filter { $0 == "SafetyNumberView.swift" }.count, 1, "only reconcile(after: .verified) raises")
+    }
+
+    func testAMentionOfMeShowsMyOwnNameWithNoMarker() {
+        let other: (String) -> ContactTrust.Display = { ContactTrust.display(userId: $0, claimedName: nil, book: [:]) }
+        let me = ContactTrust.mentionDisplay(userId: "u-me", me: "u-me", myName: "owner49", other: other)
+        XCTAssertEqual(me.label(for: .mentionChip), "owner49")
+        XCTAssertEqual(me.badge, .none)
+        XCTAssertNil(me.chipWords)
+        XCTAssertEqual(ContactTrust.mentionDisplay(userId: "u-me", me: "u-me", myName: nil, other: other).text, "you")
+        XCTAssertEqual(ContactTrust.mentionDisplay(userId: "u-x", me: "u-me", myName: "owner49", other: other).badge, .unconfirmed)
+        // The server renames me to a contact the user knows: shown as "you", never as them.
+        let book = ["u-alice": Contact(name: "alice", level: .known)]
+        XCTAssertEqual(ContactTrust.mentionDisplay(userId: "u-me", me: "u-me", myName: "alice", book: book, other: other).text, "you")
+        XCTAssertEqual(ContactTrust.mentionDisplay(userId: "u-me", me: "u-me", myName: "ali\u{200B}ce", other: other).text, "you")
+    }
 }

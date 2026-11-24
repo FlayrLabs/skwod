@@ -242,7 +242,7 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
     // ride inside the encrypted text ([Mentions]). No @everyone in a direct or group conversation.
     val mentionPicks = remember(dm.conversationId) { mutableStateListOf<Pair<String, String>>() }
     val mentionName: (String, String) -> String = { uid, _ ->
-        if (uid == me) (model.current?.username ?: "you") else shownAuthor(uid).label
+        if (uid == me) ContactTrust.SELF_MENTION else shownAuthor(uid).let { s -> s.labelFor(NameSurface.MENTION_CHIP) + chipMark(s) }
     }
     // Opening the conversation clears its "@ n" (and again whenever a mention lands while it is open).
     LaunchedEffect(scopeName, model.mentionCount(listOf(scopeName))) { model.clearMentionBadges(scopeName) }
@@ -335,7 +335,8 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
         else settleHeld()
         // The contact book follows the safety-number state: verifying promotes to VERIFIED,
         // losing it falls back to KNOWN.
-        model.contacts.setVerified(dm.peerUserId, st.verified, dm.name)
+        // A read: only demotes (raising happens in the safety-number screen, on an explicit verify).
+        model.contacts.noteStatusRead(dm.peerUserId, st.verified)
     }
 
     // "I'm typing" at most every few seconds, never for an empty composer ([TypingState]).
@@ -519,7 +520,7 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
                 }
             }
         }
-        LazyColumn(Modifier.weight(1f), state = listState) {
+        LazyColumn(Modifier.weight(1f).dismissKeyboardOnTapOrDrag(listState), state = listState) {
             item {
                 Box(Modifier.fillMaxWidth().padding(vertical = 4.dp), contentAlignment = Alignment.Center) {
                     if (reachedStart) Text(if (group != null) "This is the beginning of this group" else "This is the beginning of your conversation with ${peerName}", color = Color.White.copy(alpha = 0.4f),

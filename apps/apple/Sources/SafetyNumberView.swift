@@ -209,7 +209,7 @@ struct SafetyNumberView: View {
         do {
             number = try await client.safetyNumber(myUserId: me, userId: peerUserId, deviceId: "")
             qr = try? await client.safetyQr(userId: peerUserId)
-            status = await client.contactStatus(userId: peerUserId)
+            await reconcile(client, after: .read)
             failed = false
         } catch {
             failed = true
@@ -242,7 +242,7 @@ struct SafetyNumberView: View {
         problem = nil
         do {
             try await client.verifyContact(userId: peerUserId, safetyNumber: shown)
-            status = await client.contactStatus(userId: peerUserId)
+            await reconcile(client, after: .verified)
             if status?.verified == true { onAccepted?() }
         } catch CoreError.IdentityChanged {
             await changedUnderneath()
@@ -264,7 +264,30 @@ struct SafetyNumberView: View {
     private func unverify() async {
         guard let client = app.client else { return }
         try? await client.unverifyContact(userId: peerUserId)
-        status = await client.contactStatus(userId: peerUserId)
+        await reconcile(client, after: .unverified)
+    }
+
+    /// Build 49: after anything here changed (or was read), the core's verification state for
+    /// this person goes into the contact book — from every entry point (DM, member list, group
+    /// people) alike — and only while the same skwod's client is the active one.
+    private enum Step { case read, verified, unverified }
+
+    /// A READ only demotes; a pinned name is raised only after an explicit, successful
+    /// verification here, and never for a flagged name (unconfirmed, look-alike).
+    private func reconcile(_ client: SkwodClient, after step: Step) async {
+        let read = await client.contactStatus(userId: peerUserId)
+        guard app.client === client else { return }
+        status = read
+        switch step {
+        case .verified where read.verified:
+            // Gated in the store (`noteVerification`): a flagged name is not pinned.
+            app.contacts.noteVerification(peerUserId, name: peerName, verified: true)
+        case .unverified:
+            if read.verified { app.contacts.noteStatusRead(peerUserId, verified: true) }
+            else { app.contacts.noteVerification(peerUserId, name: peerName, verified: false) }
+        default:
+            app.contacts.noteStatusRead(peerUserId, verified: read.verified)
+        }
     }
 
     /// Continue with the devices the directory lists now (clears "verified").

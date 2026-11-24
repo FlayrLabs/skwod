@@ -41,6 +41,8 @@ class AvatarStore(private val model: AppModel) {
     private val bmpCache = HashMap<String, Bitmap>()
     /** Newest ts SEEN per key, incl. clears (tombstone) — stops an old pointer resurrecting a clear. */
     private val seenTs = HashMap<String, Long>()
+    /** Keys CLEARED (not evicted), with when: persisted and handed to our other devices. */
+    private val cleared = HashMap<String, Long>()
     private var loadedFor: String? = null
 
     /** The decoded bitmap for a key, if we hold one (decoded on demand + cached). */
@@ -59,7 +61,7 @@ class AvatarStore(private val model: AppModel) {
         val wid = model.current?.id ?: return
         if (loadedFor == wid) return
         loadedFor = wid; gate.reset()
-        raw.value = emptyMap(); bmpCache.clear(); seenTs.clear()
+        raw.value = emptyMap(); bmpCache.clear(); seenTs.clear(); cleared.clear()
         val asked = model.bound?.takeIf { it.workspaceId == wid } ?: run { loadedFor = null; return }
         // A read that FAILS is not an empty store: nothing is written over it ([ReadGate]),
         // and the next call reads again.
@@ -72,6 +74,8 @@ class AvatarStore(private val model: AppModel) {
             val map = HashMap<String, Pair<ByteArray, Long>>()
             for (k in obj.keys()) {
                 val e = obj.getJSONObject(k)
+                // No picture: a clear (tombstone).
+                if (e.optString("b64").isEmpty()) { val t = e.optLong("ts"); if (t > 0) { cleared[k] = t; seenTs[k] = t }; continue }
                 val bytes = try { Base64.decode(e.getString("b64"), Base64.NO_WRAP) } catch (_: Exception) { continue }
                 if (!acceptable(bytes)) continue   // a cache written before avatars were bounded
                 val t = e.getLong("ts")
@@ -85,6 +89,7 @@ class AvatarStore(private val model: AppModel) {
 
     private fun persist() {
         val snapshot = raw.value
+        val clearedSnapshot = HashMap(cleared)
         // Written through the client of the workspace these avatars belong to, under its key —
         // both taken NOW, not when the write runs — and only once its store was read.
         val bound = model.bound ?: return
@@ -95,6 +100,7 @@ class AvatarStore(private val model: AppModel) {
             for ((k, v) in snapshot) {
                 obj.put(k, JSONObject().put("b64", Base64.encodeToString(v.first, Base64.NO_WRAP)).put("ts", v.second))
             }
+            for ((k, t) in clearedSnapshot) if (!snapshot.containsKey(k)) obj.put(k, JSONObject().put("b64", "").put("ts", t))
             try { bound.client.kvSet(key, obj.toString()) } catch (_: Exception) {}
         }
     }
@@ -158,12 +164,48 @@ class AvatarStore(private val model: AppModel) {
                 if (img.length > AvatarPolicy.MAX_AVATAR_BYTES * 4 / 3 + 4) continue
                 val bytes = try { Base64.decode(img, Base64.NO_WRAP) } catch (_: Exception) { continue }
                 if (!acceptable(bytes)) continue
-                map[key] = bytes to t; bmpCache.remove(key); changed = true
-            } else if (map.containsKey(key)) {
-                map.remove(key); bmpCache.remove(key); changed = true   // cleared
+                map[key] = bytes to t; bmpCache.remove(key); cleared.remove(key); changed = true
+            } else {
+                cleared[key] = t
+                map.remove(key); bmpCache.remove(key); changed = true   // cleared (tombstone kept)
             }
         }
         if (changed) { evictIfNeeded(map); raw.value = map; persist() }
+    }
+
+    // Build 49: handed over between our own devices.
+
+    /** Pictures and clears of [workspaceId], for a sibling (null for another skwod's avatars). */
+    fun siblingEntries(workspaceId: String): List<SiblingRules.AvatarEntry>? {
+        if (workspaceId.isEmpty() || loadedFor != workspaceId) return null
+        val map = raw.value
+        return map.map { (k, v) -> SiblingRules.AvatarEntry(k, Base64.encodeToString(v.first, Base64.NO_WRAP), v.second) } +
+            cleared.filterKeys { it !in map }.map { (k, t) -> SiblingRules.AvatarEntry(k, null, t) }
+    }
+
+    fun mergeFromSibling(entries: List<SiblingRules.AvatarEntry>, workspaceId: String, vouched: Set<String>, mismatched: Set<String>) {
+        if (workspaceId.isEmpty() || loadedFor != workspaceId || model.current?.id != workspaceId) return
+        val held = HashMap(seenTs)
+        for ((k, v) in raw.value) if ((held[k] ?: 0) < v.second) held[k] = v.second
+        for ((k, t) in cleared) if ((held[k] ?: 0) < t) held[k] = t
+        val taken = SiblingRules.acceptedAvatars(entries, vouched, mismatched, held, System.currentTimeMillis(),
+            decode = { try { Base64.decode(it, Base64.NO_WRAP) } catch (_: Exception) { null } }, acceptable = ::acceptable)
+        if (taken.isEmpty()) return
+        val map = HashMap(raw.value)
+        for ((k, v) in taken) {
+            seenTs[k] = v.second; bmpCache.remove(k)
+            val bytes = v.first
+            if (bytes != null) { map[k] = bytes to v.second; cleared.remove(k) } else { map.remove(k); cleared[k] = v.second }
+        }
+        evictIfNeeded(map); raw.value = map; persist()
+    }
+
+    /** My avatar again to every channel — after a device of mine was linked, so it can read it —
+     *  with its ORIGINAL timestamp, so a later clear or replacement still wins. */
+    suspend fun resendMine() {
+        val me = model.current?.userId ?: return
+        val mine = raw.value[userKey(me)] ?: return
+        broadcast(userKey(me), mine.first, allMyChannelIds(), at = mine.second)
     }
 
     // Set (broadcast to the relevant channels).
@@ -185,16 +227,16 @@ class AvatarStore(private val model: AppModel) {
         broadcast(key, null, channelIds)
     }
 
-    private suspend fun broadcast(key: String, imageData: ByteArray?, channelIds: List<String>) {
+    private suspend fun broadcast(key: String, imageData: ByteArray?, channelIds: List<String>, at: Long? = null) {
         val client = model.client ?: return
-        val now = System.currentTimeMillis()
-        val square = imageData?.let { withContext(Dispatchers.Default) { squareJpeg(it) } }
+        val now = at ?: System.currentTimeMillis()
+        val square = imageData?.let { if (at != null) it else withContext(Dispatchers.Default) { squareJpeg(it) } }
         val obj = JSONObject().put("key", key).put("ts", now)
         if (square != null) obj.put("img", Base64.encodeToString(square, Base64.NO_WRAP))
         // Local echo + advance tombstone so a stale echo can't undo it.
-        seenTs[key] = now
+        seenTs[key] = maxOf(seenTs[key] ?: 0, now)
         val map = HashMap(raw.value)
-        if (square != null) { map[key] = square to now; bmpCache.remove(key) } else { map.remove(key); bmpCache.remove(key) }
+        if (square != null) { map[key] = square to now; bmpCache.remove(key); cleared.remove(key) } else { map.remove(key); bmpCache.remove(key); cleared[key] = now }
         raw.value = map; persist()
         val body = TAG + obj.toString()
         // Fan out to every channel — sequentially is fine on the IO scope, but skip empties/demo.

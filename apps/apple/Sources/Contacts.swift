@@ -154,10 +154,53 @@ final class ContactBook: ObservableObject {
         return true
     }
 
+    /// Build 49: the contact book one of our own devices handed over, for `workspaceId`
+    /// (`SiblingRules.mergedBook`): a name the user set here wins, nothing is raised above KNOWN
+    /// (a colliding or odd name stays UNVERIFIED), and only users the sender's snapshot vouches
+    /// for and that agree with this device are taken. Blocks live elsewhere and are never touched.
+    /// Returns the users that sibling had VERIFIED (the caller asks the core); nil when another
+    /// skwod's book is loaded.
+    @discardableResult
+    func mergeFromSibling(_ synced: [String: Contact], workspaceId: String, vouched: Set<String>, mismatched: Set<String>) -> [String]? {
+        guard !workspaceId.isEmpty, loadedFor == workspaceId, app?.current?.id == workspaceId else { return nil }
+        let merged = SiblingRules.mergedBook(local: entries, synced: synced, vouched: vouched, mismatched: mismatched, roster: roster)
+        if merged != entries { entries = merged; save() }
+        return synced.filter { $0.value.level == .verified && vouched.contains($0.key) && !mismatched.contains($0.key) }.map(\.key)
+    }
+
+    /// The book of `workspaceId` as a sibling payload (nil when another skwod's book is loaded).
+    func siblingPayload(workspaceId: String) -> Data? {
+        guard !workspaceId.isEmpty, loadedFor == workspaceId else { return nil }
+        return try? JSONEncoder().encode(entries)
+    }
+
     /// Follow the core's verification state for a contact.
-    func noteVerification(_ userId: String, name: String, verified: Bool) {
-        guard let updated = ContactTrust.withVerification(entries[userId], name: name, verified: verified),
-              updated != entries[userId] else { return }
+    ///
+    /// The ONE raise path, gated here (not by callers): a verification pins only a name that is
+    /// clean right now against this book and the roster — not a look-alike, not unusual
+    /// characters, not unconfirmed (`ContactTrust.mayPinOnVerify` on `display`). Callers:
+    /// `SafetyNumberView.reconcile(after: .verified)` and `SiblingSync.drain` (see Build49Tests).
+    @discardableResult
+    func noteVerification(_ userId: String, name: String, verified: Bool) -> Bool {
+        if verified {
+            let shown = display(userId, claimedName: name)
+            guard ContactTrust.mayPinOnVerify(shown.badge) else { return false }
+            guard let updated = ContactTrust.withVerification(entries[userId], name: shown.text, verified: true),
+                  updated != entries[userId] else { return true }
+            entries[userId] = updated
+            save()
+            return true
+        }
+        guard let updated = ContactTrust.withVerification(entries[userId], name: name, verified: false),
+              updated != entries[userId] else { return true }
+        entries[userId] = updated
+        save()
+        return true
+    }
+
+    /// A read of the core's verification state: may only demote (`ContactTrust.afterStatusRead`).
+    func noteStatusRead(_ userId: String, verified: Bool) {
+        guard let updated = ContactTrust.afterStatusRead(entries[userId], verified: verified), updated != entries[userId] else { return }
         entries[userId] = updated
         save()
     }
@@ -196,6 +239,10 @@ struct TrustBadge: View {
                 .padding(.horizontal, 4).padding(.vertical, 1)
                 .overlay(Capsule().strokeBorder(.orange.opacity(0.5), lineWidth: 1))
                 .accessibilityLabel("Name could not be confirmed")
+        case .unverified where compact:
+            // Rows (build 49): a small mark, not a word after every name.
+            Image(systemName: "questionmark.circle").font(.system(size: 10)).foregroundStyle(.white.opacity(0.4))
+                .accessibilityLabel("Name not verified")
         case .unverified:
             Text("unverified").font(.system(size: compact ? 8.5 : 9.5, weight: .medium)).foregroundStyle(.white.opacity(0.45))
                 .padding(.horizontal, 4).padding(.vertical, 1)

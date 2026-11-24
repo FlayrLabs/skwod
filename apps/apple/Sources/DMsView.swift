@@ -159,7 +159,10 @@ struct DMChatView: View {
             // Build 46: "@" suggests the peer here too (no @everyone in a direct conversation);
             // mentions render with the contact book's label and open the person's card.
             me: app.session?.userId,
-            mentionLabel: { uid in uid == convo.peerUserId ? shown.text : app.contacts.authorLabel(uid, claimedName: nil) },
+            mentionLabel: { uid in uid == convo.peerUserId ? shown.text
+                : ContactTrust.mentionDisplay(userId: uid, me: app.session?.userId, myName: nil) { app.contacts.display($0, claimedName: nil) }.label(for: .mentionChip) },
+            mentionBadge: { uid in ContactTrust.mentionDisplay(userId: uid, me: app.session?.userId, myName: nil) {
+                app.contacts.display($0, claimedName: $0 == convo.peerUserId ? convo.name : nil) } },
             everyoneAllowed: { _ in false },
             mentionable: BlockList.shared.contains(convo.peerUserId) || convo.peerUserId.isEmpty
                 ? [] : [(userId: convo.peerUserId, name: shown.text, username: convo.name)],
@@ -290,7 +293,8 @@ struct DMChatView: View {
         acceptShown = status.acceptFingerprint
         verified = status.verified
         // Verifying the safety number is what makes a contact VERIFIED (and losing it, not).
-        app.contacts.noteVerification(convo.peerUserId, name: shown.text, verified: status.verified)
+        // A read of the core's state: it may only demote (raising is the safety-number screen's).
+        app.contacts.noteStatusRead(convo.peerUserId, verified: status.verified)
     }
 
     private var scope: String { "dm:\(convo.conversationId)" }

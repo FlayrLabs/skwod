@@ -172,6 +172,7 @@ fun MessageRow(
     val clipboard = LocalClipboardManager.current
     val parsed = remember(body) { ChatTags.parse(body) }
     var menu by remember { mutableStateOf(false) }
+    var picker by remember { mutableStateOf(false) }
     Column(
         Modifier.fillMaxWidth()
             .then(if (mentionsMe) Modifier.background(Color(0xFFFFA726).copy(alpha = 0.08f)) else Modifier)
@@ -220,6 +221,7 @@ fun MessageRow(
                 }
             }
         }
+        if (actions != null && picker) EmojiPickerSheet(onPick = { actions.onReact(it) }, onDismiss = { picker = false })
         if (actions != null) {
             DropdownMenu(expanded = menu, onDismissRequest = { menu = false }) {
                 Row(Modifier.padding(horizontal = 8.dp), horizontalArrangement = Arrangement.spacedBy(4.dp)) {
@@ -228,6 +230,10 @@ fun MessageRow(
                             .combinedClickable(onClick = { menu = false; actions.onReact(e) }, onLongClick = {})
                             .padding(4.dp))
                     }
+                    // Any other emoji: the full picker (build 49).
+                    Text("＋", fontSize = 20.sp, color = Color.White.copy(alpha = 0.8f), modifier = Modifier
+                        .combinedClickable(onClick = { menu = false; picker = true }, onLongClick = {})
+                        .padding(4.dp))
                 }
                 if (parsed.text.isNotBlank()) {
                     DropdownMenuItem(text = { Text("Copy Text") }, onClick = {
@@ -458,6 +464,14 @@ private fun shortTime(epochMs: Long): String {
     if (epochMs <= 0) return ""
     val d = java.util.Date(epochMs)
     return java.text.SimpleDateFormat("h:mm a", java.util.Locale.getDefault()).format(d)
+}
+
+/** Build 49: the mark after a mention chip's plain name (a chip is text: a small "?" for a name
+ *  only the server vouches for, the flag's word for a flagged one, nothing for a known name). */
+fun chipMark(shown: ContactTrust.Shown): String = when {
+    shown.flag != ContactTrust.Flag.NONE -> " (${shown.flag.mark})"
+    shown.unverified -> " ?"
+    else -> ""
 }
 
 /**

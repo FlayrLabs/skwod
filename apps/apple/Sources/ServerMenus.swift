@@ -8,6 +8,8 @@ import SwiftUI
 final class ServerActions: ObservableObject {
     @Published var invite: RealSpace?
     @Published var settings: ServerRef?
+    @Published var rename: ServerRef?
+    @Published var renameText = ""
     @Published var confirmLeave: ServerRef?
     @Published var confirmDelete: ServerRef?
     @Published var outcome: String?
@@ -33,6 +35,8 @@ struct ServerMenuItems: View {
             case .mute: muteItems
             case .invite:
                 Button { actions.invite = group.channels.first } label: { Label("Invite people", systemImage: "person.badge.plus") }
+            case .rename:
+                Button { actions.renameText = group.name; actions.rename = ref } label: { Label("Rename server…", systemImage: "pencil") }
             case .settings:
                 Button { actions.settings = ref } label: { Label("Server settings", systemImage: "gearshape") }
             case .copyLink:
@@ -81,6 +85,7 @@ struct ServerActionsHost: ViewModifier {
         content
             .sheet(item: $actions.invite) { s in DismissableSheet { SecureJoinView(space: s) } }
             .sheet(item: $actions.settings) { srv in DismissableSheet { RolesSheet(server: srv) } }
+            .modifier(ServerRenameAlert(target: $actions.rename, text: $actions.renameText, chat: chat) { actions.outcome = $0 })
             .confirmationDialog("Leave \(actions.confirmLeave?.name ?? "this server")?",
                                 isPresented: Binding(get: { actions.confirmLeave != nil }, set: { if !$0 { actions.confirmLeave = nil } }),
                                 titleVisibility: .visible) {
@@ -106,6 +111,32 @@ struct ServerActionsHost: ViewModifier {
             .alert("Couldn't do that", isPresented: Binding(get: { actions.outcome != nil }, set: { if !$0 { actions.outcome = nil } })) {
                 Button("OK", role: .cancel) { actions.outcome = nil }
             } message: { Text(actions.outcome ?? "") }
+    }
+}
+
+/// "Rename server…": the name field, then `ChatModel.renameServer`. The new name is sealed under
+/// the server's key (the host only ever stores ciphertext) and every member's sidebar picks it up.
+struct ServerRenameAlert: ViewModifier {
+    @Binding var target: ServerRef?
+    @Binding var text: String
+    @ObservedObject var chat: ChatModel
+    /// A sentence when it failed.
+    var onOutcome: (String) -> Void
+
+    func body(content: Content) -> some View {
+        content.alert("Rename \(target?.name ?? "server")",
+                      isPresented: Binding(get: { target != nil }, set: { if !$0 { target = nil } })) {
+            TextField("Server name", text: $text)
+                .accessibilityIdentifier("server.renameField")
+            Button("Save") {
+                guard let srv = target else { return }
+                let name = text
+                Task { if let problem = await chat.renameServer(srv.serverId, to: name) { onOutcome(problem) } }
+            }
+            Button("Cancel", role: .cancel) { target = nil }
+        } message: {
+            Text("Everyone in the server sees the new name. It's end-to-end encrypted, like the old one.")
+        }
     }
 }
 

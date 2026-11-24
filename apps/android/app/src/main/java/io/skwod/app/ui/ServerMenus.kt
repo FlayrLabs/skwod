@@ -29,6 +29,8 @@ fun ServerActionsMenu(
     val hostSaysOwner = ServerList.hostSaysOwner(model.serverOwners, group.serverId, model.session?.userId)
     val isOwner = ownership == ServerMenu.Ownership.OWNER
     var muting by remember { mutableStateOf(false) }
+    var renaming by remember { mutableStateOf(false) }
+    var renameText by remember { mutableStateOf("") }
     var confirm by remember { mutableStateOf<ServerMenu.Item?>(null) }
     var busy by remember { mutableStateOf(false) }
     var problem by remember { mutableStateOf<String?>(null) }
@@ -43,6 +45,8 @@ fun ServerActionsMenu(
                 leadingIcon = { Icon(if (muted) Icons.Filled.Notifications else Icons.Filled.NotificationsOff, null) })
             ServerMenu.Item.INVITE -> DropdownMenuItem(text = { Text("Invite people") }, onClick = { onDismiss(); onInvite() },
                 leadingIcon = { Icon(Icons.Filled.PersonAdd, null) })
+            ServerMenu.Item.RENAME -> DropdownMenuItem(text = { Text("Rename server…") }, onClick = { onDismiss(); renameText = group.name; renaming = true },
+                leadingIcon = { Icon(Icons.Filled.Edit, null) })
             ServerMenu.Item.ICON -> DropdownMenuItem(text = { Text("Change server icon") }, onClick = { onDismiss(); onIcon() },
                 leadingIcon = { Icon(Icons.Filled.Image, null) })
             ServerMenu.Item.PERMISSIONS -> DropdownMenuItem(text = { Text("Manage permissions") }, onClick = { onDismiss(); onPermissions() },
@@ -66,6 +70,30 @@ fun ServerActionsMenu(
         },
         confirmButton = {},
         dismissButton = { TextButton(onClick = { muting = false }) { Text("Cancel") } },
+    )
+
+    // Rename for everyone: sealed under the server's key; every member's sidebar picks it up.
+    if (renaming) AlertDialog(
+        onDismissRequest = { if (!busy) { renaming = false; problem = null } },
+        title = { Text("Rename ${group.name}") },
+        text = {
+            Column {
+                OutlinedTextField(renameText, { renameText = it.take(ServerName.MAX + 20) }, singleLine = true, label = { Text("Server name") })
+                Text("Everyone in the server sees the new name. It's end-to-end encrypted, like the old one.")
+                problem?.let { Text(it, color = MaterialTheme.colorScheme.error) }
+            }
+        },
+        confirmButton = {
+            TextButton(enabled = !busy, onClick = {
+                busy = true; problem = null
+                scope.launch {
+                    val err = model.renameServer(group.serverId, renameText)
+                    busy = false
+                    if (err == null) renaming = false else problem = err
+                }
+            }) { Text(if (busy) "…" else "Save") }
+        },
+        dismissButton = { TextButton(enabled = !busy, onClick = { renaming = false; problem = null }) { Text("Cancel") } },
     )
 
     confirm?.let { what ->

@@ -708,6 +708,19 @@ class AppChat(private val model: AppModel) {
         } catch (_: Exception) { null }
     }
 
+    /** Build 49: put these decrypted server names on the joined spaces (a rename by the owner,
+     *  on any device), and keep them. */
+    fun applyServerNames(names: Map<String, String>) {
+        var changed = false
+        for (i in spaces.indices) {
+            val name = names[spaces[i].serverId] ?: continue
+            if (ServerName.problem(name) != null || spaces[i].name == name) continue
+            spaces[i] = spaces[i].copy(name = name)
+            changed = true
+        }
+        if (changed) persistSpaces()
+    }
+
     // ---- persistence (JSON in the engine's encrypted kv, keyed by workspace) ----
 
     private fun kvKey(key: String): String = "${model.current?.id ?: ""}|$key"

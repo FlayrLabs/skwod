@@ -450,3 +450,24 @@ enum MentionAutocomplete {
         return out
     }
 }
+
+/// Build 49: who a stored message body mentions, exactly as the app reads it (`ChatTags.mentions`)
+/// — Foundation only, so the notification extension decodes it the same way. An attachment's
+/// caption carries its own mentions trailer (offsets into the whole body would point at the
+/// wrong characters); a shared song mentions nobody.
+enum MessageMentions {
+    static let attachTag = "\u{2}skwod/attach|"
+    static let musicTag = "\u{2}skwod/music|"
+
+    static func payload(_ raw: String) -> MentionPayload {
+        let decoded = MentionCodec.decode(raw)
+        let body = decoded.visible
+        if body.hasPrefix(attachTag) {
+            guard let data = String(body.dropFirst(attachTag.count)).data(using: .utf8),
+                  let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return MentionPayload() }
+            return MentionCodec.decode(obj["caption"] as? String ?? "").payload
+        }
+        if body.hasPrefix(musicTag) { return MentionPayload() }
+        return decoded.payload
+    }
+}

@@ -9,6 +9,9 @@ struct ChatMessage: Identifiable, Hashable {
     var author: String
     /// The author's userId, for the E2EE avatar lookup (nil for local/demo/system rows).
     var authorId: String? = nil
+    /// Build 49: the author's name in words ("… (unverified)") for places that draw no badge —
+    /// block/report items, the action sheet, reply previews. `author` is the plain header name.
+    var authorSpoken: String? = nil
     var body: String
     var mine: Bool = false
     /// Interactive reaction pills (emoji + count + whether I added it).

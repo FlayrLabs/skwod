@@ -872,3 +872,32 @@ async fn only_the_supervised_child_can_answer_the_local_proof() {
     // Known vector, so the Swift and Kotlin sides can be checked against the same bytes.
     assert_eq!(expected, crate::api::local_proof_for(secret.as_bytes(), &(0u8..16).collect::<Vec<_>>()));
 }
+
+/// Build 49: a rename is a bounded ciphertext, and only someone with MANAGE_SERVER may make it.
+#[tokio::test]
+async fn a_server_rename_is_bounded_and_needs_manage_server() {
+    let state = test_state().await;
+    let app = crate::api::router(state.clone());
+    let (_, alice) = signup(&app, "alice").await;
+    let (_, bob) = signup(&app, "bobby").await;
+    let (server_id, _) = space(&app, &alice, &[&bob]).await;
+    let path = format!("/api/servers/{server_id}");
+    let (st, _) = send(&app, "PATCH", &path, Some(&alice), Some(json!({ "name_ciphertext": b64(&[7u8; 300]) }))).await;
+    assert_eq!(st, StatusCode::OK);
+    let (st, _) = send(&app, "PATCH", &path, Some(&alice), Some(json!({ "name_ciphertext": b64(&vec![7u8; crate::structure::MAX_NAME_CIPHERTEXT + 1]) }))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "an oversized name was stored");
+    let (st, _) = send(&app, "PATCH", &path, Some(&alice), Some(json!({ "name_ciphertext": "" }))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = send(&app, "PATCH", &path, Some(&bob), Some(json!({ "name_ciphertext": b64(b"mine now") }))).await;
+    assert_eq!(st, StatusCode::FORBIDDEN, "a member without MANAGE_SERVER renamed the server");
+    let (st, _) = send(&app, "POST", "/api/servers", Some(&alice), Some(json!({ "name_ciphertext": b64(&vec![1u8; crate::structure::MAX_NAME_CIPHERTEXT + 1]) }))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    // L9: the description is bounded too, on rename and on create.
+    let big = b64(&vec![2u8; crate::structure::MAX_DESCRIPTION_CIPHERTEXT + 1]);
+    let (st, _) = send(&app, "PATCH", &path, Some(&alice), Some(json!({ "description_ciphertext": big }))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST, "an oversized description was stored");
+    let (st, _) = send(&app, "POST", "/api/servers", Some(&alice), Some(json!({ "name_ciphertext": b64(b"n"), "description_ciphertext": big }))).await;
+    assert_eq!(st, StatusCode::BAD_REQUEST);
+    let (st, _) = send(&app, "PATCH", &path, Some(&alice), Some(json!({ "description_ciphertext": b64(b"short") }))).await;
+    assert_eq!(st, StatusCode::OK);
+}

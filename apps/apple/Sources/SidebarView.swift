@@ -402,7 +402,8 @@ struct SidebarView: View {
                 } else {
                     ForEach(chat.dms) { d in
                         Button { chat.selection = .dm(d) } label: {
-                            DMRow(name: app.contacts.display(d.peerUserId, claimedName: d.name).spoken, selected: chat.selection == .dm(d),
+                            DMRow(name: app.contacts.display(d.peerUserId, claimedName: d.name).label(for: .dmRow), selected: chat.selection == .dm(d),
+                                  badge: app.contacts.display(d.peerUserId, claimedName: d.name).badge,
                                   status: app.realtime.status(userId: d.peerUserId),
                                   peerUserId: d.peerUserId)
                         }
@@ -1007,6 +1008,8 @@ private struct AccountList: Decodable {
 struct DMRow: View {
     let name: String
     let selected: Bool
+    /// The name's trust (build 49): a small badge beside the plain name.
+    var badge: ContactTrust.Badge = .none
     /// The peer's live status ("online"/"idle"/"dnd"/"offline") — drives the presence dot.
     var status: String = "offline"
     /// The peer's userId — drives the E2EE avatar lookup.
@@ -1025,6 +1028,7 @@ struct DMRow: View {
                 .font(.system(size: 15, weight: selected ? .semibold : .regular))
                 .foregroundStyle(selected ? .white : (hovering ? .white.opacity(0.9) : .white.opacity(0.7)))
                 .lineLimit(1)
+            if badge != .none { TrustBadge(badge: badge, compact: true) }
             Spacer()
         }
         .padding(.horizontal, 8).padding(.vertical, 5)

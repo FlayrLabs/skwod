@@ -52,6 +52,8 @@ struct ChatSurface: View {
     /// The conversation's stable id (channel id, DM or group conversation id). What is staged
     /// in the composer belongs to it, and only to it.
     var conversationId: String = ""
+    /// "● N online" beside the title (nil hides it — DMs, previews).
+    var onlineCount: Int? = nil
     /// Optional trailing header actions (e.g. invite, verify).
     @ViewBuilder var headerActions: () -> AnyView
     /// Pasted / dropped files and images waiting to go with the next send.
@@ -65,29 +67,41 @@ struct ChatSurface: View {
     /// Who the draft mentions so far (ranges into the draft).
     @State private var mentionPayload = MentionPayload()
     @State private var mentionHighlight = 0
+    /// The reader is at the newest message (new ones are followed; read markers advance).
+    @State private var atBottom = true
+    /// The conversation the list was last put in its opening position for.
+    @State private var positionedFor: String?
+    /// Unread, as it stood when the conversation opened (frozen: the divider stays where the new
+    /// messages began while they are read, until the conversation is left).
+    @State private var unreadAtOpen: UnreadAtOpen?
+    /// "Mark as read" was pressed on the bar.
+    @State private var barDismissed = false
+    /// The newest row the reader had in view at the bottom (the jump pill counts what came after).
+    @State private var lastSeenId: String?
+    @Environment(ReadMarkerStore.self) private var reads: ReadMarkerStore?
+    @Environment(\.chatOnScreen) private var onScreen
+    @Environment(\.scenePhase) private var scenePhase
+    #if os(iOS)
+    /// The global maxY of this surface (the keyboard lift measures against it).
+    @State private var surfaceBottom: CGFloat = 0
+    #endif
 
     var body: some View {
         VStack(spacing: 0) {
-            ChatHeader(title: title, subtitle: subtitle, onBack: onBack, actions: headerActions)
+            ChatHeader(title: title, subtitle: subtitle, onlineCount: onlineCount, onBack: onBack, actions: headerActions)
             Divider().overlay(.white.opacity(0.08))
+            // The list, then everything under it (notice, suggestions, typing, banner, composer),
+            // stacked: rows never show through under the composer or by the home indicator (the
+            // design as it was). The composer is pinned to the bottom of this surface and, on iOS,
+            // lifted onto the keyboard by `keyboardLift` (measured, see `KeyboardFrame`).
             messageList
-            if let notice { notice }
-            if !mentionMatches.isEmpty {
-                MentionSuggestions(matches: mentionMatches, highlighted: min(mentionHighlight, mentionMatches.count - 1),
-                                   onPick: pickMention)
-            }
-            if let typing { TypingIndicatorBar(center: typing) }
-            if let banner = composingBanner {
-                ComposeBanner(text: banner.text, isEdit: banner.isEdit, onCancel: { onCancelCompose?() })
-            }
-            ChatComposer(draft: $draft, sending: sending, sendError: intakeError ?? sendError,
-                         placeholder: placeholder, onSend: sendWithMentions,
-                         uploading: uploading, onSendFile: onSendFile, onSendMusic: onSendMusic,
-                         onSendImage: onSendImage, staged: $staged,
-                         mentionKey: mentionKey,
-                         onIntake: { [conversationId] in take($0, startedFor: conversationId) })
+            bottomBar
         }
         .background(ChatBackground())
+        #if os(iOS)
+        // Where this surface ends on screen, for the keyboard lift (see `KeyboardFrame`).
+        .onGeometryChange(for: CGFloat.self) { $0.frame(in: .global).maxY } action: { surfaceBottom = $0 }
+        #endif
         // What waits in the composer belongs to THIS conversation: switching conversation
         // (the same surface, new content) never carries it along.
         .onAppear { activeConversation = conversationId }
@@ -129,6 +143,31 @@ struct ChatSurface: View {
                     .allowsHitTesting(false)
             }
         }
+    }
+
+    /// The composer and what sits right above it. On iOS it rides on top of the keyboard: lifted by
+    /// exactly the part of this surface the keyboard covers.
+    private var bottomBar: some View {
+        VStack(spacing: 0) {
+            if let notice { notice }
+            if !mentionMatches.isEmpty {
+                MentionSuggestions(matches: mentionMatches, highlighted: min(mentionHighlight, mentionMatches.count - 1),
+                                   onPick: pickMention)
+            }
+            if let typing { TypingIndicatorBar(center: typing) }
+            if let banner = composingBanner {
+                ComposeBanner(text: banner.text, isEdit: banner.isEdit, onCancel: { onCancelCompose?() })
+            }
+            ChatComposer(draft: $draft, sending: sending, sendError: intakeError ?? sendError,
+                         placeholder: placeholder, onSend: sendWithMentions,
+                         uploading: uploading, onSendFile: onSendFile, onSendMusic: onSendMusic,
+                         onSendImage: onSendImage, staged: $staged,
+                         mentionKey: mentionKey,
+                         onIntake: { [conversationId] in take($0, startedFor: conversationId) })
+        }
+        #if os(iOS)
+        .keyboardLift(containerBottom: surfaceBottom)
+        #endif
     }
 
     private var acceptsAttachments: Bool { onSendFile != nil || onSendImage != nil }
@@ -196,6 +235,7 @@ struct ChatSurface: View {
                             olderControl(onLoadOlder)
                         }
                         ForEach(Array(messages.enumerated()), id: \.element.id) { i, m in
+                            if m.id == unreadAtOpen?.firstId { NewMessagesDivider() }
                             if let system = m.system {
                                 // A security / membership event: a line of its own, never a bubble.
                                 SystemRowView(row: system, text: m.body, createdAt: m.createdAt,
@@ -214,12 +254,144 @@ struct ChatSurface: View {
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             .confirmingLinks()
-            // Follow the conversation when something NEW arrives at the bottom — not when older
-            // pages are added at the top, which must leave the reader where they are.
-            .onChange(of: messages.last?.id) { _, _ in
-                if let last = messages.last { withAnimation { proxy.scrollTo(last.id, anchor: .bottom) } }
+            #if os(iOS)
+            // The keyboard goes away the usual ways: drag the list down, or tap the list. The tap
+            // is simultaneous, so links, pictures, reactions and the long press still get theirs.
+            .scrollDismissesKeyboard(.interactively)
+            .simultaneousGesture(TapGesture().onEnded {
+                UIApplication.shared.sendAction(#selector(UIResponder.resignFirstResponder), to: nil, from: nil, for: nil)
+            })
+            #endif
+            // Is the reader at the newest message? (Within a short distance of the end, with the
+            // composer inset counted: the list ends where the composer starts.)
+            .onScrollGeometryChange(for: Bool.self) { geo in
+                let end = geo.contentSize.height + geo.contentInsets.bottom - geo.containerSize.height
+                return geo.contentOffset.y >= end - 60
+            } action: { _, now in
+                atBottom = now
+                noteReadIfAtBottom()
             }
+            // While the bar is up, the list's content starts below it: the "NEW" divider (and
+            // the first unread row) are never under the bar.
+            .contentMargins(.top, barState == nil ? 0 : 56, for: .scrollContent)
+            // The bar above the list ("N new messages since …") and the jump pill below it.
+            .overlay(alignment: .top) {
+                if let bar = barState {
+                    NewMessagesBar(text: bar, onJump: {
+                        if let id = unreadAtOpen?.firstId { withAnimation { proxy.scrollTo(id, anchor: UnitPoint(x: 0.5, y: 0.14)) } }
+                    }, onMarkRead: markAllRead)
+                    .padding(.horizontal, 12).padding(.top, 8)
+                    .transition(.move(edge: .top).combined(with: .opacity))
+                }
+            }
+            .overlay(alignment: .bottomTrailing) {
+                if newBelow > 0 {
+                    JumpToNewPill(count: newBelow) {
+                        if let last = messages.last { withAnimation { proxy.scrollTo(last.id, anchor: .bottom) } }
+                    }
+                    .padding(.trailing, 14).padding(.bottom, 10)
+                    .transition(.scale.combined(with: .opacity))
+                }
+            }
+            .animation(.snappy(duration: 0.2), value: barState)
+            .animation(.snappy(duration: 0.2), value: newBelow)
+            // A conversation opens at its first unread message (or its newest) — once per
+            // conversation, when its messages and its read marker are there (both arrive after the
+            // surface appears).
+            .task(id: conversationId) {
+                await reads?.load(conversationId)
+                positionIfNeeded(proxy)
+            }
+            .onChange(of: conversationId) { _, _ in
+                positionedFor = nil; unreadAtOpen = nil; barDismissed = false; lastSeenId = nil
+                positionIfNeeded(proxy)
+            }
+            .onChange(of: messages.isEmpty) { _, _ in positionIfNeeded(proxy) }
+            // Follow the conversation when something NEW arrives at the bottom and the reader is
+            // there (or sent it) — not when older pages are added at the top, and not while they
+            // are reading further up (the pill says what came in below instead).
+            .onChange(of: messages.last?.id) { _, _ in
+                guard positionedFor == conversationId, let last = messages.last else { positionIfNeeded(proxy); return }
+                if atBottom || last.mine {
+                    withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                    lastSeenId = last.id
+                    noteReadIfAtBottom()
+                }
+            }
+            // Back in front of the reader (the drawer slid to the chat, the app came back): what is
+            // on screen at the bottom counts as read now.
+            // On iPhone the chat stays mounted behind the channel list: leaving it is leaving the
+            // conversation (the next look opens it afresh, at what is unread by then).
+            .onChange(of: onScreen) { _, now in
+                if now { positionIfNeeded(proxy); noteReadIfAtBottom() }
+                else { positionedFor = nil; unreadAtOpen = nil; barDismissed = false }
+            }
+            .onChange(of: scenePhase) { _, _ in noteReadIfAtBottom() }
+            #if os(iOS)
+            // The keyboard came up (or went away) while the reader was at the newest message:
+            // keep it in view, right above the composer.
+            .onChange(of: KeyboardFrame.shared.frame) { _, _ in
+                guard atBottom, let last = messages.last else { return }
+                DispatchQueue.main.async { withAnimation(KeyboardFrame.shared.animation) { proxy.scrollTo(last.id, anchor: .bottom) } }
+            }
+            #endif
         }
+    }
+
+    private var unreadItems: [UnreadItem] { messages.map(\.unreadItem) }
+
+    /// Put a newly opened conversation at its first unread message, or at its newest one (once its
+    /// rows and its read marker are there). What was unread is frozen for the divider and the bar.
+    private func positionIfNeeded(_ proxy: ScrollViewProxy) {
+        guard positionedFor != conversationId, onScreen, let last = messages.last,
+              reads?.isLoaded(conversationId) ?? true else { return }
+        positionedFor = conversationId
+        let items = unreadItems
+        let marker = reads?.marker(conversationId)
+        if let first = UnreadRule.firstUnreadIndex(items, marker: marker) {
+            unreadAtOpen = UnreadAtOpen(firstId: items[first].id,
+                                        count: UnreadRule.unreadCount(items, marker: marker),
+                                        since: Date(timeIntervalSince1970: Double(items[first].createdAt) / 1000))
+        } else {
+            unreadAtOpen = nil
+        }
+        let target = unreadAtOpen?.firstId ?? last.id
+        // The first unread a little below the top: the "New" divider above it stays clear of the bar.
+        let anchor: UnitPoint = unreadAtOpen == nil ? .bottom : UnitPoint(x: 0.5, y: 0.14)
+        // Arrivals after this moment are what the jump pill counts (the bar covers the rest).
+        lastSeenId = last.id
+        // After this layout pass: the lazy rows must exist before the list can scroll to one.
+        DispatchQueue.main.async {
+            proxy.scrollTo(target, anchor: anchor)
+            if unreadAtOpen == nil { atBottom = true }
+            noteReadIfAtBottom()
+        }
+    }
+
+    /// At the newest message, in front of the reader, in an active app: read up to it.
+    private func noteReadIfAtBottom() {
+        guard atBottom, positionedFor == conversationId, let last = messages.last else { return }
+        lastSeenId = last.id
+        guard onScreen, scenePhase == .active else { return }
+        reads?.markRead(conversationId, upTo: last.unreadItem)
+    }
+
+    private func markAllRead() {
+        barDismissed = true
+        if let last = messages.last { reads?.markRead(conversationId, upTo: last.unreadItem) }
+    }
+
+    /// The bar's text while what was unread at open still is (nil hides the bar).
+    private var barState: String? {
+        guard let open = unreadAtOpen, !barDismissed,
+              UnreadRule.unreadCount(unreadItems, marker: reads?.marker(conversationId)) > 0 else { return nil }
+        return UnreadRule.barText(count: open.count, since: open.since)
+    }
+
+    /// New messages from others below the reader while they are scrolled up.
+    private var newBelow: Int {
+        guard !atBottom else { return 0 }
+        return UnreadRule.newBelow(unreadItems, lastSeenId: lastSeenId)
     }
 
     /// The top of the list: a way to page further back, or a line saying this is the start.
@@ -324,6 +496,11 @@ private struct MessageRow: View {
     #if os(macOS)
     /// A long press on the Mac opens the same actions as a right-click.
     @State private var longPressMenu = false
+    #else
+    /// The long-press action sheet (iOS).
+    @State private var actionSheet = false
+    /// The emoji picker from the reaction row's "+" (iOS).
+    @State private var reactionPicker = false
     #endif
 
     var body: some View {
@@ -337,10 +514,25 @@ private struct MessageRow: View {
             }
             .popover(isPresented: Binding(get: { profileFor != nil }, set: { if !$0 { profileFor = nil } })) {
                 if let uid = profileFor {
-                    MentionProfileCard(userId: uid, label: extras.mentionLabel?(uid) ?? "Unknown contact")
+                    MentionProfileCard(userId: uid, label: extras.mentionLabel?(uid) ?? "Unknown contact",
+                                       badge: extras.mentionBadge?(uid).badge ?? .none)
                 }
             }
+            #if os(iOS)
+            // iPhone / iPad: a long press opens the message's action sheet (reactions first, then
+            // what can be done with it) — one thumb-sized place for everything.
+            .onLongPressGesture(minimumDuration: 0.4) { if !message.isDeleted && hasActions { actionSheet = true } }
+            .sensoryFeedback(.impact(weight: .medium), trigger: actionSheet) { _, now in now }
+            .emojiPickerSheet(isPresented: $reactionPicker) { e in onReact?(message, e) }
+            .sheet(isPresented: $actionSheet) {
+                MessageActionSheet(message: message, onReact: onReact, onReply: onReply, onEdit: onEdit,
+                                   onDelete: onDelete, onForward: onForward,
+                                   onReport: extras.onReport, onBlock: extras.onBlock,
+                                   onSelectText: { selecting = true })
+            }
+            #else
             .contextMenu { if !message.isDeleted { menuItems } }
+            #endif
             #if os(macOS)
             .onLongPressGesture(minimumDuration: 0.5) { if !message.isDeleted { longPressMenu = true } }
             .popover(isPresented: $longPressMenu, arrowEdge: .top) {
@@ -373,6 +565,10 @@ private struct MessageRow: View {
                     HStack(spacing: 8) {
                         Text(message.mine ? "You" : message.author)
                             .font(.system(size: 15, weight: .semibold)).foregroundStyle(.white)
+                        // The plain name above; its trust as a small badge (build 49).
+                        if !message.mine, let id = message.authorId, let badge = extras.authorBadge?(id), badge != .none {
+                            TrustBadge(badge: badge, compact: true)
+                        }
                         Text(fullTime).font(.system(size: 11)).foregroundStyle(.white.opacity(0.4))
                     }
                 }
@@ -397,6 +593,19 @@ private struct MessageRow: View {
                             }
                             .buttonStyle(.plain)
                         }
+                        #if os(iOS)
+                        // Add another reaction: the full picker (iPhone/iPad).
+                        if onReact != nil {
+                            Button { reactionPicker = true } label: {
+                                Image(systemName: "face.smiling").font(.caption)
+                                    .padding(.horizontal, 8).padding(.vertical, 3)
+                                    .background(.white.opacity(0.08), in: Capsule())
+                                    .overlay(Capsule().strokeBorder(.white.opacity(0.12), lineWidth: 1))
+                            }
+                            .buttonStyle(.plain)
+                            .accessibilityLabel("Add a reaction")
+                        }
+                        #endif
                     }.padding(.top, 3)
                 }
             }
@@ -405,6 +614,11 @@ private struct MessageRow: View {
         .padding(.horizontal, 16)
         .padding(.top, grouped ? 1 : 10)
         .padding(.bottom, 1)
+    }
+
+    /// Is there anything to do with this message (previews pass no actions)?
+    private var hasActions: Bool {
+        onReact != nil || onReply != nil || onForward != nil || !message.body.isEmpty
     }
 
     /// Long-press / right-click actions. React row first, then copy/reply/forward, then
@@ -441,7 +655,7 @@ private struct MessageRow: View {
                 Button(role: .destructive) { onReport(message) } label: { Label("Report…", systemImage: "exclamationmark.bubble") }
             }
             if let onBlock = extras.onBlock {
-                Button(role: .destructive) { onBlock(message) } label: { Label("Block \(message.author)…", systemImage: "hand.raised") }
+                Button(role: .destructive) { onBlock(message) } label: { Label("Block \(message.authorSpoken ?? message.author)…", systemImage: "hand.raised") }
             }
         }
     }
@@ -496,7 +710,8 @@ private struct MessageRow: View {
         let base = MessageText.attributed(message.body)
         guard !message.mentions.isEmpty, let label = extras.mentionLabel else { return base }
         return MentionRender.apply(base, visible: message.body, payload: message.mentions, label: label,
-                                   everyoneAllowed: extras.everyoneAllowed?(message.authorId) ?? false)
+                                   everyoneAllowed: extras.everyoneAllowed?(message.authorId) ?? false,
+                                   trust: { extras.mentionBadge?($0) })
     }
 
     /// True for a short message that is only emoji (+ whitespace) — rendered oversized.
@@ -521,6 +736,7 @@ private struct MessageRow: View {
 private struct ChatHeader<Actions: View>: View {
     let title: String
     let subtitle: String?
+    var onlineCount: Int? = nil
     var onBack: (() -> Void)? = nil
     @ViewBuilder let actions: () -> Actions
 
@@ -542,14 +758,27 @@ private struct ChatHeader<Actions: View>: View {
                 Image(systemName: "number")
                     .font(.system(size: 17, weight: .medium)).foregroundStyle(.white.opacity(0.45))
                 Text(title.dropFirst()).font(.system(size: 16, weight: .bold)).foregroundStyle(.white)
+                    .lineLimit(1).layoutPriority(2)
             } else {
                 Text(title).font(.system(size: 16, weight: .bold)).foregroundStyle(.white)
+                    .lineLimit(1).layoutPriority(2)
             }
             if let subtitle {
                 Text("·").foregroundStyle(.white.opacity(0.3))
-                Text(subtitle).font(.system(size: 12)).foregroundStyle(.white.opacity(0.45))
+                Text(subtitle).font(.system(size: 12)).foregroundStyle(.white.opacity(0.45)).lineLimit(1)
             }
-            Spacer()
+            if let onlineCount {
+                // Kept whole: the server name truncates first.
+                HStack(spacing: 4) {
+                    Circle().fill(Color.green).frame(width: 7, height: 7)
+                    Text("\(onlineCount) online").font(.system(size: 12)).foregroundStyle(.white.opacity(0.55))
+                }
+                .fixedSize()
+                .layoutPriority(1)
+                .accessibilityElement(children: .combine)
+                .accessibilityIdentifier("chat.online")
+            }
+            Spacer(minLength: 4)
             actions()
         }
         .padding(.horizontal, 16).padding(.vertical, 12)
@@ -745,6 +974,8 @@ private struct ChatComposer: View {
         }
         .buttonStyle(.plain)
         .disabled(sending || (!hasText && staged.isEmpty))
+        .accessibilityLabel("Send")
+        .accessibilityIdentifier("composer.send")
     }
 }
 
@@ -785,12 +1016,14 @@ private struct ChatBackground: View {
 /// without a live server (SKWOD_SCREEN=chatpreview).
 struct ChatSurfacePreview: View {
     @State private var draft = ""
+    /// Messages that "arrive" while the preview is open (`SKWOD_PREVIEW_ARRIVE=<s>`).
+    @State private var arrived: [ChatMessage] = []
     private let now = Int64(Date().timeIntervalSince1970 * 1000)
     var body: some View {
         ChatSurface(
             title: "#general",
             subtitle: "Weekend Crew",
-            messages: sample,
+            messages: sample + arrived,
             draft: $draft,
             sending: false,
             sendError: nil,
@@ -801,9 +1034,19 @@ struct ChatSurfacePreview: View {
         #if os(macOS)
         .frame(minWidth: 700, minHeight: 600)
         #endif
+        #if DEBUG
+        .task {
+            guard let delay = E2E.env("SKWOD_PREVIEW_ARRIVE").flatMap(Double.init) else { return }
+            for i in 1...3 {
+                try? await Task.sleep(for: .seconds(i == 1 ? delay : 1))
+                arrived.append(.init(id: "a\(i)", author: "robin", body: "just arrived \(i)", mine: false,
+                                     createdAt: Int64(Date().timeIntervalSince1970 * 1000)))
+            }
+        }
+        #endif
     }
     private var sample: [ChatMessage] {
-        [
+        filler + [
             .init(id: "1", author: "robin", body: "hey! just joined 🦑", mine: false, createdAt: now - 600_000),
             .init(id: "2", author: "robin", body: "this place is **end-to-end** encrypted right?", mine: false, createdAt: now - 590_000),
             .init(id: "3", author: "you", body: "yep — the server only ever sees `ciphertext`", mine: true, createdAt: now - 500_000),
@@ -812,6 +1055,20 @@ struct ChatSurfacePreview: View {
             .init(id: "6", author: "sam", body: "nice. what's the safety number thing?", mine: false, reactionPills: [ReactionPill(emoji: "🔒", count: 1, mine: false), ReactionPill(emoji: "👍", count: 2, mine: true)], createdAt: now - 190_000),
             .init(id: "7", author: "you", body: "tap the shield in a DM — compare the 60 digits with the person to be sure no one's in the middle", mine: true, createdAt: now - 60_000),
         ]
+    }
+    /// Earlier history for screenshots of a long conversation (`SKWOD_PREVIEW_MESSAGES=<n>`).
+    private var filler: [ChatMessage] {
+        #if DEBUG
+        let n = Int(E2E.env("SKWOD_PREVIEW_MESSAGES") ?? "") ?? 0
+        let names = ["robin", "sam", "you"]
+        return (0..<n).map { i in
+            let who = names[i % names.count]
+            return .init(id: "f\(i)", author: who, body: "earlier message \(i + 1)", mine: who == "you",
+                         createdAt: now - 3_600_000 + Int64(i) * 60_000)
+        }
+        #else
+        return []
+        #endif
     }
 }
 
@@ -888,3 +1145,209 @@ private struct SelectableTextSheet: View {
         #endif
     }
 }
+
+/// What was unread when a conversation opened (frozen while it stays open).
+struct UnreadAtOpen: Equatable {
+    var firstId: String
+    var count: Int
+    var since: Date
+}
+
+/// The line above the first message that was new when the conversation opened.
+private struct NewMessagesDivider: View {
+    var body: some View {
+        HStack(spacing: 8) {
+            Rectangle().fill(Color.red.opacity(0.75)).frame(height: 1)
+            Text("NEW")
+                .font(.system(size: 10, weight: .heavy)).foregroundStyle(.white)
+                .padding(.horizontal, 6).padding(.vertical, 2)
+                .background(Color.red.opacity(0.85), in: RoundedRectangle(cornerRadius: 4, style: .continuous))
+        }
+        .padding(.leading, 16).padding(.trailing, 12).padding(.vertical, 6)
+        .accessibilityElement(children: .ignore)
+        .accessibilityLabel("New messages")
+        .accessibilityIdentifier("chat.newDivider")
+    }
+}
+
+/// "3 new messages since 4:12 PM" across the top of the list: tap to jump to the first of them,
+/// or mark them read.
+private struct NewMessagesBar: View {
+    let text: String
+    let onJump: () -> Void
+    let onMarkRead: () -> Void
+
+    var body: some View {
+        HStack(spacing: 10) {
+            Button(action: onJump) {
+                HStack(spacing: 6) {
+                    Image(systemName: "arrow.up").font(.system(size: 11, weight: .bold))
+                    Text(text).font(.system(size: 13, weight: .semibold)).lineLimit(1)
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityIdentifier("chat.newBar")
+            Button("Mark as read", action: onMarkRead)
+                .font(.system(size: 13, weight: .bold))
+                .buttonStyle(.plain)
+                .accessibilityIdentifier("chat.markRead")
+        }
+        .foregroundStyle(.black)
+        .padding(.horizontal, 14).padding(.vertical, 9)
+        .background(Color.skAccent, in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+        .shadow(color: .black.opacity(0.25), radius: 8, y: 3)
+    }
+}
+
+/// "↓ 2 new" while the reader is scrolled up and messages arrive below.
+private struct JumpToNewPill: View {
+    let count: Int
+    let onTap: () -> Void
+
+    var body: some View {
+        Button(action: onTap) {
+            HStack(spacing: 5) {
+                Image(systemName: "arrow.down").font(.system(size: 12, weight: .bold))
+                Text("\(count) new").font(.system(size: 13, weight: .semibold))
+            }
+            .foregroundStyle(.black)
+            .padding(.horizontal, 12).padding(.vertical, 8)
+            .background(Color.skAccent, in: Capsule())
+            .shadow(color: .black.opacity(0.3), radius: 6, y: 2)
+        }
+        .buttonStyle(.plain)
+        .accessibilityLabel("\(count) new \(count == 1 ? "message" : "messages") below")
+        .accessibilityIdentifier("chat.jumpNew")
+    }
+}
+
+#if os(iOS)
+/// The long-press sheet for one message (iOS): the message itself, a row of quick reactions, then
+/// its actions — the same ones the Mac's right-click menu lists, and only the ones that apply.
+/// Delete asks first.
+private struct MessageActionSheet: View {
+    let message: ChatMessage
+    var onReact: ((ChatMessage, String) -> Void)?
+    var onReply: ((ChatMessage) -> Void)?
+    var onEdit: ((ChatMessage) -> Void)?
+    var onDelete: ((ChatMessage) -> Void)?
+    var onForward: ((ChatMessage) -> Void)?
+    var onReport: ((ChatMessage) -> Void)?
+    var onBlock: ((ChatMessage) -> Void)?
+    var onSelectText: () -> Void
+    @Environment(\.dismiss) private var dismiss
+    @State private var confirmDelete = false
+    @State private var showPicker = false
+
+    var body: some View {
+        VStack(spacing: 16) {
+            // Which message this is about.
+            VStack(alignment: .leading, spacing: 4) {
+                Text(message.mine ? "You" : (message.authorSpoken ?? message.author))
+                    .font(.system(size: 13, weight: .semibold)).foregroundStyle(.white.opacity(0.6))
+                Text(previewText)
+                    .font(.system(size: 15)).foregroundStyle(.white.opacity(0.9))
+                    .lineLimit(3)
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .padding(12)
+            .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+
+            if onReact != nil {
+                HStack(spacing: 0) {
+                    ForEach(quickReactions.prefix(6), id: \.self) { e in
+                        Button { run { onReact?(message, e) } } label: {
+                            Text(e).font(.system(size: 28))
+                                .frame(maxWidth: .infinity, minHeight: 48)
+                                .background(isMine(e) ? Color.skAccent.opacity(0.28) : .white.opacity(0.07), in: Circle())
+                        }
+                        .buttonStyle(.plain)
+                        .accessibilityLabel("React \(e)")
+                        .padding(.horizontal, 3)
+                    }
+                    // Any other emoji: the full picker.
+                    Button { showPicker = true } label: {
+                        Image(systemName: "plus").font(.system(size: 18, weight: .semibold)).foregroundStyle(.white.opacity(0.8))
+                            .frame(maxWidth: .infinity, minHeight: 48)
+                            .background(.white.opacity(0.07), in: Circle())
+                    }
+                    .buttonStyle(.plain)
+                    .accessibilityLabel("More reactions")
+                    .accessibilityIdentifier("messageActions.moreReactions")
+                    .padding(.horizontal, 3)
+                }
+                .accessibilityIdentifier("messageActions.reactions")
+            }
+
+            VStack(spacing: 0) {
+                if let onReply { row("Reply", "arrowshape.turn.up.left") { onReply(message) } }
+                if let onForward { row("Forward", "arrowshape.turn.up.right") { onForward(message) } }
+                if !message.body.isEmpty {
+                    row("Copy Text", "doc.on.doc") { Clipboard.copy(message.body) }
+                    row("Select Text…", "selection.pin.in.out") { onSelectText() }
+                }
+                if message.mine {
+                    if let onEdit, message.attachment == nil, message.music == nil {
+                        row("Edit", "pencil") { onEdit(message) }
+                    }
+                    if onDelete != nil {
+                        row("Delete", "trash", destructive: true, closes: false) { confirmDelete = true }
+                    }
+                } else if message.authorId != nil {
+                    if let onReport { row("Report…", "exclamationmark.bubble", destructive: true) { onReport(message) } }
+                    if let onBlock { row("Block \(message.authorSpoken ?? message.author)…", "hand.raised", destructive: true) { onBlock(message) } }
+                }
+            }
+            .background(.white.opacity(0.06), in: RoundedRectangle(cornerRadius: 12, style: .continuous))
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 16).padding(.top, 22)
+        .presentationDetents([.medium, .large])
+        .presentationDragIndicator(.visible)
+        .emojiPickerSheet(isPresented: $showPicker) { e in run { onReact?(message, e) } }
+        .confirmationDialog("Delete this message?", isPresented: $confirmDelete, titleVisibility: .visible) {
+            Button("Delete for everyone", role: .destructive) { run { onDelete?(message) } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("It's removed from the conversation for everyone in it.")
+        }
+    }
+
+    private var previewText: String {
+        if !message.body.isEmpty { return message.body }
+        if message.attachment != nil { return "Attachment" }
+        if message.music != nil { return "Song" }
+        return ""
+    }
+
+    private func isMine(_ emoji: String) -> Bool {
+        message.reactionPills.contains { $0.emoji == emoji && $0.mine }
+    }
+
+    /// Close the sheet, then act once it is gone (a reply or edit lands in the composer behind
+    /// it; another sheet — Select Text, Forward, Report — can only open after this one closed).
+    private func run(_ action: @escaping () -> Void) {
+        dismiss()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: action)
+    }
+
+    private func row(_ title: String, _ icon: String, destructive: Bool = false, closes: Bool = true,
+                     _ action: @escaping () -> Void) -> some View {
+        Button { closes ? run(action) : action() } label: {
+            HStack(spacing: 12) {
+                Image(systemName: icon).frame(width: 22)
+                Text(title)
+                Spacer()
+            }
+            .font(.system(size: 16))
+            .foregroundStyle(destructive ? Color.red : .white)
+            .padding(.horizontal, 14).frame(minHeight: 48)
+            .contentShape(Rectangle())
+        }
+        .buttonStyle(.plain)
+        .accessibilityIdentifier("messageActions.\(title)")
+    }
+}
+#endif

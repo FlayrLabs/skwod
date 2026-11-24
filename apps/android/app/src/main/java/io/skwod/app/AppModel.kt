@@ -798,6 +798,77 @@ class AppModel private constructor(private val ctx: Context) {
      * (never silent, never just the first). Notices about a contact are also written by the core
      * as a persistent system row in that contact's conversation.
      */
+    /** Build 49: hand the contact book and the avatars to our other devices (sealed, core-limited).
+     *  Bound to the skwod it started for: the same binding and client after every await. */
+    suspend fun shareWithSiblings() {
+        val asked = bound ?: return
+        val c = asked.client
+        val wid = asked.workspaceId
+        fun still() = Asked.holds(asked, bound) && client === c && current?.id == wid
+        avatars.loadIfNeeded()
+        if (!still()) return
+        contacts.siblingPayload(wid)?.let { book ->
+            try { withContext(Dispatchers.IO) { c.shareWithSiblings("contacts.v1", book.toByteArray()) } } catch (_: Exception) {}
+        }
+        if (!still()) return
+        val entries = avatars.siblingEntries(wid) ?: return
+        val mine = current?.userId?.let { AvatarStore.userKey(it) }
+        for (batch in SiblingRules.batches(entries, mine)) {
+            if (!still()) return
+            val body = org.json.JSONArray().apply { batch.forEach { e -> put(org.json.JSONObject().put("key", e.key).put("img", e.img ?: "").put("ts", e.ts)) } }.toString()
+            try { withContext(Dispatchers.IO) { c.shareWithSiblings("avatars.v1", body.toByteArray()) } } catch (_: Exception) { return }
+        }
+    }
+
+    /** Build 49: take what our other devices handed over — into the skwod it was taken for; a
+     *  newly linked device asks once. */
+    private suspend fun drainSiblings() {
+        val asked = bound ?: return
+        val c = asked.client
+        val wid = asked.workspaceId
+        fun still() = Asked.holds(asked, bound) && client === c && current?.id == wid
+        val prefs = ctx.getSharedPreferences("skwod-b49", Context.MODE_PRIVATE)
+        if (!prefs.getBoolean("asked-$wid", false)) {
+            val sent = try { withContext(Dispatchers.IO) { c.requestSiblingState() } } catch (_: Exception) { 0u }
+            if (sent > 0u && still()) prefs.edit().putBoolean("asked-$wid", true).apply()
+        }
+        // This skwod's stores first: payloads are taken only once they can be merged.
+        contacts.load()
+        avatars.loadIfNeeded()
+        if (!still()) return
+        val payloads = try { withContext(Dispatchers.IO) { c.takeSiblingPayloads() } } catch (_: Exception) { emptyList() }
+        if (!still()) return
+        for (p in payloads) {
+            // Our own account is ours: its avatar comes from our own device (no snapshot entry).
+            val vouched = p.vouchedUsers.toSet() + listOfNotNull(current?.userId)
+            val mismatched = p.mismatchedUsers.toSet()
+            when (p.kind) {
+                // Names at most KNOWN; the verifications were merged by the core — shown VERIFIED
+                // where the core now says so (through the gated raise path).
+                "contacts.v1" -> {
+                    val book = SiblingBook.decode(String(p.body))
+                    if (!contacts.mergeFromSibling(book, wid, vouched, mismatched)) continue
+                    for (uid in book.filter { it.value.level == TrustLevel.VERIFIED && it.key in vouched && it.key !in mismatched }.keys.take(500)) {
+                        val st = try { withContext(Dispatchers.IO) { c.contactStatus(uid) } } catch (_: Exception) { null } ?: continue
+                        if (!still()) return
+                        if (!st.verified || !contacts.setVerifiedFromSibling(uid, book[uid]?.name, wid)) continue
+                        // Read again: an un-verify that happened meanwhile wins.
+                        val again = try { withContext(Dispatchers.IO) { c.contactStatus(uid) } } catch (_: Exception) { null } ?: continue
+                        if (!still()) return
+                        contacts.noteStatusRead(uid, again.verified)
+                    }
+                }
+                "avatars.v1" -> {
+                    val arr = try { org.json.JSONArray(String(p.body)) } catch (_: Exception) { continue }
+                    val entries = (0 until minOf(arr.length(), 64)).mapNotNull { i ->
+                        arr.optJSONObject(i)?.let { o -> SiblingRules.AvatarEntry(o.optString("key"), o.optString("img").ifEmpty { null }, o.optLong("ts")) }
+                    }
+                    avatars.mergeFromSibling(entries, wid, vouched, mismatched)
+                }
+            }
+        }
+    }
+
     suspend fun surfaceSecurityNotices() {
         val c = client ?: return
         val notices = try { c.takeSecurityNotices() } catch (_: Exception) { emptyList() }
@@ -816,6 +887,9 @@ class AppModel private constructor(private val ctx: Context) {
                 account.noteRecoveryRequest(n.deviceId, n.requestId, n.fingerprint, n.atMs.toLong())
                 continue
             }
+            // Build 49: one of our own devices asks for what it is missing; or one was just linked.
+            if (n.kind == "sibling_state_requested") { launchIO { shareWithSiblings() }; continue }
+            if (n.kind == "device_linked") launchIO { shareWithSiblings(); avatars.resendMine() }
             var alert = SecurityNotices.alert(n.kind, n.userId, n.deviceId, n.wasVerified, n.serverId, ::nameOf,
                 n.fingerprint, account::deviceLabel) ?: continue
             // "Accept" on this notice accepts the device set as it is NOW, when the notice is
@@ -828,6 +902,7 @@ class AppModel private constructor(private val ctx: Context) {
             // …and kept: Profile → Encryption → Security activity.
             account.log(n.kind, alert.title, alert.message, n.atMs.toLong())
         }
+        drainSiblings()
     }
 
     /**
@@ -2027,6 +2102,26 @@ class AppModel private constructor(private val ctx: Context) {
         serverOwners = owners
         val gone = ServerList.gone(chat.spaces.map { it.serverId }, owners.keys)
         for (sid in gone) chat.removeServer(sid)
+        // A server renamed by its owner (on any device): the decrypted names.
+        val c = client ?: return
+        val names = try { withContext(Dispatchers.IO) { c.serverNames() } } catch (_: Exception) { return }
+        if (current?.localId == wid) chat.applyServerNames(names)
+    }
+
+    /** Build 49: rename a server for everyone in it (the host checks MANAGE_SERVER). The core seals
+     *  the name under the space key. Returns a sentence when it failed. */
+    suspend fun renameServer(serverId: String, raw: String): String? {
+        ServerName.problem(raw)?.let { return it }
+        val c = client ?: return "Not connected — try again."
+        val wid = current?.localId
+        val stored = try { withContext(Dispatchers.IO) { c.renameServer(serverId, raw) } }
+        catch (e: kotlinx.coroutines.CancellationException) { throw e }
+        catch (e: Exception) {
+            routeIfDeviceError(e)
+            return if ("status 403" in e.toString()) "Only the server's owner or an admin can rename it." else "Couldn't rename the server — check your connection and try again."
+        }
+        if (current?.localId == wid) chat.applyServerNames(mapOf(serverId to stored))
+        return null
     }
 
     /**

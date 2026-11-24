@@ -19,6 +19,20 @@ enum ContactTrust {
     struct Display: Equatable {
         var text: String
         var badge: Badge
+        /// The name for `surface`: the plain name where a badge is drawn beside it, the words
+        /// everywhere else.
+        func label(for surface: Surface) -> String { ContactTrust.form(surface) == .badge ? text : spoken }
+        /// A badge must be drawn beside the plain name (`label(for:)` on a badge surface).
+        var needsBadge: Bool { badge != .none }
+        /// The words a mention chip keeps for a flagged name (its mark otherwise: a dotted
+        /// underline for UNVERIFIED, nothing for a known or verified name).
+        var chipWords: String? {
+            switch badge {
+            case .unconfirmed: return "unconfirmed"
+            case .impersonation: return "look-alike"
+            case .none, .verified, .unverified: return nil
+            }
+        }
         /// A name to put in a banner / notification / sentence.
         var spoken: String {
             switch badge {
@@ -30,7 +44,41 @@ enum ContactTrust {
         }
     }
 
+    /// Build 49: where a name appears decides its form. Styled rows (message headers, member
+    /// and DM rows, mention chips) show the plain name WITH a small badge (`TrustBadge`, or a
+    /// dotted underline in a mention chip); text-only and security-relevant places keep the
+    /// words ("(unverified)"). The trust signal never disappears — it changes shape.
+    enum Surface: CaseIterable {
+        case notification, incomingCall, dialogTitle, joinConfirmation, groupConfirmation, kickBanDialog, securityNotice, typing
+        case mentionPicker, replyPreview, actionSheet, approvalRow, blockReportTarget
+        case messageHeader, memberRow, dmRow, mentionChip, profileCard
+    }
+    enum Form: Equatable { case text, badge }
+
+    static func form(_ surface: Surface) -> Form {
+        switch surface {
+        case .messageHeader, .memberRow, .dmRow, .mentionChip, .profileCard: return .badge
+        case .notification, .incomingCall, .dialogTitle, .joinConfirmation, .groupConfirmation, .kickBanDialog, .securityNotice, .typing,
+             .mentionPicker, .replyPreview, .actionSheet, .approvalRow, .blockReportTarget: return .text
+        }
+    }
+
     static func unknownName(_ userId: String) -> String { "Unknown contact \(userId.prefix(6))" }
+
+    /// How a mention of `userId` is shown: the signed-in user is themself — their own name, no
+    /// marker (they have no contact entry for themself); anyone else through `other`.
+    /// `myName` should be a name this device holds for itself (never the server's list); as a
+    /// second line, one that looks like someone the user knows, or has unusual characters, is
+    /// shown as "you".
+    static func mentionDisplay(userId: String, me: String?, myName: String?, book: [String: Contact] = [:],
+                               roster: [String: String] = [:], other: (String) -> Display) -> Display {
+        if let me, !me.isEmpty, userId == me {
+            guard let myName, !myName.isEmpty, !collides(userId: me, name: myName, book: book, roster: roster),
+                  !WaitingTrust.hasUnusualCharacters(myName) else { return Display(text: "you", badge: .none) }
+            return Display(text: myName, badge: .none)
+        }
+        return other(userId)
+    }
 
     /// Does `name` look like the name of someone ELSE the user has grounds to recognise: a
     /// KNOWN or VERIFIED contact, or an accepted member (`roster`: user id → name) of a server
@@ -84,20 +132,37 @@ enum ContactTrust {
     /// otherwise touches a contact the user pinned; a user action sets the name it was taken
     /// under and raises the level (it never lowers it).
     static func merged(existing: Contact?, name: String, level: TrustLevel) -> Contact {
-        guard let existing else { return Contact(name: name, level: level) }
+        guard let existing else { return Contact(name: name, level: level, known: level >= .known ? true : nil) }
         if level == .unverified {
-            return existing.level >= .known ? existing : Contact(name: name.isEmpty ? existing.name : name, level: .unverified)
+            return existing.level >= .known ? existing : Contact(name: name.isEmpty ? existing.name : name, level: .unverified, known: existing.known)
         }
-        return Contact(name: name.isEmpty ? existing.name : name, level: max(existing.level, level))
+        return Contact(name: name.isEmpty ? existing.name : name, level: max(existing.level, level),
+                       known: level >= .known ? true : existing.known)
     }
 
     /// The core says whether the safety number is (still) verified: verifying promotes to
     /// VERIFIED; a verification that no longer holds falls back to KNOWN (the user did act).
     static func withVerification(_ existing: Contact?, name: String, verified: Bool) -> Contact? {
-        if verified { return Contact(name: (existing?.level ?? .unverified) >= .known ? existing!.name : name, level: .verified) }
+        if verified {
+            return Contact(name: (existing?.level ?? .unverified) >= .known ? existing!.name : name, level: .verified,
+                           known: existing?.explicitlyKnown ?? false)
+        }
         guard let existing else { return nil }
-        return existing.level == .verified ? Contact(name: existing.name, level: .known) : existing
+        // Un-verified: back to KNOWN only if the user had made them known themself.
+        guard existing.level == .verified else { return existing }
+        return Contact(name: existing.name, level: existing.explicitlyKnown ? .known : .unverified, known: existing.known)
     }
+
+    /// Build 49: a READ of the core's state (opening the safety-number screen, refreshing it)
+    /// may only demote or leave alone — it never creates or raises a pinned name. Raising
+    /// happens only after an explicit, successful verification (`withVerification(verified: true)`).
+    static func afterStatusRead(_ existing: Contact?, verified: Bool) -> Contact? {
+        guard let existing, !verified, existing.level == .verified else { return nil }
+        return withVerification(existing, name: existing.name, verified: false)
+    }
+
+    /// May an explicit verification pin this name? Not a flagged one (unconfirmed, look-alike).
+    static func mayPinOnVerify(_ badge: Badge) -> Bool { badge != .unconfirmed && badge != .impersonation }
 
     /// A flag that stands in the way of trusting a name: a look-alike / unusual characters, a
     /// directory lookup that led elsewhere, or one that could not be made.

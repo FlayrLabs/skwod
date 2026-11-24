@@ -10,7 +10,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.48.0"
+version = "0.50.0"
 edition = "2021"
 license = "AGPL-3.0-only"     # ADR-011 (supersedes ADR-002): we link libsignal
 rust-version = "1.93.1"     # libsignal v0.108.0 MSRV

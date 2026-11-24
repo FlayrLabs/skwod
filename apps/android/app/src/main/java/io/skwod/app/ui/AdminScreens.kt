@@ -74,6 +74,11 @@ fun MembersSheet(serverId: String, serverName: String, onClose: () -> Unit) {
     var confirmBan by remember { mutableStateOf<PresenceMember?>(null) }
     var confirmDelete by remember { mutableStateOf<PresenceMember?>(null) }
     var confirmDeleteBan by remember { mutableStateOf<PresenceMember?>(null) }
+    // Build 49: "Verify safety number" from the member list (not only from a DM).
+    var verifying by remember { mutableStateOf<PresenceMember?>(null) }
+    verifying?.let { m ->
+        SafetyNumberDialog(model.contacts.shown(m.userId, m.username).name, m.userId, onClose = { verifying = null })
+    }
     var status by remember { mutableStateOf<String?>(null) }
     var tick by remember { mutableStateOf(0) }
 
@@ -155,6 +160,10 @@ fun MembersSheet(serverId: String, serverName: String, onClose: () -> Unit) {
                         Spacer(Modifier.height(8.dp))
                     }
                     if (!isMe) {
+                        TextButton(onClick = { verifying = m; sheetFor = null }) {
+                            Icon(Icons.Filled.VerifiedUser, null, tint = Color.White.copy(alpha = 0.8f)); Spacer(Modifier.width(6.dp))
+                            Text("Verify safety number…", color = Color.White)
+                        }
                         // For everyone, about anyone: block (or unblock) and report.
                         val blocked = BlockList.contains(m.userId)
                         TextButton(onClick = {

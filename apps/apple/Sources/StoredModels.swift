@@ -42,13 +42,21 @@ struct Contact: Codable, Equatable {
     var name: String
     /// Absent in anything stored without it (an older build, a hand-written entry): unverified.
     var level: TrustLevel
+    /// Build 49: the user made them KNOWN by an action of their own (started a conversation, let
+    /// them in, accepted them) — what un-verifying falls back to. Absent (older entries): known
+    /// exactly when the stored level was at least KNOWN.
+    var known: Bool?
 
-    init(name: String, level: TrustLevel) { self.name = name; self.level = level }
+    init(name: String, level: TrustLevel, known: Bool? = nil) { self.name = name; self.level = level; self.known = known }
+
+    /// Was KNOWN by the user's own action.
+    var explicitlyKnown: Bool { known ?? (level >= .known) }
 
     init(from decoder: Decoder) throws {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         name = try c.decodeIfPresent(String.self, forKey: .name) ?? ""
         level = (try? c.decodeIfPresent(TrustLevel.self, forKey: .level)).flatMap { $0 } ?? .unverified
+        known = try? c.decodeIfPresent(Bool.self, forKey: .known)
     }
 }
 

@@ -119,6 +119,8 @@ final class AppState: ObservableObject {
     let realtime = Realtime()
     /// Who is typing in the open conversation (build 46).
     let typing = TypingCenter()
+    /// Where each conversation was last read on this device (build 49: divider, bar, jump pill).
+    let reads = ReadMarkerStore()
     /// E2EE avatars (profile pics, server icons, skwod icons) for the active workspace.
     let avatars = AvatarStore()
     /// Who is waiting to be let into each server of the active workspace (join requests + members
@@ -147,6 +149,7 @@ final class AppState: ObservableObject {
     private var waitingCancellable: AnyCancellable?
 
     init() {
+        reads.app = self
         #if DEBUG
         E2E.atLaunch()
         E2E.startAccountDriver(self)
@@ -571,6 +574,16 @@ final class AppState: ObservableObject {
                 noteRecoveryRequest(n)
                 continue
             }
+            // Build 49: one of our own devices (a newly linked one) asks for what it is missing.
+            if n.kind == "sibling_state_requested" {
+                Task { await SiblingSync.share(self) }
+                continue
+            }
+            // A device of ours was just linked: hand it the contact book and the avatars, and
+            // send my avatar again so it can read it (it cannot decrypt the one sent before).
+            if n.kind == "device_linked" {
+                Task { await SiblingSync.share(self); await avatars.resendMine() }
+            }
             if var alert = SecurityAlert.from(kind: n.kind, userId: n.userId, deviceId: n.deviceId,
                                               wasVerified: n.wasVerified, serverId: n.serverId, name: name(of:),
                                               deviceName: deviceNames[n.deviceId], workspaceId: noticesOf) {
@@ -591,6 +604,9 @@ final class AppState: ObservableObject {
             }
         }
         await maybePromptForRecoveryKey()
+        // Build 49: what our other devices handed over; and, on a newly linked device, ask once.
+        await SiblingSync.drain(self)
+        await SiblingSync.requestIfNeeded(self)
     }
 
     /// Restore persisted workspaces at launch and open the last-active one (no network sign-in).
@@ -1731,6 +1747,7 @@ struct SkwodApp: App {
                 .environmentObject(app)
                 .environmentObject(updater)
                 .environment(\.typingCenter, app.typing)
+                .environment(app.reads)
                 .preferredColorScheme(.dark)
                 .tint(.skAccent)
                 .windowGlass()   // translucent macOS window — desktop shows through the glass
@@ -2184,6 +2201,7 @@ private struct DebugScreen: View {
         case "linkapprove": DeviceLinkApproveSheet()
         case "backup": KeyBackupSetupSheet {}
         case "chatpreview": ChatSurfacePreview()
+        case "drawerchat": MainView()   // the chat preview inside the iPhone pager (MainView.DrawerChat)
         case "profile": ProfileView()
         case "feed": FeedView().environmentObject(ChatModel())
         case "music": MusicSearchSheet { _ in }

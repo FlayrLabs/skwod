@@ -22,7 +22,11 @@ enum class TrustLevel {
 }
 
 /** One entry of the local contact book. */
-data class Contact(val userId: String, val name: String, val level: TrustLevel)
+data class Contact(val userId: String, val name: String, val level: TrustLevel, val known: Boolean? = null) {
+    /** Build 49: made KNOWN by the user's own action — what un-verifying falls back to. Absent
+     *  (older entries): known exactly when the stored level was at least KNOWN. */
+    val explicitlyKnown: Boolean get() = known ?: (level >= TrustLevel.KNOWN)
+}
 
 /** The pure rules of the contact book and of conversation binding. Unit-tested on the JVM. */
 object ContactTrust {
@@ -51,6 +55,11 @@ object ContactTrust {
         val unverified: Boolean get() = level == TrustLevel.UNVERIFIED
         /** Shown as an ordinary name: relied on by the user, and nothing wrong with it. */
         val trusted: Boolean get() = !unverified && flag == Flag.NONE
+        /** Build 49: the name for [surface] — plain where a mark is drawn beside it
+         *  ([NameTrustMark], or a "?" after a mention chip), the words everywhere else. */
+        fun labelFor(surface: NameSurface): String = if (surface.form == NameForm.BADGE) name else label
+        /** A mark must be drawn beside the plain name. */
+        val needsMark: Boolean get() = unverified || flag != Flag.NONE || verified
         /** One-line text form, for places that cannot style (notifications, dialog titles). */
         val label: String get() = when {
             flag != Flag.NONE -> "$name (${flag.mark})"
@@ -161,7 +170,10 @@ object ContactTrust {
             }
             TrustLevel.VERIFIED -> {
                 // Verification is about keys, not names: it stands even with no name on record.
-                Contact(userId, old?.name?.takeIf { it.isNotEmpty() } ?: clean, TrustLevel.VERIFIED)
+                // The name pinned is the one shown and checked — the old one only if the user had
+                // already pinned it (KNOWN or above), matching Apple's `withVerification`.
+                val keep = old?.takeIf { it.level >= TrustLevel.KNOWN }?.name?.takeIf { it.isNotEmpty() }
+                Contact(userId, keep ?: clean, TrustLevel.VERIFIED, old?.explicitlyKnown ?: false)
             }
         }
         return if (next == old) book else book + (userId to next)
@@ -187,16 +199,29 @@ object ContactTrust {
                    others: CollisionSet = CollisionSet.of(book), lookup: WaitingTrust.Lookup? = null): Map<String, Contact> =
         if (alreadyListed) book else promote(book, userId, name, others, lookup)
 
-    /** The safety number is no longer verified (the user cleared it, or the keys changed): back to KNOWN. */
+    /** The safety number is no longer verified (the user cleared it, or the keys changed): back
+     *  to KNOWN only for someone the user made known themself, else UNVERIFIED. */
     fun unverify(book: Map<String, Contact>, userId: String): Map<String, Contact> {
         val old = book[userId] ?: return book
-        return if (old.level == TrustLevel.VERIFIED) book + (userId to old.copy(level = TrustLevel.KNOWN)) else book
+        return if (old.level == TrustLevel.VERIFIED)
+            book + (userId to old.copy(level = if (old.explicitlyKnown) TrustLevel.KNOWN else TrustLevel.UNVERIFIED)) else book
     }
+
+    /** Build 49: a READ of the core's state may only demote — never create or raise a name. */
+    fun afterStatusRead(book: Map<String, Contact>, userId: String, verified: Boolean): Map<String, Contact> =
+        if (!verified && book[userId]?.level == TrustLevel.VERIFIED) unverify(book, userId) else book
+
+    /** Build 49: a mention of me reads "you" — never a name the server could have supplied
+     *  (matching Apple). */
+    const val SELF_MENTION = "you"
+
+    /** May an explicit verification pin this name? Not a flagged one. */
+    fun mayPinOnVerify(shown: Shown): Boolean = shown.flag == Flag.NONE
 
     // ---- persistence ----
 
     fun encode(book: Map<String, Contact>): String = JSONArray().apply {
-        for (c in book.values) put(JSONObject().put("userId", c.userId).put("name", c.name).put("level", c.level.name))
+        for (c in book.values) put(JSONObject().put("userId", c.userId).put("name", c.name).put("level", c.level.name).apply { c.known?.let { put("known", it) } })
     }.toString()
 
     /**
@@ -220,7 +245,7 @@ object ContactTrust {
             val o = arr.optJSONObject(i) ?: continue
             val id = o.optString("userId"); if (id.isEmpty()) continue
             val level = try { TrustLevel.valueOf(o.optString("level")) } catch (_: Exception) { TrustLevel.UNVERIFIED }
-            out[id] = Contact(id, o.optString("name"), level)
+            out[id] = Contact(id, o.optString("name"), level, if (o.has("known")) o.optBoolean("known") else null)
         }
         return out
     }
@@ -337,6 +362,17 @@ class ContactBook(private val model: AppModel) {
         return stored == null
     }
 
+    /** Build 49: the contact book one of our own devices handed over, for [workspaceId]
+     *  ([SiblingRules.mergedBook]). False when another skwod's book is loaded. */
+    fun mergeFromSibling(synced: Map<String, Contact>, workspaceId: String, vouched: Set<String>, mismatched: Set<String>): Boolean {
+        if (workspaceId.isEmpty() || loadedFor != workspaceId || model.current?.id != workspaceId) return false
+        update { book -> SiblingRules.mergedBook(book, synced, vouched, mismatched, rosterState.value).let { if (it == book) book else it } }
+        return true
+    }
+
+    /** The book of [workspaceId] as a sibling payload (null for another skwod's book). */
+    fun siblingPayload(workspaceId: String): String? = if (workspaceId.isNotEmpty() && loadedFor == workspaceId) SiblingBook.encode(state.value) else null
+
     @Synchronized
     private fun update(change: (Map<String, Contact>) -> Map<String, Contact>) {
         val wid = model.current?.id ?: return
@@ -362,6 +398,7 @@ class ContactBook(private val model: AppModel) {
 
     /** Accepted members of the servers this account is in (user id → claimed name). */
     val roster: Map<String, String> get() = rosterState.value
+    val book: Map<String, Contact> get() = state.value
 
     @Synchronized
     fun setRoster(accepted: Map<String, String>) {
@@ -440,9 +477,30 @@ class ContactBook(private val model: AppModel) {
     }
 
     /** Follow the core's verification state for this contact (the user compared safety numbers — or no longer has). */
-    fun setVerified(userId: String, verified: Boolean, name: String?) = update {
-        if (verified) ContactTrust.record(it, userId, name ?: "", TrustLevel.VERIFIED) else ContactTrust.unverify(it, userId)
+    /** The ONE raise path, gated here (not by callers): a verification pins only a name that is
+     *  clean right now ([ContactTrust.mayPinOnVerify] on [shown]: no look-alike, no unusual
+     *  characters, no failed name check). Returns false when refused. The only caller that raises
+     *  is `SafetyNumberDialog.refreshStatus(explicitVerify = true)` (see Build49Test). */
+    fun setVerified(userId: String, verified: Boolean, name: String?): Boolean {
+        if (verified) {
+            val shown = shown(userId, name)
+            if (!ContactTrust.mayPinOnVerify(shown)) return false
+            update { ContactTrust.record(it, userId, shown.name, TrustLevel.VERIFIED) }
+        } else update { ContactTrust.unverify(it, userId) }
+        return true
     }
+
+    /** Build 49: the sibling merge's raise, bound to [workspaceId] inside the store's lock: a
+     *  switch of skwod in between makes it a no-op. The caller re-reads the core after it
+     *  ([noteStatusRead]) so a concurrent un-verify wins. */
+    @Synchronized
+    fun setVerifiedFromSibling(userId: String, name: String?, workspaceId: String): Boolean {
+        if (workspaceId.isEmpty() || loadedFor != workspaceId || model.current?.id != workspaceId) return false
+        return setVerified(userId, true, name)
+    }
+
+    /** A read of the core's state: may only demote ([ContactTrust.afterStatusRead]). */
+    fun noteStatusRead(userId: String, verified: Boolean) = update { ContactTrust.afterStatusRead(it, userId, verified) }
 
     /** Known / verified people, as (account id, name) — what a new name is compared against. */
     fun knownPeople(): List<Pair<String, String>> = state.value.values.filter { it.level != TrustLevel.UNVERIFIED }.map { it.userId to it.name }

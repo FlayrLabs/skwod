@@ -900,6 +900,29 @@ pub struct CreateServer {
     pub description_ciphertext: Option<String>,
 }
 
+/// A sealed server name, at most (a 400-byte name, its version and renamer, nonce and tag fit
+/// several times over). Anything longer is not a name.
+pub(crate) const MAX_NAME_CIPHERTEXT: usize = 2048;
+
+/// A sealed server description, at most.
+pub(crate) const MAX_DESCRIPTION_CIPHERTEXT: usize = 8192;
+
+fn bounded_description(b64: &str) -> Result<Vec<u8>, ApiError> {
+    let bytes = b64_decode(b64)?;
+    if bytes.len() > MAX_DESCRIPTION_CIPHERTEXT {
+        return Err(ApiError::BadRequest("description_ciphertext must be at most 8192 bytes"));
+    }
+    Ok(bytes)
+}
+
+fn bounded_name(b64: &str) -> Result<Vec<u8>, ApiError> {
+    let bytes = b64_decode(b64)?;
+    if bytes.is_empty() || bytes.len() > MAX_NAME_CIPHERTEXT {
+        return Err(ApiError::BadRequest("name_ciphertext must be 1..=2048 bytes"));
+    }
+    Ok(bytes)
+}
+
 async fn create_server(
     State(state): State<AppState>,
     auth: AuthUser,
@@ -910,8 +933,8 @@ async fn create_server(
     if !can_create_servers(&state, &auth.user_id).await? {
         return Err(ApiError::Forbidden);
     }
-    let name = b64_decode(&req.name_ciphertext)?;
-    let description = req.description_ciphertext.as_deref().map(b64_decode).transpose()?;
+    let name = bounded_name(&req.name_ciphertext)?;
+    let description = req.description_ciphertext.as_deref().map(bounded_description).transpose()?;
     let now = now_ms();
     let server_id = new_id();
 
@@ -995,7 +1018,7 @@ async fn update_server(
     let now = now_ms();
     if let Some(name) = &req.name_ciphertext {
         sqlx::query("UPDATE servers SET name_ciphertext = $1, updated_at = $2 WHERE id = $3")
-            .bind(b64_decode(name)?)
+            .bind(bounded_name(name)?)
             .bind(now)
             .bind(&server_id)
             .execute(&state.db)
@@ -1003,7 +1026,7 @@ async fn update_server(
     }
     if let Some(desc) = &req.description_ciphertext {
         sqlx::query("UPDATE servers SET description_ciphertext = $1, updated_at = $2 WHERE id = $3")
-            .bind(b64_decode(desc)?)
+            .bind(bounded_description(desc)?)
             .bind(now)
             .bind(&server_id)
             .execute(&state.db)

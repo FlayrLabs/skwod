@@ -1810,7 +1810,57 @@ impl SkwodClient {
 
     /// The decrypted name of a joined server (null until its space key arrives). Labels the sidebar.
     pub async fn server_name(&self, server_id: String) -> Result<Option<String>, CoreError> {
-        Ok(self.engine.lock().await.server_name(&server_id).await?)
+        let r = self.engine.lock().await.server_name(&server_id).await;
+        self.persist().await;   // the newest name version accepted
+        Ok(r?)
+    }
+
+    /// The names of every joined server this device can decrypt, by server id (one request) —
+    /// how a rename made elsewhere reaches the sidebar.
+    pub async fn server_names(&self) -> Result<std::collections::HashMap<String, String>, CoreError> {
+        let r = self.engine.lock().await.server_names().await;
+        self.persist().await;
+        Ok(r?)
+    }
+
+    /// Rename a server we hold the space key for (needs MANAGE_SERVER on the host). The name is
+    /// sealed under the space key; returns it as stored (trimmed).
+    pub async fn rename_server(&self, server_id: String, name: String) -> Result<String, CoreError> {
+        let r = self.engine.lock().await.rename_server(&server_id, &name).await;
+        self.persist().await;
+        Ok(r?)
+    }
+
+    /// Build 49: hand app state to every verified device of our own account, sealed (kinds:
+    /// `contacts.v1` — sent with this device's contact verifications — and `avatars.v1`; at most
+    /// 160 KiB each, rate-limited). Returns how many devices it went to.
+    pub async fn share_with_siblings(&self, kind: String, body: Vec<u8>) -> Result<u32, CoreError> {
+        let r = self.engine.lock().await.share_with_siblings(&kind, body).await;
+        self.persist().await;
+        Ok(r?)
+    }
+
+    /// Build 49: ask our other devices for their state (a newly linked device, once linked).
+    /// They are told with a `sibling_state_requested` security notice.
+    pub async fn request_sibling_state(&self) -> Result<u32, CoreError> {
+        let r = self.engine.lock().await.request_sibling_state().await;
+        self.persist().await;
+        Ok(r?)
+    }
+
+    /// Build 49: app state our own devices handed over since the last call. Verifications in
+    /// it were already merged by the core. An entry may be applied ONLY for a user in
+    /// `vouched_users` (in the sender's identity snapshot, agreeing with this device);
+    /// `mismatched_users` are held under other keys here.
+    pub async fn take_sibling_payloads(&self) -> Vec<SiblingPayload> {
+        let taken = self.engine.lock().await.take_sibling_payloads();
+        if !taken.is_empty() {
+            self.persist().await;
+        }
+        taken
+            .into_iter()
+            .map(|p| SiblingPayload { from_device: p.from_device, kind: p.kind, body: p.body, vouched_users: p.vouched_users, mismatched_users: p.mismatched_users })
+            .collect()
     }
 
     /// Provision a newly-approved member: relay the space key + every channel's sender key to them
@@ -3806,4 +3856,16 @@ mod tests {
         let err = SkwodCache::open("/tmp/x".into(), "abcd".into());
         assert!(matches!(err, Err(CoreError::Invalid { .. })));
     }
+}
+
+/// App state from one of our own devices (build 49; `take_sibling_payloads`).
+#[derive(Debug, uniffi::Record)]
+pub struct SiblingPayload {
+    pub from_device: String,
+    pub kind: String,
+    pub body: Vec<u8>,
+    /// The only users a payload entry may be applied for (fail closed).
+    pub vouched_users: Vec<String>,
+    /// Contacts whose devices that sibling sees differently from this device: skip them.
+    pub mismatched_users: Vec<String>,
 }

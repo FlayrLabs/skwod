@@ -106,16 +106,27 @@ final class ChatModel: ObservableObject {
         if resolved != feedChannels { feedChannels = resolved }
     }
 
+    /// Build 49: is the conversation page in front? On iPhone the selected chat stays mounted
+    /// behind the channel list; while it is behind, nothing in it counts as seen — its messages
+    /// and mentions alert and badge as usual. Always true on the Mac.
+    var chatPageVisible = true { didSet { if chatPageVisible != oldValue { refocus() } } }
+
+    /// The topic the user is looking at, or nil.
+    func refocus() {
+        guard chatPageVisible else { app?.realtime.focusedTopic = nil; return }
+        switch selection {
+        case .space(let s): app?.realtime.focusedTopic = "channel:\(s.channelId)"
+        case .dm(let d): app?.realtime.focusedTopic = "dm:\(d.conversationId)"
+        case .group(let g): app?.realtime.focusedTopic = "dm:\(g.conversationId)"
+        default: app?.realtime.focusedTopic = nil
+        }
+    }
+
     /// The item currently shown in the detail pane.
     @Published var selection: SidebarItem? {
         didSet {
             // Tell the relay which chat is on screen — its messages shouldn't notify.
-            switch selection {
-            case .space(let s): app?.realtime.focusedTopic = "channel:\(s.channelId)"
-            case .dm(let d): app?.realtime.focusedTopic = "dm:\(d.conversationId)"
-            case .group(let g): app?.realtime.focusedTopic = "dm:\(g.conversationId)"
-            default: app?.realtime.focusedTopic = nil
-            }
+            refocus()
             // Remember the last-opened channel so re-entering this skwod reopens it (across devices,
             // via the synced kv store). Only channels — DMs/home don't override it.
             if case .space(let s) = selection, !loadingSelection {
@@ -704,6 +715,35 @@ final class ChatModel: ObservableObject {
         await refreshRoles(Array(owners.keys))
         let gone = Set(spaces.map(\.serverId)).filter { !$0.isEmpty && $0 != "demo" && owners[$0] == nil }
         if !gone.isEmpty { dropServers(gone) }
+        // A server renamed by its owner or an admin (on any device): the decrypted names.
+        if let names = try? await app.client?.serverNames(), app.holds(asked) { applyServerNames(names) }
+    }
+
+    /// Put these (decrypted) server names on the sidebar's spaces, and keep them.
+    private func applyServerNames(_ names: [String: String]) {
+        var changed = false
+        for i in spaces.indices {
+            guard let name = names[spaces[i].serverId], ServerNameRule.problem(name) == nil, spaces[i].name != name else { continue }
+            spaces[i].name = name
+            changed = true
+        }
+        if changed { Task { await persist(spaces, key: "sidebar.spaces") } }
+    }
+
+    /// Rename a server for everyone in it (owners and admins: the host checks MANAGE_SERVER). The
+    /// name is sealed under the space key by the core. Returns a sentence when it failed.
+    func renameServer(_ serverId: String, to raw: String) async -> String? {
+        if let problem = ServerNameRule.problem(raw) { return problem }
+        guard let app, let client = app.client, let asked = app.bindTicket() else { return "Not connected — try again in a moment." }
+        do {
+            let stored = try await client.renameServer(serverId: serverId, name: raw)
+            guard app.holds(asked) else { return nil }
+            applyServerNames([serverId: stored])
+            return nil
+        } catch {
+            if "\(error)".contains("status 403") { return "Only the server's owner or an admin can rename it." }
+            return sendFailureText(error)
+        }
     }
 
     /// Leave a server (a member): the server removes the membership (the same route a kick uses

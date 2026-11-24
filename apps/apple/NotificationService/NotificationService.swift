@@ -378,7 +378,9 @@ enum NotificationDecryptor {
             let everyone = Set(senders?[EveryoneRule.sendersKey(channelId: String(scope.dropFirst(8)))] ?? [])
             let mine = Set((rows ?? []).filter { $0.authorId == w.userId || $0.authorId == "__me__" }.map(\.messageId))
             for m in newRows ?? [] where MentionRule.mentionsMe(
-                MentionCodec.decode(m.content ?? "").payload, me: w.userId,
+                // The same reading as the app's (`ChatTags.mentions`): an attachment's caption has
+                // its own trailer — decoding the whole body found none there (build 49 fix).
+                MessageMentions.payload(m.content ?? ""), me: w.userId,
                 senderMayMentionEveryone: scope.hasPrefix("channel:") && everyone.contains(m.authorId ?? ""),
                 // (In a one-to-one conversation everything is to me: a reply is no mention.)
                 replyToMine: (scope.hasPrefix("channel:") || (senders?[scope]?.count ?? 0) > 1)

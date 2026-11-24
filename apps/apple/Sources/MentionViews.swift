@@ -61,7 +61,8 @@ enum MentionRender {
     static let scheme = "skwod-mention"
 
     static func apply(_ base: AttributedString, visible: String, payload: MentionPayload,
-                      label: (String) -> String, everyoneAllowed: Bool) -> AttributedString {
+                      label: (String) -> String, everyoneAllowed: Bool,
+                      trust: (String) -> ContactTrust.Display? = { _ in nil }) -> AttributedString {
         guard !payload.isEmpty else { return base }
         // Rebuild from the plain text when there are mentions: ranges are offsets into it.
         var out = AttributedString()
@@ -70,9 +71,14 @@ enum MentionRender {
         // Checked again against exactly the text shown here: only mention tokens are replaced.
         for m in MentionCodec.valid(payload.mentions, in: ns) {
             out += AttributedString(ns.substring(with: NSRange(location: cursor, length: m.start - cursor)))
-            var token = AttributedString("@" + label(m.userId))
+            let shown = trust(m.userId)
+            // The plain name in the chip; words stay for a flagged name (unconfirmed, look-alike).
+            let words = shown?.chipWords.map { " (\($0))" } ?? ""
+            var token = AttributedString("@" + label(m.userId) + words)
             token.foregroundColor = .skAccent
             token.backgroundColor = Color.skAccent.opacity(0.18)
+            // Only an untrusted name is marked: a dotted underline for "not verified".
+            if shown?.badge == .unverified { token.underlineStyle = Text.LineStyle(pattern: .dot, color: .white.opacity(0.6)) }
             token.link = URL(string: "\(scheme)://\(m.userId.addingPercentEncoding(withAllowedCharacters: .alphanumerics) ?? "")")
             out += token
             cursor = m.start + m.length
@@ -95,10 +101,13 @@ enum MentionRender {
 struct MentionProfileCard: View {
     let userId: String
     let label: String
+    /// Build 49: the name's trust, drawn as a full badge under the plain name.
+    var badge: ContactTrust.Badge = .none
     var body: some View {
         VStack(spacing: 10) {
             AvatarImage(key: AvatarStore.userKey(userId), name: label, size: 64)
             Text(label).font(.headline).foregroundStyle(.white)
+            if badge != .none { TrustBadge(badge: badge) }
             Text("User \(userId.prefix(8))…").font(.caption.monospaced()).foregroundStyle(.white.opacity(0.45))
         }
         .padding(24)

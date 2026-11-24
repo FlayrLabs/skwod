@@ -3,7 +3,12 @@ package io.skwod.app
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.PickVisualMediaRequest
 import androidx.activity.result.contract.ActivityResultContracts
+import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.gestures.waitForUpOrCancellation
+import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.draw.clip
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.LazyColumn
@@ -174,8 +179,8 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
     // Opening the channel clears its "@ n" (and again whenever a mention lands while it is open).
     LaunchedEffect(space.channelId, model.mentionCount(listOf("channel:${space.channelId}"))) { model.clearMentionBadges("channel:${space.channelId}") }
     val mentionName: (String, String) -> String = { uid, typed ->
-        if (uid == model.session?.userId) (model.current?.username ?: "you")
-        else model.contacts.shown(uid, memberNames[uid] ?: typed).label
+        if (uid == model.session?.userId) ContactTrust.SELF_MENTION
+        else model.contacts.shown(uid, memberNames[uid] ?: typed).let { s -> s.labelFor(NameSurface.MENTION_CHIP) + chipMark(s) }
     }
     /** The draft as it goes out: the picks still in it ride along, invisibly ([Mentions]). */
     fun withMentions(text: String): String {
@@ -309,9 +314,53 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
     // Something was queued, delivered or failed — or someone was blocked: redraw from the cache.
     val outboxRevision = Outbox.revision.intValue
     LaunchedEffect(outboxRevision) { if (outboxRevision > 0) try { reloadLocal() } catch (_: Exception) {} }
-    LaunchedEffect(newestId) {
-        if (newestId != null) listState.animateScrollToItem(visible.size)
+    // ---- build 49: what is new since this device last read the channel ----
+    val readKey = model.current?.id?.let { io.skwod.app.UnreadRule.storageKey(it, space.channelId) }
+    var marker by remember(space.channelId) { mutableStateOf<io.skwod.app.ReadMarker?>(null) }
+    var markerLoaded by remember(space.channelId) { mutableStateOf(false) }
+    // Frozen at open: the divider stays where the new messages began while they are read.
+    var unreadAtOpen by remember(space.channelId) { mutableStateOf<Triple<String, Int, Long>?>(null) }
+    var positioned by remember(space.channelId) { mutableStateOf(false) }
+    var barDismissed by remember(space.channelId) { mutableStateOf(false) }
+    var lastSeenId by remember(space.channelId) { mutableStateOf<String?>(null) }
+    val atBottom by remember { derivedStateOf { !listState.canScrollForward } }
+    val unreadItems = visible.map { io.skwod.app.UnreadItem(it.messageId, it.createdAt, it.authorId == "__me__" || it.authorId == me, it.isSystem) }
+    LaunchedEffect(space.channelId, readKey) {
+        val c = model.client
+        marker = if (c != null && readKey != null) io.skwod.app.ReadMarker.decode(try { withContext(Dispatchers.IO) { c.kvRead(readKey) } } catch (_: Exception) { null }) else null
+        markerLoaded = true
     }
+    // Opens at the first unread message (the divider a little below the top), else at the newest.
+    LaunchedEffect(markerLoaded, newestId != null) {
+        if (!markerLoaded || positioned || newestId == null) return@LaunchedEffect
+        positioned = true
+        val first = io.skwod.app.UnreadRule.firstUnreadIndex(unreadItems, marker)
+        unreadAtOpen = first?.let { Triple(unreadItems[it].id, io.skwod.app.UnreadRule.unreadCount(unreadItems, marker), unreadItems[it].createdAt) }
+        lastSeenId = newestId
+        // +1: the "load older" row is item 0.
+        listState.scrollToItem(if (first != null) first + 1 else visible.size)
+    }
+    // Follow new messages only while at the bottom (or my own); otherwise the pill counts them.
+    LaunchedEffect(newestId) {
+        if (newestId == null || !positioned) return@LaunchedEffect
+        if (atBottom || unreadItems.lastOrNull()?.mine == true) { listState.animateScrollToItem(visible.size); lastSeenId = newestId }
+    }
+    // At the newest message: read up to it (kept in the encrypted cache, one key per channel).
+    LaunchedEffect(atBottom, newestId, positioned) {
+        if (!atBottom || !positioned) return@LaunchedEffect
+        val last = unreadItems.lastOrNull() ?: return@LaunchedEffect
+        lastSeenId = last.id
+        val next = io.skwod.app.UnreadRule.advanced(marker, last)
+        if (next == marker) return@LaunchedEffect
+        marker = next
+        val c = model.client ?: return@LaunchedEffect
+        if (readKey != null) try { withContext(Dispatchers.IO) { c.kvWrite(readKey, next.encode()) } } catch (_: Exception) {}
+    }
+    val newBelow = if (atBottom) 0 else io.skwod.app.UnreadRule.newBelow(unreadItems, lastSeenId)
+    val barText = unreadAtOpen?.takeIf { !barDismissed && io.skwod.app.UnreadRule.unreadCount(unreadItems, marker) > 0 }?.let {
+        io.skwod.app.UnreadRule.barText(it.second, java.text.DateFormat.getTimeInstance(java.text.DateFormat.SHORT).format(java.util.Date(it.third)))
+    }
+
 
     // imePadding lifts the composer above the on-screen keyboard so the input stays visible.
     Column(Modifier.fillMaxSize().imePadding().padding(16.dp)) {
@@ -348,7 +397,8 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
             visible.filter { !it.isDeleted && !it.isSystem && !it.isUndecryptable }.associate { it.messageId to
                 ((if (it.authorId == "__me__" || it.authorId == me) "you" else MemberLabel.of(model.contacts.shown(it.authorId, memberNames[it.authorId]), it.authorId)) to ChatTags.parse(it.content ?: "").text) }
         }
-        LazyColumn(Modifier.weight(1f), state = listState) {
+        Box(Modifier.weight(1f)) {
+        LazyColumn(Modifier.fillMaxSize().dismissKeyboardOnTapOrDrag(listState), state = listState) {
             item {
                 Box(Modifier.fillMaxWidth().padding(vertical = 4.dp), contentAlignment = Alignment.Center) {
                     when {
@@ -359,6 +409,7 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
                 }
             }
             itemsIndexed(visible) { i, m ->
+                if (m.messageId == unreadAtOpen?.first) NewMessagesDivider()
                 // What the row IS comes from the flags the core set when it wrote it — never from
                 // the author id or the text, which any member controls. A message whose body
                 // merely starts with the system or placeholder tag falls through and is drawn
@@ -427,6 +478,23 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
                     reactions = reactionsByMsg[m.messageId] ?: emptyList(), actions = actions, nameTrust = shownAuthor,
                     sendState = if (mine) sendStates[m.messageId] else null, mentionsMe = mentionsMe, mentionName = mentionName)
             }
+        }
+        // "N new messages since …" across the top, and "↓ N new" while scrolled up.
+        barText?.let { text ->
+            NewMessagesBar(text, Modifier.align(Alignment.TopCenter).padding(horizontal = 4.dp, vertical = 6.dp),
+                onJump = { unreadAtOpen?.first?.let { id -> scope.launch { listState.animateScrollToItem(visible.indexOfFirst { it.messageId == id }.coerceAtLeast(0) + 1) } } },
+                onMarkRead = {
+                    barDismissed = true
+                    unreadItems.lastOrNull()?.let { last ->
+                        val next = io.skwod.app.UnreadRule.advanced(marker, last); marker = next
+                        val c = model.client
+                        if (c != null && readKey != null) scope.launch { try { withContext(Dispatchers.IO) { c.kvWrite(readKey, next.encode()) } } catch (_: Exception) {} }
+                    }
+                })
+        }
+        if (newBelow > 0) JumpToNewPill(newBelow, Modifier.align(Alignment.BottomEnd).padding(10.dp)) {
+            scope.launch { listState.animateScrollToItem(visible.size) }
+        }
         }
         // Reply / edit banner above the composer, with a cancel.
         (editing?.let { "Editing message" } ?: replyingTo?.let { r -> "Replying to ${if (r.authorId == "__me__" || r.authorId == me) "yourself" else MemberLabel.of(model.contacts.shown(r.authorId, memberNames[r.authorId]), r.authorId)}" })?.let { label ->
@@ -622,3 +690,56 @@ fun CreateServerDialog(onCancel: () -> Unit, onCreate: (RealSpace) -> Unit) {
     )
 }
 
+/** The line above the first message that was new when the channel opened (build 49). */
+@Composable
+private fun NewMessagesDivider() {
+    Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+        Box(Modifier.weight(1f).height(1.dp).background(Color(0xFFE5484D)))
+        Spacer(Modifier.width(6.dp))
+        Text("NEW", color = Color.White, fontSize = 10.sp, fontWeight = FontWeight.Black,
+            modifier = Modifier.clip(RoundedCornerShape(4.dp)).background(Color(0xFFE5484D)).padding(horizontal = 6.dp, vertical = 2.dp))
+    }
+}
+
+/** "3 new messages since 4:12 PM" — tap to jump to the first of them, or mark them read. */
+@Composable
+private fun NewMessagesBar(text: String, modifier: Modifier, onJump: () -> Unit, onMarkRead: () -> Unit) {
+    Row(modifier.fillMaxWidth().clip(RoundedCornerShape(12.dp)).background(SkAccent).padding(horizontal = 12.dp, vertical = 8.dp),
+        verticalAlignment = Alignment.CenterVertically) {
+        Text("↑ $text", color = Color.Black, fontSize = 13.sp, fontWeight = FontWeight.SemiBold, maxLines = 1,
+            modifier = Modifier.weight(1f).clickable(onClick = onJump))
+        Text("Mark as read", color = Color.Black, fontSize = 13.sp, fontWeight = FontWeight.Bold, modifier = Modifier.clickable(onClick = onMarkRead))
+    }
+}
+
+/** "↓ 2 new" while scrolled up and messages arrive below. */
+@Composable
+private fun JumpToNewPill(count: Int, modifier: Modifier, onTap: () -> Unit) {
+    Text("↓ $count new", color = Color.Black, fontSize = 13.sp, fontWeight = FontWeight.SemiBold,
+        modifier = modifier.clip(RoundedCornerShape(50)).background(SkAccent).clickable(onClick = onTap).padding(horizontal = 12.dp, vertical = 8.dp))
+}
+
+/**
+ * Build 49: the keyboard goes away the usual ways — a tap on the conversation, or dragging it.
+ * The tap is watched on the Initial pass and never consumed, so links, pictures, reactions and
+ * the long press still get theirs.
+ */
+@Composable
+internal fun Modifier.dismissKeyboardOnTapOrDrag(listState: androidx.compose.foundation.lazy.LazyListState): Modifier {
+    val focus = androidx.compose.ui.platform.LocalFocusManager.current
+    val keyboard = androidx.compose.ui.platform.LocalSoftwareKeyboardController.current
+    LaunchedEffect(listState) {
+        androidx.compose.runtime.snapshotFlow { listState.isScrollInProgress }.collect { scrolling ->
+            if (scrolling) { keyboard?.hide(); focus.clearFocus() }
+        }
+    }
+    return this.pointerInput(Unit) {
+        awaitEachGesture {
+            val down = awaitFirstDown(requireUnconsumed = false, pass = androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+            val up = waitForUpOrCancellation(pass = androidx.compose.ui.input.pointer.PointerEventPass.Initial)
+            if (up != null && (up.position - down.position).getDistance() < viewConfiguration.touchSlop) {
+                keyboard?.hide(); focus.clearFocus()
+            }
+        }
+    }
+}

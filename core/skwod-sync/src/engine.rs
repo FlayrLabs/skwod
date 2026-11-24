@@ -20,6 +20,7 @@
 //! serializable for the on-device encrypted [`crate::cache::Cache`] — never for the server.
 
 mod accounts;
+mod b49;
 mod content;
 mod guard;
 mod legacy;
@@ -402,6 +403,18 @@ enum Content {
     /// statement inside the ciphertext: a direct-message payload that arrives bare is a 1:1
     /// message and is never filed in a group; one that arrives wrapped is never filed in a 1:1.
     Grouped { members: Vec<String>, inner: Vec<u8> },
+    // ---- build 49, appended; older builds cannot decode these and drop them ----
+    /// From one of our own verified devices: the contacts it verified and the identity sets it
+    /// holds (for the contact book it sends along), and app state (`b49::SIBLING_KINDS`).
+    /// Accepted only from a sibling (`b49`); merged under its rules.
+    /// `verified`: (user, identity set, verified at). A snapshot larger than one envelope is
+    /// split over several (`app` empty), sent before the payload.
+    /// `share`: monotonic per sender; a newer share replaces the receiver's snapshot from that
+    /// device, an older one is dropped. `chunk`: (index, total) of a snapshot envelope; a payload
+    /// (non-empty `app`) carries the share of the snapshot it relies on and (0, 0).
+    SiblingState { v: u8, share: u64, chunk: (u16, u16), verified: Vec<(String, Vec<Vec<u8>>, i64)>, identities: Vec<(String, Vec<Vec<u8>>)>, app: Vec<(String, Vec<u8>)> },
+    /// From one of our own verified devices (a newly linked one): "send me your state".
+    SiblingStateRequest,
 }
 
 impl Content {
@@ -907,6 +920,8 @@ pub struct Engine {
     servers_checked: Option<Instant>,
     /// Sender devices seen writing wire v3, and provision requests held over (persisted).
     b45: Build45Ext,
+    /// Build 49: server-name versions, sibling-state inbox and pending verifications (`b49`).
+    b49: b49::Build49State,
     /// What the server's last "waiting" answer in this run said: contested or not. In memory
     /// only — `None` after a launch until the waiting screen has asked again (and it asks at
     /// once), so a request contested while the app was closed never shows a countdown.
@@ -1005,6 +1020,7 @@ impl Engine {
             delivery_attempt: None,
             servers_checked: None,
             b45: Build45Ext::default(),
+            b49: b49::Build49State::default(),
             recovery_contested: None,
             unconfirmed_siblings: BTreeMap::new(),
             restored_install: false,
@@ -1101,6 +1117,7 @@ impl Engine {
         let restore_trust = (&self.unconfirmed_siblings, self.restored_install, &self.linked_here);
         accounts::write_section(&mut out, SECTION_UNCONFIRMED, &postcard::to_stdvec(&restore_trust).expect("engine state serialization is infallible"));
         accounts::write_section(&mut out, SECTION_PEEKED, &postcard::to_stdvec(&self.peeked).expect("engine state serialization is infallible"));
+        accounts::write_section(&mut out, b49::SECTION_BUILD49, &self.b49_export());
         accounts::write_section(&mut out, guard::SECTION_GUARD, &postcard::to_stdvec(&self.guard).expect("engine state serialization is infallible"));
         accounts::write_section(&mut out, rest::SECTION_DELIVERY, &postcard::to_stdvec(&self.delivery).expect("engine state serialization is infallible"));
         accounts::write_section(&mut out, SECTION_BUILD45, &postcard::to_stdvec(&self.b45_for_export()).expect("engine state serialization is infallible"));
@@ -1159,6 +1176,8 @@ impl Engine {
             self.listed_channels.clear();
             // Absent (a build ≤ 44 state): no sender has been seen on v3 yet, nothing held over.
             self.b45 = section(SECTION_BUILD45).and_then(|body| postcard::from_bytes(body).ok()).unwrap_or_default();
+            // Absent (a build ≤ 48 state): no name versions seen, nothing from siblings.
+            self.b49 = Self::b49_import(section(b49::SECTION_BUILD49));
             // Absent: no restore is waiting for its siblings to confirm.
             let restore_trust: (BTreeMap<String, Vec<u8>>, bool, BTreeSet<Vec<u8>>) =
                 section(SECTION_UNCONFIRMED).and_then(|body| postcard::from_bytes(body).ok()).unwrap_or_default();
@@ -3413,6 +3432,18 @@ impl Engine {
                         }
                         self.pending_voice.push((sender.user_id, channel_id, call_id, index, key, Instant::now()));
                     }
+                }
+            }
+            Content::SiblingState { v, share, chunk, verified, identities, app } => {
+                // Only one of our own verified devices (its sealed-sender identity is the sibling
+                // key the link chain verified, checked above); anything else is dropped silently.
+                if from_own_device && sender.device_id != local.device_id {
+                    self.on_sibling_state(&sender, v, share, chunk, verified, identities, app);
+                }
+            }
+            Content::SiblingStateRequest => {
+                if from_own_device && sender.device_id != local.device_id {
+                    self.on_sibling_request(&sender);
                 }
             }
             Content::OwnerPins { pins } => {

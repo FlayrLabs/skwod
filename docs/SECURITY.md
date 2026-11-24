@@ -296,6 +296,60 @@ A device already on the account shows a QR (Profile → Devices → Add a device
 - **Platforms.** iOS and Android scan with the camera. The Mac shows the QR and can read one from
   an image; it has no camera scan.
 
+### Sibling sync (build 49)
+
+A newly linked device starts with the account's keys and nothing else: no contact book, no
+verifications, no avatars, no history (the link bundle carries siblings, the account key, space
+keys and owner pins; sender keys start at the link). Build 49 adds a sealed channel between the
+account's OWN verified devices (`Content::SiblingState` / `SiblingStateRequest`, `engine/b49.rs`)
+that carries the contact book, the core's verifications and the avatar cache.
+
+- **Who can send.** Accepted only when the sealed-sender identity of the session equals the
+  sibling key this device verified through the link chain, and the device is not tombstoned.
+  Anything else is dropped silently. Older builds cannot decode the appended variants and drop them.
+- **Where state came from.** Every pending verification and inbox entry keeps the vouching
+  sibling's device id AND identity; it is purged, and re-checked before use
+  (`apply_pending_verified`, `take_sibling_payloads`), when that sibling is removed, re-keyed or
+  tombstoned.
+- **Verifications.** Merged only for exactly the device set this device holds; never downgrade or
+  replace a verification made here; never override a hold (an unvouched device). A contact the
+  user un-verified here is never re-verified by a sibling; after accepting a changed device set,
+  only a verification dated later counts (`cleared`, set by `set_verified(false)` and
+  `accept_identity_change`; `SiblingState` carries each verification's time).
+- **Different keys are a hold, not a silent drop.** If a sibling verified set S and this device
+  holds (or later pins) other keys, the contact is marked verified-for-S: an `identity_changed`
+  notice (was_verified) and nothing is sent until the user verifies again here.
+- **Fail closed on the snapshot.** The identity snapshot goes first, split over as many envelopes
+  as it needs (never truncated). An app payload entry is applied only for users in that sibling's
+  snapshot whose set agrees with this device's (or whom this device has not pinned): the core
+  hands the app `vouched_users`; everyone else is skipped.
+- **Names and avatars (apps).** A name the user set here wins; a synced name is at most KNOWN —
+  and only UNVERIFIED when it collides with someone the user knows or has unusual characters.
+  Avatars: decodable, ≤ 96 KiB each, ≤ 120 KiB per payload, newer than held, clear tombstones
+  honoured. Blocks are never synced.
+- **Limits.** 120 KiB per payload, 64 payloads held, 24 shares per 10 minutes, a request answered
+  at most once per 10 minutes per device; the normal sealed mailbox carries it, so the host sees
+  what it sees for any sealed message.
+- **Server names (v2).** A rename is sealed with AAD `skwod/server-name-v2|<server_id>` over
+  {version, name, by}; readers refuse an older version, a version more than 10 minutes in the
+  future (which could otherwise lock the name), and the legacy form once a v2 name was seen.
+  **Residual:** `by` is not yet checked against the owner or a MANAGE_SERVER member (the core
+  does not know admins); a member who holds the space key and MANAGE_SERVER-less access cannot
+  rename through the host (it checks MANAGE_SERVER), but a host colluding with any member could
+  serve a member-sealed name. Binding renames to a device signature of an authorised member is
+  the follow-up.
+- **History is not transferred (yet).** See `docs/HISTORY-TRANSFER.md` for the design.
+- **Tracked residuals for build 51** (with history transfer):
+  - **M2 — legacy server names are not bound.** A name in the creation-time (legacy) form is
+    accepted while no v2 name has been seen for that server; a host could swap legacy names
+    between servers that share a key until the first rename. Binding the creation name (v2 at
+    creation, once every client reads v2) closes it.
+  - **L5** — deferred with the history transfer, as reviewed.
+- **Payload formats** are fixed and shared by both apps (see `b49.rs`): `contacts.v1` is a JSON
+  object user id → {name, level, known?}; `avatars.v1` a JSON array of {key, img?, ts}.
+- **Server names** also refuse Unicode format characters (Cf: zero-width, direction marks, tags)
+  and blank-looking fillers, in the core and in both apps' validators alike.
+
 ## Key backup (opt-in)
 
 Signal protects PIN recovery with an enclave that rate-limits guesses. A self-hosted server has no

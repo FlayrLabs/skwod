@@ -26,6 +26,9 @@ final class AvatarStore: ObservableObject {
     /// The newest timestamp SEEN per key, including for cleared avatars (a tombstone). Keeps an old
     /// pointer arriving after a clear from resurrecting the removed image.
     private var seenTs: [String: Int64] = [:]
+    /// Keys whose avatar was CLEARED (not just evicted), with when: persisted and handed to our
+    /// other devices, so an older picture can never come back over a clear.
+    private var cleared: [String: Int64] = [:]
     /// Max cached avatars — bounds memory as members / ex-members accumulate. When exceeded, the
     /// least-recently-touched entries are evicted (my own + currently-referenced keys are safe
     /// because they're re-ingested constantly).
@@ -61,7 +64,7 @@ final class AvatarStore: ObservableObject {
         do { read = try await bound.client.kvRead(key: key) } catch { return }
         guard app.bound?.workspaceId == wid, app.bound?.turn == bound.turn, app.current?.id == wid, loadedFor != wid else { return }
         loadedFor = wid
-        images = [:]; seenTs = [:]
+        images = [:]; seenTs = [:]; cleared = [:]
         guard let json = read, let data = json.data(using: .utf8),
               let stored = try? JSONDecoder().decode([String: StoredAvatar].self, from: data) else { return }
         // Bitmap decode happens lazily in the views; here we only hold the raw JPEG bytes.
@@ -69,6 +72,8 @@ final class AvatarStore: ObservableObject {
             Data(base64Encoded: s.b64).flatMap { Self.acceptable($0) ? ($0, s.ts) : nil }
         }
         for (k, s) in stored { seenTs[k] = s.ts }
+        // An entry with no picture is a clear (tombstone).
+        for (k, s) in stored where s.b64.isEmpty { cleared[k] = s.ts }
     }
 
     private struct StoredAvatar: Codable { var b64: String; var ts: Int64 }
@@ -76,7 +81,8 @@ final class AvatarStore: ObservableObject {
     private func persist() async {
         // Never before the stored set was read for this workspace: it would be written over.
         guard let app, let client = app.client, let wid = app.current?.id, loadedFor == wid, app.bound?.workspaceId == wid else { return }
-        let stored = images.mapValues { StoredAvatar(b64: $0.data.base64EncodedString(), ts: $0.ts) }
+        var stored = images.mapValues { StoredAvatar(b64: $0.data.base64EncodedString(), ts: $0.ts) }
+        for (k, ts) in cleared where stored[k] == nil { stored[k] = StoredAvatar(b64: "", ts: ts) }
         guard let json = try? JSONEncoder().encode(stored),
               let str = String(data: json, encoding: .utf8) else { return }
         await client.kvSet(key: kvKey, value: str)
@@ -180,13 +186,55 @@ final class AvatarStore: ObservableObject {
                 guard img.utf8.count <= Self.maxAvatarBytes * 4 / 3 + 4,
                       let bytes = Data(base64Encoded: img), Self.acceptable(bytes) else { continue }
                 images[msg.key] = (bytes, msg.ts)
+                cleared.removeValue(forKey: msg.key)
                 changed = true
-            } else if images[msg.key] != nil {
-                images.removeValue(forKey: msg.key)   // cleared (tombstone kept in seenTs)
+            } else {
+                cleared[msg.key] = msg.ts   // a clear: kept (and persisted) as a tombstone
+                if images[msg.key] != nil { images.removeValue(forKey: msg.key) }
                 changed = true
             }
         }
         if changed { evictIfNeeded(); Task { await persist() } }
+    }
+
+    // MARK: Build 49 — handed over between our own devices
+
+    /// What this device holds for `workspaceId` (pictures and clears), as entries for a sibling
+    /// (`SiblingSync`). Nothing when another skwod's avatars are loaded.
+    func siblingEntries(workspaceId: String) -> [SiblingRules.AvatarEntry]? {
+        guard !workspaceId.isEmpty, loadedFor == workspaceId else { return nil }
+        var out = images.map { SiblingRules.AvatarEntry(key: $0.key, img: $0.value.data.base64EncodedString(), ts: $0.value.ts) }
+        for (k, ts) in cleared where images[k] == nil { out.append(.init(key: k, img: nil, ts: ts)) }
+        return out
+    }
+
+    /// Take what one of our own devices held for `workspaceId` (it checked each pointer's
+    /// author when it took it): only for users its snapshot vouches for, newer than what is
+    /// held or cleared here, each picture validated (`SiblingRules.acceptedAvatars`). Refused
+    /// when another skwod's avatars are loaded.
+    func mergeFromSibling(_ entries: [SiblingRules.AvatarEntry], workspaceId: String, vouched: Set<String>, mismatched: Set<String>) {
+        guard !workspaceId.isEmpty, loadedFor == workspaceId, app?.current?.id == workspaceId else { return }
+        let now = Int64(Date().timeIntervalSince1970 * 1000)
+        var held = seenTs
+        for (k, v) in images where (held[k] ?? 0) < v.ts { held[k] = v.ts }
+        for (k, ts) in cleared where (held[k] ?? 0) < ts { held[k] = ts }
+        let taken = SiblingRules.acceptedAvatars(entries, vouched: vouched, mismatched: mismatched, heldTs: held, now: now, acceptable: Self.acceptable)
+        guard !taken.isEmpty else { return }
+        for (key, value) in taken {
+            seenTs[key] = value.ts
+            if let data = value.data { images[key] = (data, value.ts); cleared.removeValue(forKey: key) }
+            else { images.removeValue(forKey: key); cleared[key] = value.ts }
+        }
+        evictIfNeeded()
+        Task { await persist() }
+    }
+
+    /// Send my own avatar again to every channel I am in — after a device of mine was linked, so
+    /// it can read it (it cannot decrypt the pointer sent before it existed). With the ORIGINAL
+    /// timestamp: a later clear or replacement still wins everywhere.
+    func resendMine() async {
+        guard let app, let me = app.session?.userId, let mine = images[Self.userKey(me)] else { return }
+        await broadcast(key: Self.userKey(me), imageData: mine.data, channelIds: allMyChannelIds(), at: mine.ts)
     }
 
     /// True if `body` is an avatar-pointer message (so the chat view hides it from the conversation).
@@ -216,15 +264,15 @@ final class AvatarStore: ObservableObject {
         await broadcast(key: key, imageData: nil, channelIds: channelIds)
     }
 
-    private func broadcast(key: String, imageData: Data?, channelIds: [String]) async {
+    private func broadcast(key: String, imageData: Data?, channelIds: [String], at: Int64? = nil) async {
         guard let app, let client = app.client else { return }
-        let ts = Int64(Date().timeIntervalSince1970 * 1000)
-        let square = imageData.flatMap { squareJPEG($0) }
+        let ts = at ?? Int64(Date().timeIntervalSince1970 * 1000)
+        let square = imageData.flatMap { at == nil ? squareJPEG($0) : $0 }
         let msg = AvatarMessage(key: key, img: square?.base64EncodedString(), ts: ts)
         guard let json = try? JSONEncoder().encode(msg), let body = String(data: json, encoding: .utf8) else { return }
         // Update locally first for instant feedback; advance the tombstone so a stale echo can't undo it.
-        seenTs[key] = ts
-        if let square { images[key] = (square, ts) } else { images.removeValue(forKey: key) }
+        seenTs[key] = max(seenTs[key] ?? 0, ts)
+        if let square { images[key] = (square, ts); cleared.removeValue(forKey: key) } else { images.removeValue(forKey: key); cleared[key] = ts }
         await persist()
         // Fan out concurrently — one message per channel, but in parallel, not N sequential RTTs.
         let text = Self.tag + body

@@ -133,15 +133,50 @@ impl Engine {
 
     /// The decrypted name of a server we belong to (None until we hold its space key). Used to label
     /// a freshly-joined space in the sidebar.
-    pub async fn server_name(&self, server_id: &str) -> Result<Option<String>, EngineError> {
+    pub async fn server_name(&mut self, server_id: &str) -> Result<Option<String>, EngineError> {
         let resp = self.api.get("/api/servers").await?;
         let arr = resp["servers"].as_array().cloned().unwrap_or_default();
         for s in arr {
             if s["server_id"].as_str() == Some(server_id) {
-                return Ok(s["name_ciphertext"].as_str().and_then(|ct| self.decrypt_name(server_id, ct)));
+                return Ok(s["name_ciphertext"].as_str().and_then(|ct| self.open_server_name(server_id, ct)));
             }
         }
         Ok(None)
+    }
+
+    /// Every listed server's name this device can decrypt (one request), by server id — how a
+    /// rename by someone else reaches this device's sidebar. Servers whose key we don't hold yet,
+    /// or whose sealed name doesn't open, are left out.
+    /// Each name is bound to its server and must not be older than one accepted here
+    /// (`open_server_name`), and goes through the same rule a rename is held to.
+    pub async fn server_names(&mut self) -> Result<std::collections::HashMap<String, String>, EngineError> {
+        let resp = self.api.get("/api/servers").await?;
+        let arr = resp["servers"].as_array().cloned().unwrap_or_default();
+        let mut out = std::collections::HashMap::new();
+        for s in arr.into_iter().take(MAX_SERVER_ARRAY) {
+            let Some(id) = s["server_id"].as_str().map(str::to_string) else { continue };
+            if let Some(name) = s["name_ciphertext"].as_str().and_then(|ct| self.open_server_name(&id, ct)) {
+                out.insert(id, name);
+            }
+        }
+        Ok(out)
+    }
+
+    /// Rename a server we hold the space key for. The new name is sealed under the space key like
+    /// the original (the host stores ciphertext only), and the host lets only members with
+    /// MANAGE_SERVER change it. Every member reads it back through `server_name`.
+    /// The new name is sealed bound to this server and versioned above every name this device
+    /// has seen for it (`seal_server_name_v2`), so the host can neither move it to another
+    /// server nor roll it back to an older one.
+    pub async fn rename_server(&mut self, server_id: &str, name: &str) -> Result<String, EngineError> {
+        let name = checked_server_name(name)?;
+        let sk = *self.spaces.get(server_id).ok_or(EngineError::Protocol("no space key for server"))?;
+        let by = self.local()?.user_id;
+        let (sealed, version) = self.seal_server_name_v2(&sk, server_id, &name, &by)?;
+        self.api.patch(&format!("/api/servers/{}", enc(server_id)), serde_json::json!({ "name_ciphertext": sealed })).await?;
+        // Only now: a rename the host did not take leaves the live name acceptable here.
+        self.note_server_name_version(server_id, version);
+        Ok(name)
     }
 
     /// List existing invites for a space we host (for showing/revoking them).
@@ -579,4 +614,62 @@ impl Engine {
         let emoji = String::from_utf8(skwod_crypto::aead::open(key, &Self::reaction_aad(message_id, user_id), &sealed)?).ok()?;
         (!emoji.is_empty() && emoji.len() <= 64 && Self::reaction_tag(key, message_id, &emoji) == tag).then_some(emoji)
     }
+}
+
+/// The longest server name, in characters (Unicode scalar values; the apps count the same).
+pub const MAX_SERVER_NAME_CHARS: usize = 100;
+/// ...and in UTF-8 bytes.
+pub const MAX_SERVER_NAME_BYTES: usize = 400;
+
+/// A server name as it is stored: trimmed, 1 to `MAX_SERVER_NAME_CHARS` characters, no control
+/// characters (a newline or a direction override has no place in a sidebar label).
+pub(crate) fn checked_server_name(name: &str) -> Result<String, EngineError> {
+    let name = name.trim();
+    if name.is_empty() || name.chars().count() > MAX_SERVER_NAME_CHARS || name.len() > MAX_SERVER_NAME_BYTES {
+        return Err(EngineError::TooLarge("A server name needs 1 to 100 characters."));
+    }
+    let chars: Vec<char> = name.chars().collect();
+    for (i, &c) in chars.iter().enumerate() {
+        // U+FE0F (emoji presentation) only right after a visible emoji base ("❤️").
+        if c == '\u{FE0F}' {
+            if i > 0 && emoji_base(chars[i - 1]) { continue; }
+            return Err(EngineError::TooLarge("A server name can't contain line breaks, control or invisible characters."));
+        }
+        if c.is_control() || invisible(c) || blank_looking(c) || ignorable(c) || c == '\u{2028}' || c == '\u{2029}' {
+            return Err(EngineError::TooLarge("A server name can't contain line breaks, control or invisible characters."));
+        }
+    }
+    // Something must show: a name of only spaces, blank-looking and ignorable characters is no name.
+    if name.chars().all(|c| c.is_whitespace() || blank_looking(c) || ignorable(c) || c == '\u{FE0F}') {
+        return Err(EngineError::TooLarge("A server name needs 1 to 100 characters."));
+    }
+    Ok(name.to_string())
+}
+
+/// Unicode general category Cf (format: zero-width, direction marks and overrides, tags…).
+fn invisible(c: char) -> bool {
+    matches!(c as u32,
+        0x00AD | 0x0600..=0x0605 | 0x061C | 0x06DD | 0x070F | 0x0890..=0x0891 | 0x08E2 | 0x180E
+        | 0x200B..=0x200F | 0x202A..=0x202E | 0x2060..=0x2064 | 0x2066..=0x206F | 0xFEFF | 0xFFF9..=0xFFFB
+        | 0x110BD | 0x110CD | 0x13430..=0x1343F | 0x1BCA0..=0x1BCA3 | 0x1D173..=0x1D17A | 0xE0001 | 0xE0020..=0xE007F)
+}
+
+/// Default_Ignorable_Code_Point beyond Cf: variation selectors (but U+FE0F, handled apart),
+/// Mongolian free variation selectors, the reserved U+2065 and U+FFF0–FFF8, and the
+/// ignorable plane-14 block.
+fn ignorable(c: char) -> bool {
+    matches!(c as u32, 0x180B..=0x180F | 0x2065 | 0xFE00..=0xFE0E | 0xFFF0..=0xFFF8 | 0xE0000..=0xE0FFF)
+}
+
+/// A character U+FE0F may follow: one drawn as an emoji or symbol (not a letter, digit,
+/// space, mark or another invisible).
+fn emoji_base(c: char) -> bool {
+    let u = c as u32;
+    !(c.is_alphanumeric() || c.is_whitespace() || c.is_control() || invisible(c) || blank_looking(c) || ignorable(c) || c == '\u{FE0F}')
+        && (u >= 0x2000 || "#*©®".contains(c))
+}
+
+/// Characters that render as nothing or as a blank (fillers, the braille blank).
+fn blank_looking(c: char) -> bool {
+    matches!(c as u32, 0x115F | 0x1160 | 0x2800 | 0x3164 | 0xFFA0 | 0x034F | 0x17B4 | 0x17B5)
 }

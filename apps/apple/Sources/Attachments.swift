@@ -40,16 +40,7 @@ enum ChatTags {
     /// Who the message mentions, decoded from exactly the text `parse` returns: the body's
     /// trailer for a plain message, the caption's own for an attachment (offsets into the whole
     /// body would point at the wrong characters of a caption), none for a song.
-    static func mentions(_ raw: String) -> MentionPayload {
-        let decoded = MentionCodec.decode(raw)
-        let body = decoded.visible
-        if body.hasPrefix(attach), let data = String(body.dropFirst(attach.count)).data(using: .utf8),
-           let a = try? JSONDecoder().decode(ChatAttachment.self, from: data) {
-            return MentionCodec.decode(a.caption ?? "").payload
-        }
-        if body.hasPrefix(music) { return MentionPayload() }
-        return decoded.payload
-    }
+    static func mentions(_ raw: String) -> MentionPayload { MessageMentions.payload(raw) }
 }
 
 // MARK: - Crypto

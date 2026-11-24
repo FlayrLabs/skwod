@@ -1,7 +1,7 @@
 [package]
 name = "skwod-host"
 description = "Tray app for hosting a skwod server on a Windows or Linux PC: runs the bundled server, opens its admin page, Start/Stop/Quit."
-version = "0.48.0"
+version = "0.50.0"
 edition = "2021"
 license = "AGPL-3.0-only"
 rust-version = "1.93.1"

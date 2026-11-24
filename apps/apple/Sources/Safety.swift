@@ -94,6 +94,11 @@ struct MessageExtras {
     /// mentioned person's profile.
     var me: String?
     var mentionLabel: ((String) -> String)?
+    /// Build 49: how a mentioned user's name is trusted — the chip shows the plain name with a
+    /// dotted underline for UNVERIFIED and keeps words for a flagged name (`chipWords`).
+    var mentionBadge: ((String) -> ContactTrust.Display)? = nil
+    /// Build 49: the trust badge beside a message author's (plain) name.
+    var authorBadge: ((String) -> ContactTrust.Badge)? = nil
     var everyoneAllowed: ((String?) -> Bool)?
     var onOpenProfile: ((String) -> Void)?
     /// Who may be @mentioned here: (user id, shown name, username — what the token says).

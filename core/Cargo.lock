@@ -5882,7 +5882,7 @@ checksum = "8ee5873ec9cce0195efcb7a4e9507a04cd49aec9c83d0389df45b1ef7ba2e649"
 
 [[package]]
 name = "skwod-core"
-version = "0.48.0"
+version = "0.50.0"
 dependencies = [
  "base64 0.22.1",
  "futures-util",
@@ -5902,7 +5902,7 @@ dependencies = [
 
 [[package]]
 name = "skwod-crypto"
-version = "0.48.0"
+version = "0.50.0"
 dependencies = [
  "aes 0.8.4",
  "argon2",
@@ -5927,7 +5927,7 @@ dependencies = [
 
 [[package]]
 name = "skwod-net"
-version = "0.48.0"
+version = "0.50.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -5950,7 +5950,7 @@ dependencies = [
 
 [[package]]
 name = "skwod-sync"
-version = "0.48.0"
+version = "0.50.0"
 dependencies = [
  "arti-client",
  "base64 0.22.1",

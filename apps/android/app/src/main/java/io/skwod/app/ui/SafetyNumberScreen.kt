@@ -73,8 +73,23 @@ fun SafetyNumberDialog(peerName: String, peerUserId: String, onChanged: () -> Un
     var qr by remember { mutableStateOf<String?>(null) }
     var confirmManual by remember { mutableStateOf(false) }
 
-    suspend fun refreshStatus() {
-        status = try { withContext(Dispatchers.IO) { model.client?.contactStatus(peerUserId) } } catch (_: Exception) { null }
+    // Build 49: every entry point (DM, member list, group people) reconciles the contact book
+    // with the core here — for the same skwod's client only.
+    // A READ only demotes; a name is raised only after an explicit, successful verification
+    // here (`explicitVerify`), and never for a flagged name.
+    suspend fun refreshStatus(explicitVerify: Boolean = false, explicitUnverify: Boolean = false) {
+        val asked = model.client ?: return
+        val st = try { withContext(Dispatchers.IO) { asked.contactStatus(peerUserId) } } catch (_: Exception) { null } ?: return
+        if (model.client !== asked) return
+        status = st
+        when {
+            explicitVerify && st.verified -> {
+                // Gated in the store: a flagged name is not pinned.
+                model.contacts.setVerified(peerUserId, true, peerName)
+            }
+            explicitUnverify -> if (!st.verified) model.contacts.setVerified(peerUserId, false, peerName) else model.contacts.noteStatusRead(peerUserId, true)
+            else -> model.contacts.noteStatusRead(peerUserId, st.verified)
+        }
     }
 
     suspend fun compute() {
@@ -112,7 +127,7 @@ fun SafetyNumberDialog(peerName: String, peerUserId: String, onChanged: () -> Un
         problem = null
         try {
             withContext(Dispatchers.IO) { c.verifyContact(peerUserId, shown) }
-            refreshStatus()
+            refreshStatus(explicitVerify = true)
             onChanged()
         } catch (_: uniffi.skwod_core.CoreException.IdentityChanged) {
             changedUnderneath()
@@ -124,7 +139,7 @@ fun SafetyNumberDialog(peerName: String, peerUserId: String, onChanged: () -> Un
     suspend fun unverify() {
         val c = model.client ?: return
         try { withContext(Dispatchers.IO) { c.unverifyContact(peerUserId) } } catch (_: Exception) {}
-        refreshStatus()
+        refreshStatus(explicitUnverify = true)
         onChanged()
     }
 

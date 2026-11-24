@@ -679,35 +679,66 @@ private struct DrawerPager: View {
     /// so the chat stays loaded behind the list. The rail + you-bar belong to the LIST page only —
     /// the chat page is full-screen.
     @State private var page: DrawerPage? = .list
+    /// The last page the pager came to rest on (`page` is nil between pages).
+    @State private var settled: DrawerPage = .list
 
     var body: some View {
-        GeometryReader { geo in
-            ScrollView(.horizontal, showsIndicators: false) {
-                HStack(spacing: 0) {
-                    ZStack(alignment: .bottom) {
-                        HStack(spacing: 0) {
-                            ServerRailView(chat: chat)
-                            DrawerList()
-                        }
-                        MobileYouBar()
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 0) {
+                ZStack(alignment: .bottom) {
+                    HStack(spacing: 0) {
+                        ServerRailView(chat: chat)
+                        DrawerList()
                     }
-                    .frame(width: geo.size.width).id(DrawerPage.list)
-                    DrawerChat().frame(width: geo.size.width).id(DrawerPage.chat)
+                    MobileYouBar()
                 }
-                .scrollTargetLayout()
+                .containerRelativeFrame(.horizontal).id(DrawerPage.list)
+                // Each page is the scroll view's own width; the height is whatever the system
+                // gives the pager (no screen-sized frames: the keyboard lift in `ChatSurface`
+                // measures the page as it really is).
+                DrawerChat().containerRelativeFrame(.horizontal).id(DrawerPage.chat)
             }
-            .scrollTargetBehavior(.paging)
-            .scrollPosition(id: $page)
-            .onChange(of: chat.selection) { _, sel in
-                withAnimation(.snappy(duration: 0.28)) { page = sel == nil ? .list : .chat }
-            }
-            // Both pages stay mounted for the paging swipe, so the chat's composer field can keep
-            // the keyboard up behind the channel list. Whenever the visible page isn't the chat,
-            // resign first responder — the keyboard only belongs to the open conversation.
-            .onChange(of: page) { _, p in
-                if p != .chat { dismissKeyboard() }
-            }
+            .scrollTargetLayout()
         }
+        .scrollTargetBehavior(.paging)
+        .scrollPosition(id: $page)
+        // Every assignment, not only a change: tapping the conversation that is already selected
+        // (after swiping back to the list) must slide to it again.
+        .onReceive(chat.$selection.dropFirst()) { sel in
+            withAnimation(.snappy(duration: 0.28)) { page = sel == nil ? .list : .chat }
+        }
+        #if DEBUG
+        // Screenshots of the chat page inside the real pager (no server needed).
+        .task { if E2E.env("SKWOD_SCREEN") == "drawerchat" { try? await Task.sleep(for: .milliseconds(600)); page = .chat } }
+        #endif
+        // Both pages stay mounted for the paging swipe, so the chat's composer field can keep
+        // the keyboard up behind the channel list. Whenever the visible page isn't the chat,
+        // resign first responder — the keyboard only belongs to the open conversation.
+        .onChange(of: page) { _, p in
+            // Only a settled page that isn't the chat. (`nil` is "between pages" — a relayout,
+            // e.g. the keyboard appearing, must never take the keyboard away again.)
+            if let p { settled = p; chat.chatPageVisible = p == .chat }
+            if let p, p != .chat { dismissKeyboard() }
+        }
+        // A rotation (or an iPad window resize) changes the page width and leaves the pager
+        // between two pages: put the page that was showing back under the viewport.
+        .onGeometryChange(for: CGFloat.self) { $0.size.width } action: { _ in
+            let showing = settled
+            var t = Transaction(); t.disablesAnimations = true
+            withTransaction(t) { page = nil }
+            DispatchQueue.main.async { withTransaction(t) { page = showing } }
+        }
+        // Only the page in front marks messages read (the chat stays mounted behind the list),
+        // and only it counts as "on screen" for alerts and mention badges.
+        .environment(\.chatOnScreen, settled == .chat)
+        .onAppear { chat.chatPageVisible = settled == .chat }
+        .onDisappear { chat.chatPageVisible = true }
+        #if DEBUG
+        // Proving the keyboard lift: take the keyboard safe area away from the pager entirely
+        // (what a scroll view that keeps it to itself does), so only `KeyboardFrame` can lift the
+        // composer (`SKWOD_E2E_NO_KEYBOARD_SAFE_AREA=1`).
+        .ignoresSafeArea(E2E.env("SKWOD_E2E_NO_KEYBOARD_SAFE_AREA") == "1" ? .keyboard : [], edges: .bottom)
+        #endif
         // One shared glass backdrop under both pages, with the dark chrome veil over it — the same
         // three contrast steps as macOS (rail bare on chrome, drawer +1 lift, chat lightest).
         .background {
@@ -792,6 +823,14 @@ private enum DrawerPage: Hashable { case list, chat }
 private struct DrawerChat: View {
     @EnvironmentObject private var chat: ChatModel
     var body: some View {
+        #if DEBUG
+        if E2E.env("SKWOD_SCREEN") == "drawerchat" { ChatSurfacePreview() } else { selected }
+        #else
+        selected
+        #endif
+    }
+
+    @ViewBuilder private var selected: some View {
         switch chat.selection {
         case .home: DMHomeView().environmentObject(chat)
         case .feed: FeedView().environmentObject(chat)
@@ -818,6 +857,9 @@ private struct DrawerList: View {
     @State private var query = ""
     @State private var newChannelTarget: ServerRef?
     @State private var rolesTarget: ServerRef?
+    @State private var renameTarget: ServerRef?
+    @State private var renameText = ""
+    @State private var renameProblem: String?
 
     var body: some View {
         Group {
@@ -837,6 +879,9 @@ private struct DrawerList: View {
         .sheet(isPresented: $showCreate) { CreateSpaceSheet { chat.addSpace($0) } }
         .sheet(item: $newChannelTarget) { srv in NewChannelSheet(server: srv, chat: chat) }
         .sheet(item: $rolesTarget) { srv in DismissableSheet { RolesSheet(server: srv) } }
+        .alert("Couldn't rename the server", isPresented: Binding(get: { renameProblem != nil }, set: { if !$0 { renameProblem = nil } })) {
+            Button("OK", role: .cancel) { renameProblem = nil }
+        } message: { Text(renameProblem ?? "") }
     }
 
     /// The space to invite people into: the selected one, else the first.
@@ -865,6 +910,12 @@ private struct DrawerList: View {
                         }
                         Button { showSkwodSettings = true } label: { Label("Skwod settings", systemImage: "gearshape") }
                         if let sp = inviteSpace {
+                            // Id, name and role from ONE server: the one on screen.
+                            if chat.inChannelsMode, let srv = chat.currentServer, chat.role(in: srv.serverId) != .member {
+                                Button { renameText = srv.name; renameTarget = ServerRef(serverId: srv.serverId, name: srv.name) } label: {
+                                    Label("Rename server…", systemImage: "pencil")
+                                }
+                            }
                             Button { rolesTarget = ServerRef(serverId: sp.serverId, name: sp.name) } label: {
                                 Label("Manage permissions", systemImage: "checkmark.shield")
                             }
@@ -883,6 +934,8 @@ private struct DrawerList: View {
                                 .font(.system(size: 14, weight: .semibold)).foregroundStyle(.white.opacity(0.5))
                         }
                     }
+                    // (On the menu, not the list: one alert per view — the list has its own.)
+                    .modifier(ServerRenameAlert(target: $renameTarget, text: $renameText, chat: chat) { renameProblem = $0 })
                     Spacer()
                 }
                 .padding(.horizontal, 12).padding(.top, 8).padding(.bottom, 8)

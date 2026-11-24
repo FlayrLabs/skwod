@@ -245,24 +245,27 @@ struct SpaceChannelView: View {
         .onReceive(NotificationCenter.default.publisher(for: .skwodOutboxChanged)) { _ in
             Task { await reloadLocal() }
         }
+        .onReceive(app.realtime.$presence) { _ in presenceTick &+= 1 }
         .environment(\.messageExtras, MessageExtras(
             onReport: { msg in
                 guard let id = msg.authorId else { return }
-                reporting = ReportTarget(userId: id, name: msg.author, messageText: msg.body.isEmpty ? nil : msg.body, serverId: space.serverId,
+                reporting = ReportTarget(userId: id, name: msg.authorSpoken ?? msg.author, messageText: msg.body.isEmpty ? nil : msg.body, serverId: space.serverId,
                                            channelId: space.channelId, messageId: msg.id)
             },
             onBlock: { msg in
                 guard let id = msg.authorId else { return }
-                blocking = ReportTarget(userId: id, name: msg.author, serverId: space.serverId)
+                blocking = ReportTarget(userId: id, name: msg.authorSpoken ?? msg.author, serverId: space.serverId)
             },
             onRetry: { Outbox.retry(app, localId: $0) },
             onDiscard: { Outbox.discard(app, localId: $0) },
             me: app.session?.userId,
-            mentionLabel: { authorLabel($0) },
+            mentionLabel: { mentionDisplay($0).label(for: .mentionChip) },
+            mentionBadge: { mentionDisplay($0) },
+            authorBadge: { display($0).badge },
             // @everyone counts from the server's PINNED owner and its admins (`EveryoneRule`).
             everyoneAllowed: { sender in chat.everyoneHonoured(sender, in: space.serverId) },
             mentionable: memberNames.filter { $0.key != app.session?.userId && !BlockList.shared.contains($0.key) }
-                .map { (userId: $0.key, name: authorLabel($0.key), username: $0.value) }
+                .map { (userId: $0.key, name: display($0.key).label(for: .mentionPicker), username: $0.value) }
                 .sorted { $0.name.lowercased() < $1.name.lowercased() }
                 + (chat.everyoneHonoured(app.session?.userId, in: space.serverId)
                    ? [(userId: MentionComposer.everyoneId, name: "everyone", username: "")] : []),
@@ -300,6 +303,19 @@ struct SpaceChannelView: View {
         #endif
     }
 
+    /// "● N online": the server's members (the list this view already keeps for names and
+    /// mentions, minus anyone still waiting to be let in) whose presence — seeded by the app's
+    /// existing presence poll and updated live by the socket — isn't offline. No extra request.
+    private var onlineCount: Int? {
+        _ = presenceTick
+        guard !memberNames.isEmpty else { return nil }
+        let held = Set(app.waiting.waiting(in: space.serverId).map(\.userId))
+        let me = app.session?.userId
+        return memberNames.keys.filter { uid in
+            !held.contains(uid) && (uid == me || app.realtime.status(userId: uid) != "offline")
+        }.count
+    }
+
     private var chatSurface: some View {
         ChatSurface(
             title: "#\(space.channelName)",
@@ -335,6 +351,7 @@ struct SpaceChannelView: View {
             composingBanner: composingBanner,
             onCancelCompose: { if editing != nil { draft = "" }; replyingTo = nil; editing = nil },
             conversationId: space.channelId,
+            onlineCount: onlineCount,
             headerActions: {
                 AnyView(
                     HStack(spacing: 16) {
@@ -371,6 +388,9 @@ struct SpaceChannelView: View {
 
     /// userId → username, so message authors render as real names instead of id prefixes.
     @State private var memberNames: [String: String] = [:]
+    /// Bumped on every live presence event, so "● N online" follows the socket (Realtime is
+    /// nested state).
+    @State private var presenceTick = 0
 
     private func load() async {
         guard let client = app.client else { return }
@@ -461,6 +481,22 @@ struct SpaceChannelView: View {
         app.contacts.authorLabel(userId, claimedName: userId.flatMap { memberNames[$0] })
     }
 
+    private func display(_ userId: String) -> ContactTrust.Display {
+        app.contacts.display(userId, claimedName: memberNames[userId])
+    }
+
+    /// A mention: me as myself (no marker), anyone else as `display`.
+    private func mentionDisplay(_ userId: String) -> ContactTrust.Display {
+        // Me as "you" — never under the server's name for me (a host could make it a contact's).
+        ContactTrust.mentionDisplay(userId: userId, me: app.session?.userId, myName: nil, other: display)
+    }
+
+    /// A message author's name: plain, with the trust badge beside it (`authorBadge`).
+    private func headerName(_ userId: String?) -> String {
+        guard let userId, !userId.isEmpty else { return authorLabel(userId) }
+        return display(userId).label(for: .messageHeader)
+    }
+
     private func map(_ rows: [Message]) -> [ChatMessage] {
         let waitingIds = Set(app.waiting.waiting(in: space.serverId).map(\.userId))
         // Index bodies by id so a reply can render a one-line preview of its parent.
@@ -471,6 +507,7 @@ struct SpaceChannelView: View {
             // "Mine" = my local echo ("__me__") OR any message from MY account on another device
             // (same userId, e.g. my phone) — all render as "you", not my username.
             let mine = m.authorId == "__me__" || (m.authorId != nil && m.authorId == app.session?.userId)
+            // A reply preview draws no badge: the name in words.
             let author = mine ? "you" : authorLabel(m.authorId)
             bodyById[m.messageId] = (author, ChatTags.parse(content).text)
         }
@@ -503,12 +540,13 @@ struct SpaceChannelView: View {
             // "Mine" = my local echo ("__me__") OR any message from MY account on another device
             // (same userId, e.g. my phone) — all render as "you", not my username.
             let mine = m.authorId == "__me__" || (m.authorId != nil && m.authorId == app.session?.userId)
-            let author = mine ? "you" : authorLabel(m.authorId)
+            let author = mine ? "you" : headerName(m.authorId)
             // My own rows carry "__me__"; use my real userId so my avatar renders too.
             let authorId = mine ? app.session?.userId : m.authorId
             let parsed = ChatTags.parse(content)
             let replyPreview = m.replyToId.flatMap { bodyById[$0] }.map { "\($0.author): \($0.text.prefix(60))" }
-            return ChatMessage(id: m.messageId, author: author, authorId: authorId, body: parsed.text, mine: mine,
+            return ChatMessage(id: m.messageId, author: author, authorId: authorId,
+                               authorSpoken: mine ? nil : authorLabel(m.authorId), body: parsed.text, mine: mine,
                                reactionPills: reactionsByMessage[m.messageId] ?? [],
                                createdAt: m.createdAt, attachment: parsed.attachment, music: parsed.music,
                                replyToId: m.replyToId, replyPreview: replyPreview,
@@ -746,6 +784,8 @@ private struct MembersColumn: View {
     @State private var reporting: ReportTarget?
     @State private var confirmBan: PresenceMember?
     @State private var confirmDelete: PresenceMember?
+    /// "Verify safety number…" for this member (build 49: reachable from the member list).
+    @State private var verifying: PresenceMember?
     @State private var status = ""
     /// Bumped on every live presence event so SwiftUI recomputes `live` (Realtime is nested state).
     @State private var liveTick = 0
@@ -801,6 +841,9 @@ private struct MembersColumn: View {
             }
         }
         .safetyActions(blocking: $blocking, reporting: $reporting)
+        .sheet(item: $verifying) { m in
+            DismissableSheet { SafetyNumberView(peerName: app.contacts.display(m.userId, claimedName: m.username).text, peerUserId: m.userId) }
+        }
         .confirmationDialog("Kick \(confirmKick?.username ?? "")?",
                             isPresented: Binding(get: { confirmKick != nil }, set: { if !$0 { confirmKick = nil } }),
                             titleVisibility: .visible) {
@@ -845,8 +888,10 @@ private struct MembersColumn: View {
     }
 
     private func memberRow(_ m: PresenceMember) -> some View {
-        MemberRow(username: m.userId == app.session?.userId ? m.username : app.contacts.display(m.userId, claimedName: m.username).spoken,
-                  userId: m.userId, status: m.status)
+        let shown = app.contacts.display(m.userId, claimedName: m.username)
+        let isMe = m.userId == app.session?.userId
+        return MemberRow(username: isMe ? m.username : shown.label(for: .memberRow), userId: m.userId, status: m.status,
+                         badge: isMe ? nil : shown.badge)
             .contextMenu {
                 if !roles.isEmpty {
                     Menu("Roles") {
@@ -861,6 +906,7 @@ private struct MembersColumn: View {
                     }
                 }
                 if m.userId != app.session?.userId {
+                    Button { verifying = m } label: { Label("Verify safety number…", systemImage: "checkmark.shield") }
                     SafetyMenuItems(userId: m.userId, name: m.username, serverId: serverId, blocking: $blocking, reporting: $reporting)
                     Divider()
                     Button { confirmKick = m } label: { Label("Kick from server", systemImage: "person.badge.minus") }
@@ -941,6 +987,8 @@ private struct MemberRow: View {
     let username: String
     var userId: String? = nil
     var status: String = "offline"
+    /// How far the name is trusted (nil for yourself): a small badge, not words after the name.
+    var badge: ContactTrust.Badge? = nil
     @State private var hovering = false
 
     var body: some View {
@@ -953,6 +1001,7 @@ private struct MemberRow: View {
                     .offset(x: 1, y: 1)
             }
             Text(username).font(.system(size: 13)).foregroundStyle(.white.opacity(0.85)).lineLimit(1)
+            if let badge { TrustBadge(badge: badge, compact: true) }
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 8).padding(.vertical, 5)
@@ -999,6 +1048,8 @@ struct MembersSheetView: View {
     @State private var reporting: ReportTarget?
     @State private var confirmBan: PresenceMember?
     @State private var confirmDelete: PresenceMember?
+    /// "Verify safety number…" for this member (build 49: reachable from the member list).
+    @State private var verifying: PresenceMember?
     @State private var status = ""
     /// Bumped on every live presence event so SwiftUI recomputes `live` (Realtime is nested state).
     @State private var liveTick = 0
@@ -1049,6 +1100,9 @@ struct MembersSheetView: View {
             while !Task.isCancelled { await load(); try? await Task.sleep(for: .seconds(10)) }
         }
         .safetyActions(blocking: $blocking, reporting: $reporting)
+        .sheet(item: $verifying) { m in
+            DismissableSheet { SafetyNumberView(peerName: app.contacts.display(m.userId, claimedName: m.username).text, peerUserId: m.userId) }
+        }
         .confirmationDialog("Kick \(confirmKick?.username ?? "")?",
                             isPresented: Binding(get: { confirmKick != nil }, set: { if !$0 { confirmKick = nil } }),
                             titleVisibility: .visible) {
@@ -1079,6 +1133,7 @@ struct MembersSheetView: View {
                 Divider()
             }
             if m.userId != app.session?.userId {
+                Button { verifying = m } label: { Label("Verify safety number…", systemImage: "checkmark.shield") }
                 SafetyMenuItems(userId: m.userId, name: m.username, serverId: serverId, blocking: $blocking, reporting: $reporting)
                 Divider()
                 Button { confirmKick = m } label: { Label("Kick from server", systemImage: "person.badge.minus") }

@@ -17,7 +17,9 @@ enum ServerRole: Equatable {
 enum ServerMenuItem: Equatable, CaseIterable {
     /// `leaveUnverified`: Leave, behind a warning — no owner is pinned on this device, so it
     /// can't tell whether this account owns the server.
-    case mute, invite, settings, copyLink, leave, leaveUnverified, delete
+    /// `rename`: change the server's name for everyone (sealed under the space key; the host
+    /// lets only members with MANAGE_SERVER do it).
+    case mute, invite, rename, settings, copyLink, leave, leaveUnverified, delete
 }
 
 /// Who owns a server, as far as this device may say: the owner PINNED by the core
@@ -38,7 +40,7 @@ enum ServerMenuRule {
     static func items(role: ServerRole, channelsKnown: Bool, ownerPinned: Bool = true) -> [ServerMenuItem] {
         var out: [ServerMenuItem] = []
         if channelsKnown { out += [.mute, .invite] }
-        if role != .member { out.append(.settings) }
+        if role != .member { out += [.rename, .settings] }
         out.append(.copyLink)
         // The (pinned) owner deletes and never leaves (leaving forgets the keys); everyone else
         // leaves. With no pinned owner, only a Leave that warns first.
@@ -128,5 +130,51 @@ enum ServerListRule {
             out[id] = row["owner_id"] as? String ?? ""
         }
         return out
+    }
+}
+
+/// What a server name may be (the same rule the core applies before sealing it: trimmed,
+/// 1 to 100 characters, one line, no direction overrides).
+enum ServerNameRule {
+    static let maxLength = 100
+    static let maxBytes = 400
+
+    enum Outcome: Equatable { case success(String), failure(String) }
+
+    static func checked(_ raw: String) -> Outcome {
+        let name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        // Unicode scalars and UTF-8 bytes — exactly what the core counts (`checked_server_name`).
+        if name.isEmpty || name.unicodeScalars.count > maxLength || name.utf8.count > maxBytes {
+            return .failure("A server name needs 1 to \(maxLength) characters.")
+        }
+        // The core's rule exactly: control, format (Cf: zero-width, direction, tags…) and
+        // blank-looking characters (fillers, the braille blank) are refused.
+        let scalars = Array(name.unicodeScalars)
+        let blank: Set<UInt32> = [0x115F, 0x1160, 0x2800, 0x3164, 0xFFA0, 0x034F, 0x17B4, 0x17B5]
+        func ignorable(_ v: UInt32) -> Bool {
+            (0x180B...0x180F).contains(v) || v == 0x2065 || (0xFE00...0xFE0E).contains(v) || (0xFFF0...0xFFF8).contains(v) || (0xE0000...0xE0FFF).contains(v)
+        }
+        func invisibleOrBlank(_ s: Unicode.Scalar) -> Bool {
+            CharacterSet.controlCharacters.contains(s) || s.properties.generalCategory == .format || blank.contains(s.value)
+                || ignorable(s.value) || s.value == 0x2028 || s.value == 0x2029
+        }
+        func emojiBase(_ s: Unicode.Scalar) -> Bool {
+            !(s.properties.isAlphabetic || s.properties.numericType != nil || s.properties.isWhitespace || invisibleOrBlank(s) || s.value == 0xFE0F)
+                && (s.value >= 0x2000 || "#*©®".unicodeScalars.contains(s))
+        }
+        for (i, s) in scalars.enumerated() {
+            if s.value == 0xFE0F {
+                // The emoji presentation selector only right after a visible emoji base ("❤️").
+                if i > 0, emojiBase(scalars[i - 1]) { continue }
+                return .failure("A server name can't contain line breaks, control or invisible characters.")
+            }
+            if invisibleOrBlank(s) { return .failure("A server name can't contain line breaks, control or invisible characters.") }
+        }
+        return .success(name)
+    }
+
+    static func problem(_ raw: String) -> String? {
+        if case .failure(let why) = checked(raw) { return why }
+        return nil
     }
 }

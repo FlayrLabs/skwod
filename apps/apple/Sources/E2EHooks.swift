@@ -825,6 +825,31 @@ enum E2E {
             guard !target.isEmpty else { note(command, "error: no such server"); return true }
             let problem = parts[0] == "leaveserver" ? await chat.leaveServer(target) : await chat.deleteServer(target)
             note(command, problem.map { "error: \($0)" } ?? "ok servers=\(chat.serverGroups.count)")
+        case "setavatar":
+            // What "Change profile picture" does: my avatar to every channel I am in.
+            await app.avatars.setUserAvatar(E2E.samplePhoto(seed: 7))
+            note(command, "ok has=\(app.avatars.data(for: AvatarStore.userKey(me)) != nil)")
+        case "avatars":
+            // The avatars this device holds (keys), e.g. after a sibling handed its cache over.
+            let keys = (app.avatars.siblingEntries(workspaceId: app.current?.id ?? "") ?? []).filter { $0.img != nil }.map(\.key).sorted()
+            note(command, "n=\(keys.count) [\(keys.joined(separator: ", "))]")
+        case "trust":
+            // trust:<username> — how this device shows them, and what the core says.
+            guard let found = await user(arg) else { note(command, "error: no such user"); return true }
+            let shown = app.contacts.display(found.userId, claimedName: arg)
+            let status = await client.contactStatus(userId: found.userId)
+            note(command, "label=\(shown.spoken) badge=\(shown.badge) level=\(app.contacts.level(found.userId)) core_verified=\(status.verified)")
+        case "sharesiblings":
+            await SiblingSync.share(app)
+            note(command, "ok")
+        case "renameserver":
+            // What "Rename server…" calls (owners and admins).
+            let problem = await chat.renameServer(space.serverId, to: arg)
+            note(command, problem.map { "error: \($0)" } ?? "ok name=\(chat.serverGroups.first { $0.serverId == space.serverId }?.name ?? "-")")
+        case "servername":
+            // The name this device shows for the first server, after asking the host again.
+            await chat.refreshServerList()
+            note(command, "name=\(chat.serverGroups.first { $0.serverId == space.serverId }?.name ?? "-")")
         case "renamehost":
             // What "Rename on host…" calls (the instance owner).
             let problem = await app.setInstanceName(arg)

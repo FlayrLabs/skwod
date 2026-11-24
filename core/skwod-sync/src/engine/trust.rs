@@ -308,6 +308,8 @@ impl Engine {
         if !was_blocked && blocked {
             self.notice("identity_changed", user, "", true);
         }
+        // A verification one of our other devices made for exactly these devices (build 49).
+        self.apply_pending_verified(user);
     }
 
     /// Is `peer` a chain-verified, currently listed device of a contact?
@@ -461,12 +463,15 @@ impl Engine {
         let c = self.contacts.get_mut(&peer.user_id).ok_or(EngineError::Protocol("unknown contact"))?;
         if !verified {
             c.verified = None;
+            // The user un-verified them here: no sibling's verification revives it (build 49).
+            self.note_verification_change(&peer.user_id, false, true);
             return Ok(());
         }
         if !c.unvouched.is_empty() || c.live.is_empty() {
             return Err(EngineError::IdentityChanged(peer.user_id.clone()));
         }
         c.verified = Some(c.live_identities());
+        self.note_verification_change(&peer.user_id, true, false);
         Ok(())
     }
 
@@ -496,6 +501,8 @@ impl Engine {
             c.live.insert(device.clone());
         }
         c.verified = None;
+        // Only a verification made after this counts from a sibling (build 49).
+        self.note_verification_change(&peer.user_id, false, false);
         for (device, identity) in &accepted {
             let addr = DeviceAddress::new(peer.user_id.clone(), device.clone());
             // The user's decision is what puts this key on record (nothing a message carried

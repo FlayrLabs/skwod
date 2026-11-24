@@ -386,7 +386,7 @@ class BasicsTest {
         assertTrue(ContactTrust.display("u-sam", "sam", book).trusted)
         assertNull(ContactTrust.display("u-sam", "sam", book).warning)
         book = ContactTrust.record(book, "u-sam", "whatever-the-server-says-now", TrustLevel.VERIFIED)
-        assertEquals(Contact("u-sam", "sam", TrustLevel.VERIFIED), book["u-sam"])              // keeps the name the user had
+        assertEquals(Contact("u-sam", "sam", TrustLevel.VERIFIED, known = true), book["u-sam"])  // keeps the name the user had (and that they knew them)
         assertTrue(ContactTrust.display("u-sam", null, book).verified)
         // Recording a lower level later never lowers it…
         assertEquals(book, ContactTrust.record(book, "u-sam", "sam", TrustLevel.KNOWN))

@@ -3206,3 +3206,390 @@ fn a_contested_recovery_answer_waits_for_an_approval_not_the_hold() {
     assert!(contested.to_string().contains("waiting for approval on one of your devices"), "{contested}");
     assert!(!contested.to_string().contains("day"), "{contested}");
 }
+
+/// Build 49: what a server rename accepts (the name is sealed under the space key after this).
+#[test]
+fn a_server_name_is_trimmed_bounded_and_single_line() {
+    use super::rest::checked_server_name;
+    assert_eq!(checked_server_name("  Weekend Crew ").unwrap(), "Weekend Crew");
+    assert!(checked_server_name("   ").is_err());
+    assert!(checked_server_name("").is_err());
+    assert!(checked_server_name(&"x".repeat(100)).is_ok());
+    assert!(checked_server_name(&"x".repeat(101)).is_err());
+    assert!(checked_server_name(&"é".repeat(100)).is_ok(), "characters, not bytes");
+    assert!(checked_server_name("two\nlines").is_err());
+    assert!(checked_server_name("evil\u{202E}txt").is_err());
+    let e = checked_server_name("").unwrap_err();
+    assert!(e.to_string().contains("1 to 100"), "{e}");
+}
+
+// ---- build 49: server names bound to their server and version ----
+
+#[test]
+fn a_server_name_is_bound_to_its_server_and_never_rolls_back() {
+    let mut me = engine("me", "m1");
+    let key = [7u8; 32];
+    me.spaces.insert("s1".into(), key);
+    me.spaces.insert("s2".into(), key); // two servers that share a key (the host's best case)
+
+    // A name from before renames (creation): taken while no v2 name has been seen.
+    let legacy = Engine::seal_name(&key, "Old Name");
+    assert_eq!(me.open_server_name("s1", &legacy).as_deref(), Some("Old Name"));
+
+    let (v1, n1) = me.seal_server_name_v2(&key, "s1", "First", "me").unwrap();
+    me.note_server_name_version("s1", n1);
+    let (v2, _) = me.seal_server_name_v2(&key, "s1", "Second", "me").unwrap();
+    let mut reader = engine("you", "y1");
+    reader.spaces.insert("s1".into(), key);
+    reader.spaces.insert("s2".into(), key);
+    assert_eq!(reader.open_server_name("s1", &v2).as_deref(), Some("Second"));
+    // Replayed older version: refused. The same version again: fine.
+    assert_eq!(reader.open_server_name("s1", &v1), None, "an older rename was accepted");
+    assert_eq!(reader.open_server_name("s1", &v2).as_deref(), Some("Second"));
+    // Once a v2 name was seen, the legacy form is refused (it carries no version).
+    assert_eq!(reader.open_server_name("s1", &legacy), None, "a legacy name rolled a rename back");
+    // Swapped onto another server: refused (AAD names the server).
+    assert_eq!(reader.open_server_name("s2", &v2), None, "a name moved to another server");
+    // Survives a restart.
+    let state = reader.export_state();
+    let mut again = engine("you", "y1");
+    let _ = again.load_state(&state);
+    again.spaces.insert("s1".into(), key);
+    assert_eq!(again.b49.name_versions.get("s1"), reader.b49.name_versions.get("s1"));
+}
+
+#[test]
+fn a_received_server_name_goes_through_the_name_rule() {
+    let mut me = engine("me", "m1");
+    let key = [3u8; 32];
+    me.spaces.insert("s".into(), key);
+    let (bad, _) = me.seal_server_name_v2(&key, "s", "two\nlines", "me").unwrap();
+    let mut reader = engine("you", "y1");
+    reader.spaces.insert("s".into(), key);
+    assert_eq!(reader.open_server_name("s", &bad), None);
+    let long = Engine::seal_name(&key, &"x".repeat(101));
+    assert_eq!(reader.open_server_name("s", &long), None);
+}
+
+// ---- build 49: the sibling channel ----
+
+fn sibling_state(verified: b49::VerifiedList, identities: b49::IdentityList, app: Vec<(String, Vec<u8>)>) -> Vec<u8> {
+    // A snapshot envelope (share 1, the only chunk) when there is no app payload; a payload
+    // relying on share 1 otherwise.
+    let chunk = if app.is_empty() { (0, 1) } else { (0, 0) };
+    Content::SiblingState { v: b49::SIBLING_STATE_V1, share: 1, chunk, verified, identities, app }.encode().unwrap()
+}
+
+/// A verified sibling `device` of `me`, with a session under its key.
+fn add_sibling(me: &mut Engine, device: &str) -> b49::Source {
+    let key = SignalStore::generate().identity_key();
+    me.siblings.insert(device.into(), key.clone());
+    me.store.accept_identity(&addr("me", device), &key).unwrap();
+    b49::Source { device: device.into(), identity: key }
+}
+
+#[tokio::test]
+async fn sibling_state_is_accepted_only_from_a_verified_device_of_our_own() {
+    let mut me = engine("me", "m1");
+    let local = me.local().unwrap();
+    me.last_sibling_check = Some(Instant::now());
+    let bob = pin_fresh(&mut me, "bob", "b1");
+    let bob_keys = me.contacts["bob"].live_identities();
+    let snapshot = sibling_state(vec![("bob".into(), bob_keys.clone(), 1)], vec![("bob".into(), bob_keys.clone())], vec![]);
+    let payload = sibling_state(vec![], vec![], vec![("contacts.v1".into(), b"{}".to_vec())]);
+
+    // Another account (even one we know), or a device of ours no link vouched for: dropped.
+    for from in [bob.clone(), addr("me", "rogue")] {
+        me.handle_content(&local, from.clone(), &snapshot, 0).await;
+        me.handle_content(&local, from, &payload, 0).await;
+    }
+    assert!(me.take_sibling_payloads().is_empty());
+    assert!(!me.contacts["bob"].is_verified(), "a non-sibling marked a contact verified");
+
+    // A verified sibling: merged, and its payload may speak for bob (in its snapshot, agreeing).
+    add_sibling(&mut me, "m2");
+    me.handle_content(&local, addr("me", "m2"), &snapshot, 0).await;
+    me.handle_content(&local, addr("me", "m2"), &payload, 0).await;
+    let got = me.take_sibling_payloads();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].vouched_users, vec!["bob".to_string()]);
+    assert!(got[0].mismatched_users.is_empty());
+    assert!(me.contacts["bob"].is_verified());
+
+    // An unknown kind, or an oversized body: dropped.
+    let odd = sibling_state(vec![], vec![], vec![("blocks.v1".into(), b"[]".to_vec()), ("avatars.v1".into(), vec![0; b49::MAX_SIBLING_BODY + 1])]);
+    me.handle_content(&local, addr("me", "m2"), &odd, 0).await;
+    assert!(me.take_sibling_payloads().is_empty());
+}
+
+#[tokio::test]
+async fn a_payload_speaks_only_for_users_in_the_senders_snapshot() {
+    let mut me = engine("me", "m1");
+    let local = me.local().unwrap();
+    me.last_sibling_check = Some(Instant::now());
+    pin_fresh(&mut me, "frank", "f1");
+    add_sibling(&mut me, "m2");
+    // No snapshot at all: the payload may speak for nobody (fail closed).
+    me.handle_content(&local, addr("me", "m2"), &sibling_state(vec![], vec![], vec![("avatars.v1".into(), b"[]".to_vec())]), 0).await;
+    let got = me.take_sibling_payloads();
+    assert!(got[0].vouched_users.is_empty() && got[0].mismatched_users.is_empty());
+    // frank under other keys: mismatched; gina unknown here: vouched.
+    let snap = sibling_state(vec![], vec![("frank".into(), vec![SignalStore::generate().identity_key()]), ("gina".into(), vec![vec![1; 33]])], vec![]);
+    me.handle_content(&local, addr("me", "m2"), &snap, 0).await;
+    me.handle_content(&local, addr("me", "m2"), &sibling_state(vec![], vec![], vec![("avatars.v1".into(), b"[]".to_vec())]), 0).await;
+    let got = me.take_sibling_payloads();
+    assert_eq!(got[0].mismatched_users, vec!["frank".to_string()]);
+    assert_eq!(got[0].vouched_users, vec!["gina".to_string()]);
+}
+
+#[test]
+fn a_large_snapshot_is_split_by_size_never_truncated() {
+    // Contacts with many devices each: a count-based split would overflow an envelope.
+    let identities: b49::IdentityList = (0..1000).map(|i| (format!("user-{i:06}"), (0..32).map(|d| vec![(i + d) as u8; 33]).collect())).collect();
+    let verified: b49::VerifiedList = vec![("user-000001".into(), identities[1].1.clone(), 5), ("user-000900".into(), identities[900].1.clone(), 5)];
+    let chunks = b49::snapshot_chunks((verified, identities));
+    assert!(chunks.len() > 3, "1000 contacts with 32 devices each cannot fit one envelope");
+    assert_eq!(chunks.iter().map(|(_, i)| i.len()).sum::<usize>(), 1000, "nothing dropped");
+    for (v, ids) in &chunks {
+        let encoded = Content::SiblingState { v: b49::SIBLING_STATE_V1, share: 7, chunk: (0, 32), verified: v.clone(), identities: ids.clone(), app: vec![] }.encode().unwrap();
+        assert!(encoded.len() <= b49::SNAPSHOT_CHUNK_BYTES + 1024, "a chunk of {} bytes", encoded.len());
+    }
+    // Every verification travels with its own contact's chunk.
+    for (v, ids) in &chunks {
+        for (u, _, _) in v { assert!(ids.iter().any(|(x, _)| x == u)); }
+    }
+    assert_eq!(chunks.iter().map(|(v, _)| v.len()).sum::<usize>(), 2);
+}
+
+fn snap_env(share: u64, chunk: (u16, u16), users: &[&str]) -> Vec<u8> {
+    let identities = users.iter().map(|u| (u.to_string(), vec![vec![1u8; 33]])).collect();
+    Content::SiblingState { v: b49::SIBLING_STATE_V1, share, chunk, verified: vec![], identities, app: vec![] }.encode().unwrap()
+}
+
+fn payload_env(share: u64) -> Vec<u8> {
+    Content::SiblingState { v: b49::SIBLING_STATE_V1, share, chunk: (0, 0), verified: vec![], identities: vec![], app: vec![("avatars.v1".into(), b"[]".to_vec())] }.encode().unwrap()
+}
+
+async fn sibling_engine() -> (Engine, DeviceAddress) {
+    let mut me = engine("me", "m1");
+    let local = me.local().unwrap();
+    me.last_sibling_check = Some(Instant::now());
+    add_sibling(&mut me, "m2");
+    (me, local)
+}
+
+#[tokio::test]
+async fn snapshot_chunks_may_arrive_out_of_order() {
+    let (mut me, local) = sibling_engine().await;
+    me.handle_content(&local, addr("me", "m2"), &snap_env(5, (1, 2), &["b"]), 0).await;
+    me.handle_content(&local, addr("me", "m2"), &snap_env(5, (0, 2), &["a"]), 0).await;
+    me.handle_content(&local, addr("me", "m2"), &payload_env(5), 0).await;
+    let got = me.take_sibling_payloads();
+    assert_eq!(got[0].vouched_users, vec!["a".to_string(), "b".to_string()]);
+}
+
+#[tokio::test]
+async fn a_missing_chunk_vouches_for_nobody() {
+    let (mut me, local) = sibling_engine().await;
+    me.handle_content(&local, addr("me", "m2"), &snap_env(5, (0, 2), &["a"]), 0).await;
+    me.handle_content(&local, addr("me", "m2"), &payload_env(5), 0).await;
+    assert!(me.take_sibling_payloads()[0].vouched_users.is_empty(), "an incomplete snapshot vouched");
+    // A payload relying on another share: nobody either.
+    me.handle_content(&local, addr("me", "m2"), &snap_env(5, (1, 2), &["b"]), 0).await;
+    me.handle_content(&local, addr("me", "m2"), &payload_env(4), 0).await;
+    assert!(me.take_sibling_payloads()[0].vouched_users.is_empty());
+}
+
+#[tokio::test]
+async fn a_replayed_older_share_is_dropped_and_an_empty_newer_one_resets() {
+    let (mut me, local) = sibling_engine().await;
+    me.handle_content(&local, addr("me", "m2"), &snap_env(5, (0, 1), &["a"]), 0).await;
+    // Replay of share 4: dropped, the snapshot stays share 5 with "a".
+    me.handle_content(&local, addr("me", "m2"), &snap_env(4, (0, 1), &["evil"]), 0).await;
+    assert_eq!(me.b49.snapshots["m2"].share, 5);
+    assert!(!me.b49.snapshots["m2"].users.contains_key("evil"));
+    // A newer, empty share: resets.
+    me.handle_content(&local, addr("me", "m2"), &snap_env(6, (0, 1), &[]), 0).await;
+    assert_eq!(me.b49.snapshots["m2"].share, 6);
+    assert!(me.b49.snapshots["m2"].users.is_empty());
+    me.handle_content(&local, addr("me", "m2"), &payload_env(6), 0).await;
+    assert!(me.take_sibling_payloads()[0].vouched_users.is_empty());
+}
+
+#[test]
+fn share_ids_only_go_up() {
+    let mut me = engine("me", "m1");
+    me.b49.last_share = u64::MAX - 1;
+    // (the send path) — never below the last, saturating.
+    let next = now_ms().max(me.b49.last_share.saturating_add(1));
+    assert_eq!(next, u64::MAX);
+}
+
+#[test]
+fn a_sibling_never_overrides_a_hold_or_a_local_verification() {
+    let mut me = engine("me", "m1");
+    let src = add_sibling(&mut me, "m2");
+    let carol = pin_fresh(&mut me, "carol", "c1");
+    let carol_keys = me.contacts["carol"].live_identities();
+    let other = vec![SignalStore::generate().identity_key()];
+
+    // A device of carol's nobody vouched for (a hold): not overridden.
+    me.contacts.get_mut("carol").unwrap().unvouched.insert("c2".into(), other[0].clone());
+    assert!(!me.merge_sibling_verified("carol", carol_keys.clone(), 10, &src));
+    assert!(me.contacts["carol"].verified.is_none());
+    me.contacts.get_mut("carol").unwrap().unvouched.clear();
+
+    // Verified here: a sibling's different set never replaces it.
+    me.set_verified(&carol, true).unwrap();
+    assert!(!me.merge_sibling_verified("carol", other, i64::MAX, &src));
+    assert!(me.contacts["carol"].is_verified());
+}
+
+#[test]
+fn a_sibling_verification_for_other_keys_is_a_hold_not_a_silent_drop() {
+    let mut me = engine("me", "m1");
+    let src = add_sibling(&mut me, "m2");
+    pin_fresh(&mut me, "dora", "d1");
+    me.take_security_notices();
+    let theirs = vec![SignalStore::generate().identity_key()];
+    assert!(!me.merge_sibling_verified("dora", theirs, 10, &src));
+    assert!(me.contacts["dora"].blocked(), "sends to dora must be held until she is verified again");
+    let notices = me.take_security_notices();
+    assert!(notices.iter().any(|n| n.kind == "identity_changed" && n.user_id == "dora" && n.was_verified));
+}
+
+#[test]
+fn an_unverify_here_is_never_undone_by_a_sibling() {
+    let mut me = engine("me", "m1");
+    let src = add_sibling(&mut me, "m2");
+    let eve = pin_fresh(&mut me, "eve", "e1");
+    let keys = me.contacts["eve"].live_identities();
+    me.set_verified(&eve, true).unwrap();
+    me.set_verified(&eve, false).unwrap();
+    // Even a verification dated later: the user un-verified her here.
+    assert!(!me.merge_sibling_verified("eve", keys.clone(), now_ms() as i64 + 60_000, &src));
+    assert!(!me.contacts["eve"].is_verified());
+    // A clear by accepting a changed set: only a later verification counts.
+    let mut other = engine("me", "m1");
+    let src2 = add_sibling(&mut other, "m2");
+    pin_fresh(&mut other, "fay", "f1");
+    let fay_keys = other.contacts["fay"].live_identities();
+    other.note_verification_change("fay", false, false);
+    let cleared = other.b49.cleared["fay"].at;
+    assert!(!other.merge_sibling_verified("fay", fay_keys.clone(), cleared - 1, &src2));
+    assert!(!other.contacts["fay"].is_verified());
+    assert!(other.merge_sibling_verified("fay", fay_keys, cleared + 1, &src2));
+    assert!(other.contacts["fay"].is_verified());
+}
+
+#[test]
+fn a_siblings_verification_waits_for_this_devices_pin_and_its_source() {
+    let mut me = engine("me", "m1");
+    let src = add_sibling(&mut me, "m2");
+    let dave_key = SignalStore::generate().identity_key();
+    // Not pinned here yet: remembered, nothing pinned.
+    assert!(me.merge_sibling_verified("dave", vec![dave_key.clone()], 5, &src));
+    assert!(!me.contacts.contains_key("dave"));
+    pin(&mut me, &addr("dave", "d1"), &dave_key);
+    me.apply_pending_verified("dave");
+    assert!(me.contacts["dave"].is_verified());
+
+    // Pinned with ANOTHER key: held (not silently dropped).
+    let mut other = engine("me", "m1");
+    let src2 = add_sibling(&mut other, "m2");
+    assert!(other.merge_sibling_verified("erin", vec![SignalStore::generate().identity_key()], 5, &src2));
+    pin_fresh(&mut other, "erin", "e1");
+    other.take_security_notices();
+    other.apply_pending_verified("erin");
+    assert!(other.contacts["erin"].blocked());
+    assert!(other.take_security_notices().iter().any(|n| n.kind == "identity_changed" && n.was_verified));
+
+    // The sibling that vouched was removed before the pin: nothing applies.
+    let mut third = engine("me", "m1");
+    let src3 = add_sibling(&mut third, "m2");
+    let key = SignalStore::generate().identity_key();
+    assert!(third.merge_sibling_verified("finn", vec![key.clone()], 5, &src3));
+    third.siblings.remove("m2");
+    pin(&mut third, &addr("finn", "f1"), &key);
+    third.apply_pending_verified("finn");
+    assert!(!third.contacts["finn"].is_verified());
+    assert!(third.b49.pending_verified.is_empty());
+}
+
+#[tokio::test]
+async fn payloads_from_a_sibling_removed_since_are_dropped() {
+    let mut me = engine("me", "m1");
+    let local = me.local().unwrap();
+    me.last_sibling_check = Some(Instant::now());
+    add_sibling(&mut me, "m2");
+    me.handle_content(&local, addr("me", "m2"), &sibling_state(vec![], vec![], vec![("avatars.v1".into(), b"[]".to_vec())]), 0).await;
+    // Re-keyed (or removed and tombstoned) before the app took it.
+    me.siblings.insert("m2".into(), SignalStore::generate().identity_key());
+    assert!(me.take_sibling_payloads().is_empty());
+}
+
+#[test]
+fn sibling_sends_are_rate_limited() {
+    let mut me = engine("me", "m1");
+    let allowed = (0..100).filter(|_| me.take_sibling_send()).count();
+    assert_eq!(allowed, 24);
+}
+
+#[test]
+fn a_server_name_from_the_far_future_is_refused_and_cannot_lock_the_name() {
+    let key = [5u8; 32];
+    let mut reader = engine("you", "y1");
+    reader.spaces.insert("s".into(), key);
+    // Forge a v2 name dated a year ahead (what a malicious member or a replaying host could serve).
+    let plain = postcard::to_stdvec(&(now_ms() + 365 * 86_400_000, "Locked".to_string(), "x".to_string())).unwrap();
+    let forged = B64.encode(skwod_crypto::aead::seal(&key, b"skwod/server-name-v2|s", &plain));
+    assert_eq!(reader.open_server_name("s", &forged), None);
+    assert!(!reader.b49.name_versions.contains_key("s"), "a future version was stored");
+    // An honest rename afterwards still lands.
+    let mut owner = engine("me", "m1");
+    owner.spaces.insert("s".into(), key);
+    let (honest, _) = owner.seal_server_name_v2(&key, "s", "Fine", "me").unwrap();
+    assert_eq!(reader.open_server_name("s", &honest).as_deref(), Some("Fine"));
+    // Sealing never overflows, and noting never lowers a stored version.
+    owner.b49.name_versions.insert("s".into(), u64::MAX);
+    assert!(owner.seal_server_name_v2(&key, "s", "Again", "me").is_ok());
+    owner.note_server_name_version("s", 5);
+    assert_eq!(owner.b49.name_versions["s"], u64::MAX);
+}
+
+/// A rename the host did not take must not make this device refuse the name that is still live.
+#[tokio::test]
+async fn a_failed_rename_keeps_the_live_name_acceptable() {
+    let key = [9u8; 32];
+    let mut owner = engine("me", "m1");
+    owner.spaces.insert("s".into(), key);
+    let (live, v) = owner.seal_server_name_v2(&key, "s", "Live", "me").unwrap();
+    owner.note_server_name_version("s", v);
+    // The PATCH fails (nothing listens on the test client's host).
+    assert!(owner.rename_server("s", "Never landed").await.is_err());
+    assert_eq!(owner.b49.name_versions["s"], v, "a failed rename raised the stored version");
+    assert_eq!(owner.open_server_name("s", &live).as_deref(), Some("Live"));
+}
+
+/// L6: invisible (Cf) and blank-looking server names are refused.
+#[test]
+fn a_server_name_cannot_be_invisible_or_blank_looking() {
+    use super::rest::checked_server_name;
+    for bad in ["a\u{200B}b", "\u{2060}x", "x\u{FEFF}", "\u{00AD}soft", "tag\u{E0041}", "\u{3164}", "\u{3164}\u{3164}", "\u{2800}", " \u{115F} "] {
+        assert!(checked_server_name(bad).is_err(), "{bad:?} was accepted");
+    }
+    assert!(checked_server_name("Crew \u{3164}name").is_err(), "a filler inside a name hides characters");
+    assert!(checked_server_name("Café 🎉").is_ok());
+}
+
+/// Line/paragraph separators, default-ignorables and a stray U+FE0F are refused; an emoji with
+/// its presentation selector is fine.
+#[test]
+fn a_server_name_refuses_separators_and_ignorables() {
+    use super::rest::checked_server_name;
+    for bad in ["\u{FE0F}", "a\u{FE0F}b", "\u{E0100}", "crew\u{2028}name", "x\u{2029}y", "\u{180B}x", "x\u{FE00}", "\u{FFF0}x", "\u{2065}"] {
+        assert!(checked_server_name(bad).is_err(), "{bad:?} was accepted");
+    }
+    assert!(checked_server_name("❤️ crew").is_ok());
+    assert!(checked_server_name("Weekend ✌️").is_ok());
+}

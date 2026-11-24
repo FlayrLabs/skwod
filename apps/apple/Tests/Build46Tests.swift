@@ -178,8 +178,8 @@ final class Build46Tests: XCTestCase {
     // MARK: server and skwod menus
 
     func testServerMenuByRole() {
-        XCTAssertEqual(ServerMenuRule.items(role: .owner, channelsKnown: true), [.mute, .invite, .settings, .copyLink, .delete])
-        XCTAssertEqual(ServerMenuRule.items(role: .admin, channelsKnown: true), [.mute, .invite, .settings, .copyLink, .leave])
+        XCTAssertEqual(ServerMenuRule.items(role: .owner, channelsKnown: true), [.mute, .invite, .rename, .settings, .copyLink, .delete])
+        XCTAssertEqual(ServerMenuRule.items(role: .admin, channelsKnown: true), [.mute, .invite, .rename, .settings, .copyLink, .leave])
         XCTAssertEqual(ServerMenuRule.items(role: .member, channelsKnown: true), [.mute, .invite, .copyLink, .leave])
         // Only the owner may delete; the owner can never "leave" (the server refuses it).
         XCTAssertFalse(ServerMenuRule.items(role: .admin, channelsKnown: true).contains(.delete))

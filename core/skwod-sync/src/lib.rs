@@ -20,7 +20,7 @@ pub mod realtime;
 pub use cache::{Cache, CacheError};
 pub use client::{valid_blob_id, ApiClient, ChunkOutcome, ClientError, Session, CLIENT_BUILD};
 pub use engine::{
-    is_undecryptable, undecryptable_body, DeviceInfo, DeviceState, MemorySentStore, OutgoingRow, ResentMessage, RetryEvent, SentStore, StateSink, SENT_RETENTION_MS, UNDECRYPTABLE_TAG,
+    is_undecryptable, undecryptable_body, DeviceInfo, DeviceState, MemorySentStore, OutgoingRow, ResentMessage, RetryEvent, SavedApi, SentStore, StateSink, SENT_RETENTION_MS, UNDECRYPTABLE_TAG,
 };
 pub use engine::{
     ChannelDelete, ChannelPage, ChannelPlaintext, DmConversation, DmOp, DmOpKind, Engine, EngineError, EventSink, InboundDm, InboundMessage, InboundReport, InboxOutcome, LoadOutcome, PageCursor, PairPoll, PeerId, Reaction,

@@ -156,14 +156,34 @@ object AttachmentCrypto {
 }
 
 /** Thin client for the server's resumable blob store; content is opaque ciphertext to the server. */
-class BlobStore(private val base: String, private val token: String) {
-    private fun conn(path: String, method: String): HttpURLConnection {
-        val c = URL("${base.trimEnd('/')}/$path").openConnection() as HttpURLConnection
+class BlobStore(
+    private val base: String,
+    private val token: String,
+    /** Opens a connection (replaceable in tests: nothing is sent until it is used). */
+    private val opener: (URL) -> HttpURLConnection = { it.openConnection() as HttpURLConnection },
+    /** The sink's verdict for a base, and where requests are tracked (replaceable in tests). */
+    private val allows: (String) -> Boolean = { RawSink.allows(it) },
+    private val track: (HttpURLConnection, String) -> Unit = { c, b -> RawSink.track(c, b) },
+) {
+    /**
+     * EVERY request of this store is opened here. [token] is what the session presents: through
+     * a p2p front only its credential (the front injects the real token), else the token; none
+     * when empty. [blobToken]: a DM attachment's download token instead.
+     */
+    private fun open(path: String, method: String, blobToken: String? = null): HttpURLConnection {
+        // The one sink: never to a retired or SUSPECT front; tracked, so a move cuts it.
+        if (!allows(base)) throw AttachmentException("Not connected — try again in a moment.")
+        val c = opener(URL("${base.trimEnd('/')}/$path"))
+        track(c, base)
         c.requestMethod = method
-        c.setRequestProperty("Authorization", "Bearer $token")
+        if (blobToken != null) c.setRequestProperty("x-skwod-blob-token", blobToken)
+        else if (token.isNotEmpty()) c.setRequestProperty("Authorization", "Bearer $token")
         c.connectTimeout = 15000; c.readTimeout = 30000
         return c
     }
+
+
+    private fun conn(path: String, method: String): HttpURLConnection = open(path, method)
 
     /** What the server said when it refused a request, as a sentence for the user. */
     private fun refusal(c: HttpURLConnection): AttachmentException {
@@ -275,11 +295,7 @@ class BlobStore(private val base: String, private val token: String) {
     suspend fun download(blobId: String, token: String? = null, maxBytes: Long = AttachmentLimits.maxCiphertext(UploadLimit.inMemoryDownloadCap())): ByteArray = withContext(Dispatchers.IO) {
         // Into memory: bounded by a fixed constant, never by what a server says it allows.
         @Suppress("NAME_SHADOWING") val maxBytes = minOf(maxBytes, AttachmentLimits.maxCiphertext(UploadLimit.inMemoryDownloadCap()))
-        val c = URL("${base.trimEnd('/')}/api/blobs/$blobId").openConnection() as HttpURLConnection
-        c.requestMethod = "GET"
-        c.connectTimeout = 15000; c.readTimeout = 30000
-        if (token != null) c.setRequestProperty("x-skwod-blob-token", token)
-        else c.setRequestProperty("Authorization", "Bearer ${this@BlobStore.token}")
+        val c = open("api/blobs/$blobId", "GET", blobToken = token)
         val status = try { c.responseCode } catch (_: java.io.IOException) { throw AttachmentException("Download failed — check your connection.") }
         when (status) {
             200 -> {
@@ -308,11 +324,7 @@ class BlobStore(private val base: String, private val token: String) {
      * whatever the header said, and nothing partial is kept.
      */
     suspend fun downloadTo(blobId: String, dest: File, token: String? = null, maxBytes: Long = AttachmentLimits.maxCiphertext(UploadLimit.downloadCap())) = withContext(Dispatchers.IO) {
-        val c = URL("${base.trimEnd('/')}/api/blobs/$blobId").openConnection() as HttpURLConnection
-        c.requestMethod = "GET"
-        c.connectTimeout = 15000; c.readTimeout = 30000
-        if (token != null) c.setRequestProperty("x-skwod-blob-token", token)
-        else c.setRequestProperty("Authorization", "Bearer ${this@BlobStore.token}")
+        val c = open("api/blobs/$blobId", "GET", blobToken = token)
         val status = try { c.responseCode } catch (_: java.io.IOException) { throw AttachmentException("Download failed — check your connection.") }
         when (status) {
             200 -> {

@@ -104,6 +104,7 @@ right for almost everyone.**
 | **Run as (uid:gid)** | `99:100` | The low-privilege user the server runs as (Unraid's usual `nobody:users`). |
 | **Use public relays as a fallback** | `true` | If a friend's app can't connect directly (common behind home routers), traffic goes through a public relay. It's still end-to-end encrypted; the relay only sees IP addresses and timing. Setting `false` is more private, but some friends may not be able to connect at all. |
 | **Find on local network** | empty (off) | Helps phones on your home Wi-Fi find the server faster. It only works with Network Type **Host**. Leave it off. |
+| **Add a device by QR** | empty (off) | Set it to `1` to turn on [adding a device by QR code](#optional-turn-on-adding-a-device-by-qr-code). |
 
 **Extra Parameters** (advanced view): **don't change these.** They are the safety settings:
 
@@ -249,6 +250,29 @@ Each Skwod is separate and has its own account. In the app, open your profile an
 skwod** (Android: **Add a Skwod**). On a Mac or Android you can also use the **Join or host a
 Skwod** tile in the left rail. You get the same **Sign up** form; use your server's invite there.
 
+### Optional: turn on adding a device by QR code
+
+With this on, a member can sign in on a new phone or computer by scanning a QR code from a device
+they're already signed in on, without typing a password. It's off unless you turn it on.
+
+1. On the **Docker** tab, click the Skwod icon, then **Edit**.
+2. Click **Show more settings** and set **Add a device by QR** to `1`.
+3. Click **Apply**. The container restarts and the server starts again by itself.
+
+If you don't see that setting (you installed Skwod before it was added to the template), click
+**Add another Path, Port, Variable, Label or Device** instead. Set **Config Type** to `Variable`,
+**Name** to `Add a device by QR`, **Key** to `SKWOD_QR_PAIRING` and **Value** to `1`, then click
+**Add** and **Apply**.
+
+To use it: on a signed-in device, open **Profile → Devices → Manage… → Add a device**. On the new
+device, tap **Scan from your other device**, check the Skwod and username it names, then pick the
+matching emoji on the signed-in device. Only approve a device that's in front of you, and only scan
+a code from your own device: a code from someone else would add the new device to *their* account.
+How it works, and what it can't protect against, is in
+[SECURITY.md](SECURITY.md#adding-a-device-by-qr-build-48).
+
+To turn it off again, clear the value and **Apply**.
+
 ## 8. Create a server and invite friends
 
 In Skwod, a **server** is a group with its own channels and members, and your Skwod can hold
@@ -298,7 +322,15 @@ internet. Calls travel through the same encrypted connection as chat, over the o
 - **For the best call quality**, forward **UDP 47474** on your router to your Unraid box's IP
   address. Look up "port forwarding" in your router's manual. Forward **UDP only**, and **only
   47474**. **Never forward port 3477** (the admin page).
-- The admin page shows **Voice and video: On** when calls are ready.
+- The admin page shows **Voice and video: On** when calls are ready. It's live: if the call
+  server stops, the page says **Starting…** or **Off** with the reason, and Skwod keeps trying to
+  start it again by itself (after 2 seconds at first, at most a minute apart). You don't need to
+  restart the container.
+- **There is nothing to set up.** If somebody saved another call server for this Skwod earlier
+  (the app's *Turn on voice & video* panel did that), calls use that one and the built-in one
+  stays off. The admin page then says **On, through** and its name. To go back, open the Skwod app
+  as the owner → **Skwod settings** → **Use this Skwod's own call server**. Only the owner can,
+  from their own device.
 
 ## Updating
 
@@ -310,6 +342,37 @@ internet. Calls travel through the same encrypted connection as chat, over the o
    and signed before it becomes `latest`. If an update changes the database, the server first
    keeps a copy of the old one in `appdata/skwod/snapshots/`.
 
+**Make a backup before you update** (the encrypted one under [Backups](#backups)). Updating is
+one-way once the database has changed: an older image then refuses to start, with "was written by
+a NEWER version of Skwod than this one" in the log. Your data isn't damaged. Put the newer image
+back and it starts again.
+
+**If you really must go back**, you need the encrypted backup you made **before** the update, and
+the older image's digest (see
+[pin an exact image](#for-the-cautious-pin-an-exact-image)). Everything since that backup is gone,
+and everyone signs in again.
+
+1. **Stop** the container and leave it stopped.
+2. In the Unraid Terminal, restore the backup with the **older** image. `--replace` sets the
+   current folder aside as `skwod.replaced-<time>` next to it; nothing is deleted.
+
+   ```sh
+   docker run --rm --user 0:0 --network none \
+     -e SKWOD_BACKUP_PASSPHRASE='a long passphrase you wrote down' \
+     -v /mnt/user/appdata:/appdata -v /mnt/user/backups/skwod:/backup \
+     ghcr.io/flayrlabs/skwod-server@sha256:<older digest> \
+     skwod restore --in /backup/skwod-2026-11-22.skwodbackup --data /appdata/skwod --replace
+   ```
+
+3. Edit the container, set **Repository** to the same
+   `ghcr.io/flayrlabs/skwod-server@sha256:<older digest>`, and click **Apply**. That starts it.
+   If the restore listed anything that came back (a removed device, a lifted ban), it's also in
+   `restore-report.txt` in the data folder: remove those again.
+
+Don't copy a file from `snapshots/` over the database yourself: that brings back devices and
+sessions you removed and one-time keys that were already used, and signs out some people with no
+explanation. `skwod restore` takes care of those.
+
 After an update, everyone's apps reconnect by themselves. Nobody needs a new invite.
 
 ## Backups
@@ -320,6 +383,10 @@ your Skwod is gone,** and every invite and member with it.
 
 **The simplest way:** install **Appdata Backup** from the **Apps** tab and include the `skwod`
 folder. It stops the container briefly while it copies, which is the safe way to copy it.
+It's a plain copy, though, for when the folder is lost. If the copy is older than an update, a
+removed device or member, or a password change, putting it back undoes those, and it doesn't end
+old sessions or drop used one-time keys. When you have an encrypted backup (below), restore that
+one instead.
 
 **An encrypted single-file backup (recommended as well).** Skwod can write its whole data folder
 into one file locked with a passphrase, which you can safely keep off-site:
@@ -368,7 +435,9 @@ same members. Nobody has to be invited again.
      click **Apply**.
    - **If you made an encrypted backup:** copy the `.skwodbackup` file to the new box, for
      example to `/mnt/user/backups/skwod/`, and run this in the new box's Terminal. The
-     target folder must not exist yet:
+     target folder must not hold a Skwod yet (if it does, add `--replace`, which sets it aside).
+     If you pin an image, use your pinned digest here instead of `:latest`: the restored Skwod
+     must be started by the same version or a newer one:
 
      ```sh
      docker run --rm --user 0:0 --network none \
@@ -524,9 +593,49 @@ You opened the page some way other than the tunnel. Use the `ssh -L` command fro
 - Make sure **Connection port (UDP)** and **P2P port** are the same number.
 - Make sure the invite hasn't expired (7 days) or been revoked. Make a new one.
 
-**Calls don't connect, or there's no sound or picture.**
-- The admin page should show **Voice and video: On**. If it says **Off**, look in the log for
-  `voice disabled` and restart the container.
+**Calls don't connect, or there's no sound or picture.** What the app says tells you where to
+look:
+
+| The app says | What it means | What to do |
+|---|---|---|
+| Voice is off on this Skwod | The call server isn't running | The admin page says why next to **Voice and video**; run the check below |
+| Voice is starting | It's being started, or started again | Wait a minute |
+| Couldn't reach the host | The app didn't reach your server at all | Same as *Friends can't connect*, above |
+| You can't join this channel | That account may not join the voice channel | **Skwod settings** → permissions |
+| Reached the call, but this device's connection blocked its sound and video | The server side works. The last step, inside the phone, fails on some connections (mobile data; a VPN that carries everything) | Join on Wi-Fi; update the app |
+| Reached the call, but sound and video didn't get through | The call server answered, the sound and picture didn't arrive | Forward **UDP 47474** ([step 9](#9-voice-and-video-calls)); run the check below |
+
+An app older than build 51 says only *"Couldn't join the call"* for all of them.
+
+**A safe check** for the Unraid Terminal. It prints only the sentences you see here (no addresses,
+names, keys or log lines), so you can paste what it says anywhere:
+
+```sh
+c=skwod
+say() { if eval "$2" >/dev/null 2>&1; then echo "$1: yes"; else echo "$1: no"; fi; }
+L=$(docker logs "$c" 2>&1)
+say "container running"                  '[ "$(docker inspect -f "{{.State.Running}}" "$c")" = true ]'
+say "server healthy"                     'docker exec "$c" skwod healthcheck'
+say "call server running now"            'docker top "$c" | grep -q "[l]ivekit-server"'
+say "log: voice was turned on"           'grep -q "voice/video enabled" <<<"$L"'
+say "log: voice failed at least once"    'grep -q "voice disabled" <<<"$L"'
+say "log: another call server is saved"  'grep -q "another call server is saved" <<<"$L"'
+say "log: no call server in the image"   'grep -q "no bundled call server" <<<"$L"'
+say "memory limit was hit"               '[ "$(docker inspect -f "{{.State.OOMKilled}}" "$c")" = true ]'
+unset L
+```
+
+- *call server running now: no* and *voice failed at least once: yes*: leave it a few minutes; it's
+  tried again by itself. On an image older than build 51 it's tried once per start: restart the
+  container.
+- *call server running now: no*, *voice was turned on: no* and *voice failed: no* on an image
+  older than build 51: another call server was probably saved (older images don't say so). Update
+  the image, then see [step 9](#9-voice-and-video-calls).
+- *memory limit was hit: yes*: raise `--memory` (below).
+- Everything looks right and one person still can't join: have them try on
+  Wi-Fi and on mobile data, and tell us which of the sentences above their app says.
+
+More:
 - Calls use the same connection as chat. If chat works but calls are choppy, forward **UDP
   47474** to the Unraid box ([step 9](#9-voice-and-video-calls)).
 - Check that the app has permission to use the microphone and camera (phone **Settings** →
@@ -571,4 +680,7 @@ build system for each one. If you want to decide each update yourself, pin the i
    `ghcr.io/flayrlabs/skwod-server@sha256:<digest>`, then **Apply**.
 
 A pinned image never changes, so **Check for Updates** won't show Skwod updates any more. To
-update, put a new digest in **Repository** yourself.
+update, put a new digest in **Repository** yourself, after making a backup.
+
+Going back to an older digest only works while the database hasn't changed in between. If it has,
+the older image refuses to start: see [Updating](#updating).

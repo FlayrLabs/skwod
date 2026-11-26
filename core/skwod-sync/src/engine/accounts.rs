@@ -441,7 +441,8 @@ impl Engine {
             return Ok(());
         }
         let local = self.local()?;
-        let Some(token) = self.api.token().map(str::to_string) else { return Ok(()) };
+        // (Resolved in process for a front client, which holds only its credential.)
+        let Some(token) = self.api.real_token() else { return Ok(()) };
         if self.passive && self.acct.install_secret.is_none() {
             // The notification extension makes no secrets; the app binds first.
             return Err(EngineError::Protocol("this install has not been bound by the app yet"));
@@ -1060,6 +1061,12 @@ impl Engine {
                 Ok(())
             }
         }
+    }
+
+    /// Tests only: would something sealed now be let out?
+    #[doc(hidden)]
+    pub fn checkpoint_for_test(&mut self) -> Result<(), EngineError> {
+        self.checkpoint(None)
     }
 
     /// The message row a send that just FAILED had already written (scope, id): it never went

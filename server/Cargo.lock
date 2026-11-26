@@ -2884,8 +2884,6 @@ dependencies = [
 [[package]]
 name = "n0-mainline"
 version = "0.7.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b46bd27a3729d0e94ca0ce610f72d0d71e5955d66e4f3d37241c56693fe41587"
 dependencies = [
  "crc",
  "dyn-clone",
@@ -4726,7 +4724,7 @@ dependencies = [
 
 [[package]]
 name = "skwod-crypto"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "aes 0.8.4",
  "argon2",
@@ -4750,10 +4748,11 @@ dependencies = [
 
 [[package]]
 name = "skwod-net"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "base64 0.22.1",
  "bytes",
+ "futures-util",
  "hex",
  "hmac 0.12.1",
  "http-body-util",
@@ -4772,7 +4771,7 @@ dependencies = [
 
 [[package]]
 name = "skwod-server"
-version = "0.50.0"
+version = "0.51.0"
 dependencies = [
  "argon2",
  "axum",

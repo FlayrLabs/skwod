@@ -63,6 +63,34 @@ fun ConnectionPill(modifier: Modifier = Modifier, compact: Boolean = false) {
     }
 }
 
+/** The header the conversation screens draw at their top (16 dp of padding and a 48 dp row). */
+internal val SCREEN_HEADER = 64.dp
+
+/** Whether the [ConnectionBanner] is up. */
+@Composable
+internal fun connectionStripShowing(model: AppModel): Boolean {
+    P2PManager.quality.value
+    return model.current != null && !model.connection.isUsable
+}
+
+/** Relays are off and there is no direct way to the host: what would help, at the user's tap. */
+@Composable
+private fun DirectOnlyNotice(model: AppModel, modifier: Modifier) {
+    var asking by remember { mutableStateOf(false) }
+    Surface(color = Color(0xFF1B1B26), shape = RoundedCornerShape(18.dp), modifier = modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
+        Column(Modifier.padding(horizontal = 14.dp, vertical = 9.dp)) {
+            Text(DirectOnlyRule.text(model.current?.displayName ?: "your host"), color = Color.White, fontSize = 13.sp, fontWeight = FontWeight.SemiBold)
+            Row {
+                TextButton(onClick = { asking = true }) { Text("Turn on", color = SkAccent, fontWeight = FontWeight.SemiBold) }
+                TextButton(onClick = { model.retryConnection() }) { Text("Retry", color = SkAccent, fontWeight = FontWeight.SemiBold) }
+            }
+        }
+    }
+    if (asking) AlertDialog(onDismissRequest = { asking = false }, title = { Text("Allow relays?") }, text = { Text(DirectOnlyRule.WHAT_A_RELAY_SEES) },
+        confirmButton = { TextButton(onClick = { asking = false; model.useRelayWhenNeeded() }) { Text("Turn on") } },
+        dismissButton = { TextButton(onClick = { asking = false }) { Text("Cancel") } })
+}
+
 /**
  * A strip across the top of the app while the active skwod can't be reached — so a message that
  * isn't sending is never a mystery. Hidden whenever the connection is usable.
@@ -70,10 +98,9 @@ fun ConnectionPill(modifier: Modifier = Modifier, compact: Boolean = false) {
 @Composable
 fun ConnectionBanner(modifier: Modifier = Modifier) {
     val model = AppModel.get(LocalContext.current)
-    if (model.current == null) return
-    P2PManager.quality.value
+    if (!connectionStripShowing(model)) return
     val q = model.connection
-    if (q.isUsable) return
+    if (model.cannotReachDirectly) { DirectOnlyNotice(model, modifier); return }
     Surface(color = Color(0xFF1B1B26), shape = RoundedCornerShape(50), modifier = modifier.padding(horizontal = 12.dp, vertical = 8.dp)) {
         Row(Modifier.padding(horizontal = 14.dp, vertical = 9.dp), verticalAlignment = Alignment.CenterVertically) {
             Box(Modifier.size(9.dp).clip(CircleShape).background(q.color))
@@ -83,6 +110,10 @@ fun ConnectionBanner(modifier: Modifier = Modifier) {
                 if (q == ConnectionQuality.Offline) {
                     Text("Their computer may be off or asleep. Skwod keeps trying.", color = Color.White.copy(alpha = 0.6f), fontSize = 11.sp)
                 }
+            }
+            if (q == ConnectionQuality.Offline) {
+                Spacer(Modifier.width(8.dp))
+                TextButton(onClick = { model.retryConnection() }) { Text("Retry", color = SkAccent, fontWeight = FontWeight.SemiBold) }
             }
         }
     }
@@ -149,7 +180,8 @@ fun PrivacySection() {
             settings.publicFallback) { v ->
             settings.publicFallback = v
             // Sessions were dialed with the old choice: drop them and dial again.
-            model.launchIO { P2PManager.disconnectAll(); model.redial() }
+            // Retire, unbind, dial, bind, release — in that order ([AppModel.redial]).
+            model.launchIO { model.redial() }
         }
     }
     SettingRow("Stay connected for notifications",

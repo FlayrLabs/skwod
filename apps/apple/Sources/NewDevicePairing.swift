@@ -34,6 +34,7 @@ final class NewDevicePairing: ObservableObject, Identifiable {
     let knownName: String?
     @Published private(set) var phase: Phase = .join { didSet { report() } }
     private var client: SkwodClient?
+    private var lease: CacheLease?
     private var localId: String?
     private var task: Task<Void, Never>?
     private var paired: PairedDevice?
@@ -117,14 +118,22 @@ final class NewDevicePairing: ObservableObject, Identifiable {
                 phase = .failed("Skwod couldn't set up its encrypted storage. Unlock the device and try again.")
                 return
             }
-            guard await StoreLock.shared.holdForApp() else {
+            let c = SkwodClient(baseUrl: base, token: "")
+            let use = c.cacheLease()
+            lease = use
+            switch await CacheOpening(lock: .shared, isCurrent: { !Task.isCancelled }, key: { keyHex }, lease: { use }, attach: {
+                self.localId = id
+                self.client = c
+                _ = try await c.attachCache(path: SharedContainer.cachePath(forWorkspace: id), keyHex: $0)
+            }).run() {
+            case .open: break
+            case .superseded: return
+            case .closed: throw PairingLeft()
+            case .busy, .noKey:
                 phase = .failed("Skwod is busy finishing a notification. Try again in a moment.")
                 return
+            case .failed(let error): throw error
             }
-            localId = id
-            let c = SkwodClient(baseUrl: base, token: "")
-            client = c
-            _ = try await c.attachCache(path: SharedContainer.cachePath(forWorkspace: id), keyHex: keyHex)
             SharedContainer.excludeCacheFromBackup(forWorkspace: id)
             // Pin the host's identity before anything is exchanged, as a log-in does.
             if let identity = try? await fetchServerIdentity(baseUrl: base) {
@@ -135,6 +144,9 @@ final class NewDevicePairing: ObservableObject, Identifiable {
             phase = .waiting
 
             while !Task.isCancelled {
+                // The app was sent away meanwhile: this client's cache was taken from it, and the
+                // code it answered can be answered only once (`pairBegin` again would burn it).
+                if use.isOver() { throw PairingLeft() }
                 if now > offer.expiresAt + 60 {
                     throw PairingExpired()
                 }
@@ -160,17 +172,25 @@ final class NewDevicePairing: ObservableObject, Identifiable {
                 }
                 try? await Task.sleep(for: .seconds(2))
             }
+        } catch is PairingLeft {
+            left()
         } catch is PairingExpired {
             phase = .failed("The code expired before it was approved. Make a new one on your other device.")
             cleanUp()
         } catch {
             guard !Task.isCancelled else { return }
+            if lease?.isOver() == true { left(); return }
             #if DEBUG
             E2E.pairingErrorDetail = String(describing: error)
             #endif
             phase = .failed(PairingCopy.failure(detail: coreErrorText(error, fallback: "Couldn't reach that Skwod. Check your connection and try again.")))
             cleanUp()
         }
+    }
+
+    private func left() {
+        phase = .failed(PairingCopy.left)
+        cleanUp()
     }
 
     /// Remove the store and key a pairing that did not finish created.
@@ -194,6 +214,8 @@ final class NewDevicePairing: ObservableObject, Identifiable {
 }
 
 private struct PairingExpired: Error {}
+/// The app left the front while pairing (the cache may not be used from there).
+private struct PairingLeft: Error {}
 
 /// The screen for [`NewDevicePairing`].
 struct NewDevicePairingSheet: View {

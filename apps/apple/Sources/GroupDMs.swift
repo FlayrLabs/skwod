@@ -454,9 +454,13 @@ struct GroupChatView: View {
     @State private var olderRows: [Message] = []
     @State private var draft = ""
     @State private var sendError: String?
+    /// The skwod this conversation belongs to: what is sent here goes through its cache, or nowhere.
+    @State private var home: String?
     @State private var uploading = false
     @State private var loadingOlder = false
     @State private var reachedStart = false
+    /// Build 51: the conversation `messages` were loaded for.
+    @State private var loadedConversation: String?
     @State private var sendStates: [String: SendState] = [:]
     @State private var reactionsByMessage: [String: [ReactionPill]] = [:]
     @State private var replyingTo: ChatMessage?
@@ -466,6 +470,7 @@ struct GroupChatView: View {
     @State private var reporting: ReportTarget?
 
     private var scope: String { "dm:\(group.conversationId)" }
+    private var draftKey: String? { home.map { Compose.directKey(workspaceId: $0, conversationId: group.conversationId) } }
     /// Who a message of this group is sealed to: the members shown on this screen.
     private var peers: [String] { group.memberUserIds }
     private func name(_ userId: String) -> String { app.contacts.display(userId, claimedName: group.claimedNames[userId]).text }
@@ -485,22 +490,24 @@ struct GroupChatView: View {
             sending: false,
             sendError: sendError,
             placeholder: "Message the group",
-            onSend: { Task { await send() } },
+            onSend: { send($0) },
+            canSend: ready,
             onLoadOlder: rows.count >= 200 || !olderRows.isEmpty ? { Task { await loadOlder() } } : nil,
             loadingOlder: loadingOlder,
             reachedStart: reachedStart,
             uploading: uploading,
-            onSendFile: { url in Task { await sendAttachment(.file(url)) } },
-            onSendMusic: { track in Task { await sendBody { try AttachmentService.musicBody(track).body } } },
-            onSendImage: { data in Task { await sendAttachment(.image(data)) } },
-            onBack: { chat.selection = nil; dismiss() },
-            onReact: { msg, emoji in Task { await toggleReaction(msg, emoji) } },
+            onSendFile: { url in sendAttachment(.file(url)) },
+            onSendMusic: { track in sendMusic(track) },
+            onSendImage: { data in sendAttachment(.image(data)) },
+            onBack: { chat.reveal.send(false); dismiss() },
+            onReact: { msg, emoji in toggleReaction(msg, emoji) },
             onReply: { msg in editing = nil; replyingTo = msg },
             onEdit: { msg in replyingTo = nil; editing = msg; draft = msg.body },
-            onDelete: { msg in Task { await deleteMessage(msg) } },
+            onDelete: { msg in deleteMessage(msg) },
             composingBanner: composingBanner,
             onCancelCompose: { if editing != nil { draft = "" }; replyingTo = nil; editing = nil },
             conversationId: group.conversationId,
+            onPullToRefresh: { await app.syncMailbox(); await reloadFromCache() },
             headerActions: {
                 AnyView(
                     Button { showPeople = true } label: {
@@ -531,8 +538,17 @@ struct GroupChatView: View {
             everyoneAllowed: { _ in false },
             mentionable: group.memberUserIds.filter { !BlockList.shared.contains($0) }
                 .map { (userId: $0, name: name($0), username: group.claimedNames[$0] ?? "") },
-            typingFrom: Set(group.memberUserIds)))
-        .task(id: group.conversationId) { await load() }
+            typingFrom: Dictionary(group.memberUserIds.map { ($0, group.claimedNames[$0] ?? "") }, uniquingKeysWith: { first, _ in first })))
+        // Build 51: keyed on the client too (`ConversationLoadKey`).
+        .task(id: ConversationLoadKey(id: group.conversationId, clientTurn: app.clientTurn)) { await load() }
+        .onAppear {
+            guard home == nil else { return }
+            home = chat.spacesWorkspaceId
+            if let draftKey { draft = chat.draft(for: draftKey) }
+        }
+        .onChange(of: draft) { _, now in if editing == nil, let draftKey { chat.keepDraft(now, for: draftKey) } }
+        .onChange(of: app.clientTurn) { _, _ in if sendError == Compose.opening { sendError = nil } }
+        .onReceive(NotificationCenter.default.publisher(for: .skwodCatchUp)) { _ in Task { await reloadFromCache() } }
         .onReceive(NotificationCenter.default.publisher(for: .skwodOutboxChanged)) { _ in Task { await reloadFromCache() } }
         .onReceive(NotificationCenter.default.publisher(for: .skwodDMChanged)) { note in
             if note.object as? String == group.conversationId { Task { await reloadFromCache() } }
@@ -547,7 +563,9 @@ struct GroupChatView: View {
     }
 
     private func load() async {
-        olderRows = []; reachedStart = false
+        // No client yet: this runs again when one is up (keyed on `clientTurn`).
+        guard app.client != nil else { return }
+        if loadedConversation != group.conversationId { olderRows = []; reachedStart = false; loadedConversation = group.conversationId }
         await reloadFromCache()
         while !Task.isCancelled {
             await Outbox.flush(app)
@@ -560,7 +578,10 @@ struct GroupChatView: View {
 
     private func reloadFromCache() async {
         guard let client = app.client else { return }
-        rows = await client.history(scope: scope)
+        let cached = await client.history(scope: scope)
+        // (A client whose cache was taken reads nothing: what is on screen stays.)
+        guard app.client === client else { return }
+        rows = cached
         let me = app.session?.userId ?? ""
         // Reactions count only from this account and the group's members (as rows do, below).
         let members = Set(group.memberUserIds)
@@ -614,56 +635,86 @@ struct GroupChatView: View {
         }
     }
 
-    private func send() async {
-        guard let client = app.client else { return }
-        let text = draft.trimmingCharacters(in: .whitespaces); guard !text.isEmpty else { return }
-        let (replyTarget, editTarget) = (replyingTo, editing)
+    /// Can something be handed over right now? Only to the cache of the skwod this conversation is
+    /// in; while that is being opened nothing is taken from the composer, and it says so.
+    private func ready() -> Bool {
+        if Outbox.client(of: home, app) == nil { sendError = Compose.opening; return false }
+        if sendError == Compose.opening { sendError = nil }
+        return true
+    }
+
+    /// Send, reply or edit. Everything about it is settled here, at the tap (`SendOrder`): what comes
+    /// after — another conversation, another skwod — changes nothing about where it goes. Nothing
+    /// waits for the network: it is queued in the core (shown at once as "Sending…").
+    private func send(_ written: String) -> Bool {
+        let (replyTarget, editTarget, key) = (replyingTo, editing, draftKey)
+        let taken = Compose.take(text: written, home: home, bound: app.bound.flatMap { $0.cacheOpen ? $0.workspaceId : nil },
+                                 place: .direct(conversationId: group.conversationId, peers: peers), replyTo: replyTarget?.id, editing: editTarget?.id)
+        guard case .send(let order) = taken, let client = Outbox.client(of: home, app) else {
+            if taken != .nothing { sendError = Compose.opening }
+            return false
+        }
         draft = ""; sendError = nil; replyingTo = nil; editing = nil
-        do {
-            if let editTarget {
-                try await client.queueDmEdit(conversationId: group.conversationId, peerUserIds: peers, messageId: editTarget.id, text: text)
-            } else {
-                _ = try await client.queueDm(conversationId: group.conversationId, peerUserIds: peers, text: text, replyToId: replyTarget?.id, uploadIds: [])
+        Task {
+            do {
+                try await Outbox.queue(order, through: client)
+                Outbox.kick(app, composed: true)
+            } catch {
+                // Could not even be queued (too long, the outbox is full, the cache was just taken):
+                // the text goes back to this conversation's composer.
+                draft = Compose.givenBack(order.text, to: draft)
+                replyingTo = replyTarget; editing = editTarget
+                if editTarget == nil, let key { chat.keepDraft(Compose.givenBack(order.text, to: chat.draft(for: key)), for: key) }
+                sendError = sendFailureText(error)
             }
-            Outbox.kick(app, composed: true)
-        } catch {
-            draft = draft.isEmpty ? text : "\(text)\n\(draft)"
-            replyingTo = replyTarget; editing = editTarget
-            sendError = sendFailureText(error)
+        }
+        return true
+    }
+
+    private func sendMusic(_ track: MusicTrack) {
+        guard ready(), let client = Outbox.client(of: home, app), let home else { return }
+        let order: SendOrder
+        do { order = SendOrder(workspaceId: home, place: .direct(conversationId: group.conversationId, peers: peers), text: try AttachmentService.musicBody(track).body) }
+        catch { sendError = sendFailureText(error); return }
+        Task {
+            do {
+                try await Outbox.queue(order, through: client)
+                Outbox.kick(app, composed: true)
+            } catch { sendError = sendFailureText(error) }
         }
     }
 
-    private func sendBody(_ make: () throws -> String) async {
-        guard let client = app.client else { sendError = "Not connected — try again in a moment."; return }
-        do {
-            _ = try await client.queueDm(conversationId: group.conversationId, peerUserIds: peers, text: try make(), replyToId: nil, uploadIds: [])
-            Outbox.kick(app, composed: true)
-        } catch { sendError = sendFailureText(error) }
-    }
-
-    private func sendAttachment(_ source: StreamedUpload.Source) async {
+    /// A file or photo: encrypted file-to-file, queued, uploaded in resumable chunks by the outbox
+    /// (`StreamedUpload`). In a channel the server links the blob to the message when the queued send
+    /// goes out, which is what lets members download it.
+    private func sendAttachment(_ source: StreamedUpload.Source) {
+        guard ready(), let client = Outbox.client(of: home, app), let home else { return }
+        let target = StreamedUpload.Target.dm(conversationId: group.conversationId, peers: peers)
         uploading = true; sendError = nil
-        defer { uploading = false }
-        do {
-            try await StreamedUpload.queue(source, to: .dm(conversationId: group.conversationId, peers: peers), app: app)
-        } catch { sendError = sendFailureText(error) }
+        Task {
+            do { try await StreamedUpload.queue(source, to: target, through: client, workspace: home, app: app) }
+            catch { sendError = sendFailureText(error) }
+            uploading = false
+        }
     }
 
-    private func toggleReaction(_ msg: ChatMessage, _ emoji: String) async {
-        guard let client = app.client else { return }
+    private func toggleReaction(_ msg: ChatMessage, _ emoji: String) {
+        guard ready(), let client = Outbox.client(of: home, app) else { return }
         let mineAlready = msg.reactionPills.first(where: { $0.emoji == emoji })?.mine ?? false
-        do {
-            try await client.queueDmReaction(conversationId: group.conversationId, peerUserIds: peers, messageId: msg.id, emoji: emoji, remove: mineAlready)
+        let (conversationId, peers) = (group.conversationId, peers)
+        Task { do {
+            try await client.queueDmReaction(conversationId: conversationId, peerUserIds: peers, messageId: msg.id, emoji: emoji, remove: mineAlready)
             Outbox.kick(app)
-        } catch { sendError = sendFailureText(error) }
+        } catch { sendError = sendFailureText(error) } }
     }
 
-    private func deleteMessage(_ msg: ChatMessage) async {
-        guard let client = app.client else { return }
-        do {
-            try await client.queueDmDelete(conversationId: group.conversationId, peerUserIds: peers, messageId: msg.id)
+    private func deleteMessage(_ msg: ChatMessage) {
+        guard ready(), let client = Outbox.client(of: home, app) else { return }
+        let (conversationId, peers) = (group.conversationId, peers)
+        Task { do {
+            try await client.queueDmDelete(conversationId: conversationId, peerUserIds: peers, messageId: msg.id)
             Outbox.kick(app)
-        } catch { sendError = sendFailureText(error) }
+        } catch { sendError = sendFailureText(error) } }
     }
 }
 

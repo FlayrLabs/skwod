@@ -361,8 +361,34 @@ address, same invites, same members; nobody has to be invited again.
   not include attachments.
 - **A copy before every schema change**: when an update is about to migrate the database, the
   database as it was is kept first, as `snapshots/pre-migrate-v<N>-<date>.db` (newest three). If
-  that copy cannot be taken (disk full), the server says so and does not start, rather than
-  migrate without a way back.
+  that copy cannot be taken (disk full), the server says so and does not start. It is a safety
+  copy for repairing a database, not a way to go back to an older version (see below).
+
+**Before every update, make a real backup** (`skwod backup`, below). Once an update has changed
+the database, an older server, or an older image you pinned, refuses to start on it: it says the
+data "was written by a NEWER version of Skwod than this one" and changes nothing. Start the newer
+one again.
+
+- **If you have to go back (SQLite):** stop the server, then run
+  `skwod restore --in <the backup from before the update> --data <data> --replace` **with the older
+  version** (in Docker, the older image by its digest), and start that version. The current folder
+  is set aside as `<data>.replaced-<time>`. What happened since the backup is gone and everyone
+  signs in again. In Docker, mount the folder that **contains** the data folder: the mounted folder
+  itself cannot be set aside (the command is in [UNRAID.md](UNRAID.md#updating)).
+- **Do not copy a file from `snapshots/`, or an old copy of the data folder, over the current one.**
+  A plain copy brings back sessions and devices that were ended or removed since, makes one-time
+  prekeys that were already handed out available again, and forgets sessions issued since, so those
+  people are signed out. `skwod restore` deals with all of that (it ends every session, drops the
+  one-time prekeys and reports what came back).
+- **With Postgres** `skwod backup` and `skwod restore` do not cover the database. Before updating,
+  stop the server and take a `pg_dump` together with a copy of the data folder (attachments and
+  keys). Plan to go **forward**: if the new version gives trouble, start it again or update to the
+  next one. A dump put back is a plain copy, with everything above: sessions that were ended and
+  devices that were removed since work again, and one-time prekeys that were already served are
+  served again. There is no tool yet that cleans that up for Postgres, so use a dump only when the
+  database itself is lost. Then tell everyone to change their password and to check their devices
+  (the **Devices** sheet in the app) and remove the ones that should be gone, and remove and ban again whoever
+  should stay out.
 
 Files in `snapshots/` (and everything a backup or restore writes) are readable by the server's
 user only (`0600`, directories `0700`).
@@ -400,7 +426,8 @@ skwod move-data --from <data> --to <new place>    # same skwod, new folder (serv
 - `restore --verify-only` streams the archive and writes nothing but a temporary copy of the
   database (to check it), which it removes.
 - Not covered: a Postgres database (`--database-url`). Back that up with `pg_dump`; the data
-  folder still holds the attachments and keys.
+  folder still holds the attachments and keys. What putting a dump back does: see *With Postgres*
+  above.
 
 **Mac app** — Start server → Options → **Backup**: *Export…* writes that same file (and includes
 this Mac's saved host login, so the new Mac can sign you in); *Import…* on another Mac restores
@@ -421,7 +448,7 @@ docker exec -e SKWOD_BACKUP_PASSPHRASE='…' skwod skwod restore --in /backup/sk
 # Restore onto a new box: with the container STOPPED, into an EMPTY appdata folder
 docker run --rm -e SKWOD_BACKUP_PASSPHRASE='…' \
   -v /mnt/user/appdata/skwod:/data -v /mnt/user/backups/skwod:/backup \
-  ghcr.io/flayrlabs/skwod-server:latest skwod restore --in /backup/skwod-2026-11-19.skwodbackup --data /data/restored
+  ghcr.io/flayrlabs/skwod-server@sha256:<the digest you run> skwod restore --in /backup/skwod-2026-11-19.skwodbackup --data /data/restored
 # …then move the contents of /mnt/user/appdata/skwod/restored up one level and start the container.
 ```
 

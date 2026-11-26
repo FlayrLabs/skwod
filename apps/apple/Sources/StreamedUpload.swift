@@ -84,11 +84,11 @@ enum StreamedUpload {
 
     /// Encrypt `source` to a file, build its descriptor and queue the message. Returns once
     /// the message is queued (it shows at once as "Sending…" with upload progress).
+    /// `client` has the cache of `workspace` open: both were taken when the user sent it, and
+    /// everything after goes through them alone.
     @MainActor
-    static func queue(_ source: Source, to target: Target, app: AppState) async throws {
-        guard let client = app.client else { throw AttachmentError.notSignedIn }
+    static func queue(_ source: Source, to target: Target, through client: SkwodClient, workspace: String, app: AppState) async throws {
         let forDm: Bool = { if case .dm = target { return true } else { return false } }()
-        guard let workspace = app.current?.id else { throw AttachmentError.notSignedIn }
         // The host's per-file limit, as fresh as a minute: checked before anything is encrypted.
         await UploadLimitSync.refresh(app)
         let staged = try await stage(source, in: stagingDirectory(forWorkspace: workspace))

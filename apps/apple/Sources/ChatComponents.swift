@@ -23,7 +23,11 @@ struct ChatSurface: View {
     /// Why the last send failed, in a sentence for the user (nil = it didn't).
     var sendError: String?
     var placeholder: String
-    var onSend: () -> Void
+    /// The text goes out (true), or stays in the composer (false).
+    var onSend: (String) -> Bool
+    /// Asked before anything is taken from the composer: can it be handed over right now? (It says so
+    /// if not.)
+    var canSend: () -> Bool = { true }
     /// "Load older": shown at the top of the list while there is more history to page in.
     var onLoadOlder: (() -> Void)? = nil
     var loadingOlder: Bool = false
@@ -54,6 +58,12 @@ struct ChatSurface: View {
     var conversationId: String = ""
     /// "● N online" beside the title (nil hides it — DMs, previews).
     var onlineCount: Int? = nil
+    /// Build 51: how the last catch-up of this conversation went ("Reconnecting…", or
+    /// "Couldn't load new messages · Retry" once the retries ran out) — never a silent stale list.
+    var syncStatus: FetchRetryRule.Status = .ok
+    var onRetrySync: (() -> Void)? = nil
+    /// Build 51: pull-to-refresh on iPhone (nil: none).
+    var onPullToRefresh: (() async -> Void)? = nil
     /// Optional trailing header actions (e.g. invite, verify).
     @ViewBuilder var headerActions: () -> AnyView
     /// Pasted / dropped files and images waiting to go with the next send.
@@ -78,6 +88,15 @@ struct ChatSurface: View {
     @State private var barDismissed = false
     /// The newest row the reader had in view at the bottom (the jump pill counts what came after).
     @State private var lastSeenId: String?
+    /// The user just sent something: the list goes to the bottom when it shows up.
+    @State private var justSent = false
+    /// The read marker and the moment this conversation was opened (`UnreadRule.atOpen`).
+    @State private var markerAtOpen: ReadMarker?
+    @State private var openedAt: Int64 = 0
+    /// The list is animating down to the newest row on its own (not the reader scrolling).
+    @State private var followingDown = false
+    /// Build 51: where the list is; `scrollTo(edge: .bottom)` reaches the true end.
+    @State private var scrollPosition = ScrollPosition(edge: .bottom)
     @Environment(ReadMarkerStore.self) private var reads: ReadMarkerStore?
     @Environment(\.chatOnScreen) private var onScreen
     @Environment(\.scenePhase) private var scenePhase
@@ -121,7 +140,7 @@ struct ChatSurface: View {
         }
         .onDisappear { typing?.stoppedTyping() }
         // Only this conversation's people show as typing in it.
-        .onChange(of: TypingAudience(conversationId: conversationId, members: surfaceExtras.typingFrom), initial: true) { _, audience in
+        .onChange(of: TypingAudience(conversationId: conversationId, names: surfaceExtras.typingFrom), initial: true) { _, audience in
             typing?.setAudience(audience)
         }
         // Drop files or images (a Finder drag, the screenshot thumbnail, a picture from another
@@ -159,7 +178,7 @@ struct ChatSurface: View {
                 ComposeBanner(text: banner.text, isEdit: banner.isEdit, onCancel: { onCancelCompose?() })
             }
             ChatComposer(draft: $draft, sending: sending, sendError: intakeError ?? sendError,
-                         placeholder: placeholder, onSend: sendWithMentions,
+                         placeholder: placeholder, onSend: sendWithMentions, canSend: canSend,
                          uploading: uploading, onSendFile: onSendFile, onSendMusic: onSendMusic,
                          onSendImage: onSendImage, staged: $staged,
                          mentionKey: mentionKey,
@@ -202,10 +221,14 @@ struct ChatSurface: View {
         typing?.stoppedTyping()
         let names = Dictionary(surfaceExtras.mentionable.map { ($0.userId, MentionAutocomplete.tokenSource(name: $0.name, username: $0.username)) }, uniquingKeysWith: { a, _ in a })
         let payload = MentionAutocomplete.reconcile(mentionPayload, draft: draft, names: names)
-        if !payload.isEmpty { draft = MentionCodec.encode(draft, payload) }
+        // (Nothing is taken from the composer unless it goes out.)
+        guard onSend(payload.isEmpty ? draft : MentionCodec.encode(draft, payload)) else { return }
         mentionPayload = MentionPayload()
-        onSend()
+        // Sending always goes to the bottom (now, and again when the message shows up).
+        justSent = true
+        scrollToBottomRequest &+= 1
     }
+    @State private var scrollToBottomRequest = 0
 
     /// Add what came in to the waiting list, or say why it couldn't be.
     private func take(_ results: [Result<StagedAttachment, ComposerIntake.Problem>], startedFor: String) {
@@ -253,7 +276,13 @@ struct ChatSurface: View {
                 .padding(.vertical, 16)
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
+            // Build 51: a conversation opens at its newest message, at the bottom.
+            .defaultScrollAnchor(.bottom, for: .initialOffset)
+            .scrollPosition($scrollPosition)
             .confirmingLinks()
+            #if os(iOS)
+            .modifier(PullToRefresh(action: onPullToRefresh))
+            #endif
             #if os(iOS)
             // The keyboard goes away the usual ways: drag the list down, or tap the list. The tap
             // is simultaneous, so links, pictures, reactions and the long press still get theirs.
@@ -264,36 +293,57 @@ struct ChatSurface: View {
             #endif
             // Is the reader at the newest message? (Within a short distance of the end, with the
             // composer inset counted: the list ends where the composer starts.)
-            .onScrollGeometryChange(for: Bool.self) { geo in
-                let end = geo.contentSize.height + geo.contentInsets.bottom - geo.containerSize.height
-                return geo.contentOffset.y >= end - 60
-            } action: { _, now in
-                atBottom = now
+            // Build 51: only the reader leaves the bottom. Rows arriving, the window or the safe
+            // area changing (back from the background) move the END, not the offset — the reader
+            // is still "at the bottom" then, and the next arrival follows them down
+            // (`ChatScrollRule.stillAtBottom`).
+            .onScrollGeometryChange(for: ScrollEdge.self) { geo in
+                ScrollEdge(offset: geo.contentOffset.y,
+                           end: geo.contentSize.height + geo.contentInsets.bottom - geo.containerSize.height)
+            } action: { old, new in
+                // Our own scroll down to the newest row is under way: it ends at the bottom.
+                if followingDown {
+                    if new.offset >= new.end - 60 { followingDown = false }
+                    atBottom = true
+                    return
+                }
+                atBottom = ChatScrollRule.stillAtBottom(was: atBottom, offsetMoved: abs(new.offset - old.offset) > 1,
+                                                        nowAtEnd: new.offset >= new.end - 60)
                 noteReadIfAtBottom()
+                reportVisible()
             }
             // While the bar is up, the list's content starts below it: the "NEW" divider (and
             // the first unread row) are never under the bar.
             .contentMargins(.top, barState == nil ? 0 : 56, for: .scrollContent)
             // The bar above the list ("N new messages since …") and the jump pill below it.
             .overlay(alignment: .top) {
-                if let bar = barState {
-                    NewMessagesBar(text: bar, onJump: {
-                        if let id = unreadAtOpen?.firstId { withAnimation { proxy.scrollTo(id, anchor: UnitPoint(x: 0.5, y: 0.14)) } }
-                    }, onMarkRead: markAllRead)
-                    .padding(.horizontal, 12).padding(.top, 8)
-                    .transition(.move(edge: .top).combined(with: .opacity))
+                VStack(spacing: 6) {
+                    if let bar = barState {
+                        NewMessagesBar(text: bar, onJump: {
+                            // Up to where the new messages began (the list opened at the newest).
+                            if let id = unreadAtOpen?.firstId { withAnimation { proxy.scrollTo(id, anchor: UnitPoint(x: 0.5, y: 0.14)) } }
+                            barDismissed = true
+                        }, onMarkRead: markAllRead)
+                        .transition(.move(edge: .top).combined(with: .opacity))
+                    }
+                    if syncStatus != .ok {
+                        SyncStatusChip(status: syncStatus, onRetry: onRetrySync)
+                            .transition(.opacity)
+                    }
                 }
+                .padding(.horizontal, 12).padding(.top, 8)
             }
             .overlay(alignment: .bottomTrailing) {
                 if newBelow > 0 {
                     JumpToNewPill(count: newBelow) {
-                        if let last = messages.last { withAnimation { proxy.scrollTo(last.id, anchor: .bottom) } }
+                        if !messages.isEmpty { followDown(); withAnimation { scrollPosition.scrollTo(edge: .bottom) } }
                     }
                     .padding(.trailing, 14).padding(.bottom, 10)
                     .transition(.scale.combined(with: .opacity))
                 }
             }
             .animation(.snappy(duration: 0.2), value: barState)
+            .animation(.snappy(duration: 0.2), value: syncStatus)
             .animation(.snappy(duration: 0.2), value: newBelow)
             // A conversation opens at its first unread message (or its newest) — once per
             // conversation, when its messages and its read marker are there (both arrive after the
@@ -312,11 +362,26 @@ struct ChatSurface: View {
             // are reading further up (the pill says what came in below instead).
             .onChange(of: messages.last?.id) { _, _ in
                 guard positionedFor == conversationId, let last = messages.last else { positionIfNeeded(proxy); return }
-                if atBottom || last.mine {
-                    withAnimation { proxy.scrollTo(last.id, anchor: .bottom) }
+                refreshUnreadAtOpen()
+                switch ChatScrollRule.onArrival(atBottom: atBottom, newestIsMine: last.mine, justSent: justSent,
+                                                newFromOthers: UnreadRule.newBelow(unreadItems, lastSeenId: lastSeenId)) {
+                case .follow:
+                    justSent = false
+                    followDown()
+                    withAnimation { scrollPosition.scrollTo(edge: .bottom) }
                     lastSeenId = last.id
+                    atBottom = true
                     noteReadIfAtBottom()
+                case .pill, .nothing:
+                    break   // reading history: the "↓ N new" pill says what came in
                 }
+                reportVisible()
+            }
+            .onChange(of: messages.count) { _, _ in refreshUnreadAtOpen(); reportVisible() }
+            .onChange(of: scrollToBottomRequest) { _, _ in
+                guard let last = messages.last else { return }
+                followDown()
+                withAnimation { scrollPosition.scrollTo(edge: .bottom) }
             }
             // Back in front of the reader (the drawer slid to the chat, the app came back): what is
             // on screen at the bottom counts as read now.
@@ -324,7 +389,7 @@ struct ChatSurface: View {
             // conversation (the next look opens it afresh, at what is unread by then).
             .onChange(of: onScreen) { _, now in
                 if now { positionIfNeeded(proxy); noteReadIfAtBottom() }
-                else { positionedFor = nil; unreadAtOpen = nil; barDismissed = false }
+                else { positionedFor = nil; unreadAtOpen = nil; barDismissed = false; markerAtOpen = nil }
             }
             .onChange(of: scenePhase) { _, _ in noteReadIfAtBottom() }
             #if os(iOS)
@@ -332,7 +397,8 @@ struct ChatSurface: View {
             // keep it in view, right above the composer.
             .onChange(of: KeyboardFrame.shared.frame) { _, _ in
                 guard atBottom, let last = messages.last else { return }
-                DispatchQueue.main.async { withAnimation(KeyboardFrame.shared.animation) { proxy.scrollTo(last.id, anchor: .bottom) } }
+                _ = last
+                DispatchQueue.main.async { withAnimation(KeyboardFrame.shared.animation) { scrollPosition.scrollTo(edge: .bottom) } }
             }
             #endif
         }
@@ -346,26 +412,36 @@ struct ChatSurface: View {
         guard positionedFor != conversationId, onScreen, let last = messages.last,
               reads?.isLoaded(conversationId) ?? true else { return }
         positionedFor = conversationId
-        let items = unreadItems
-        let marker = reads?.marker(conversationId)
-        if let first = UnreadRule.firstUnreadIndex(items, marker: marker) {
-            unreadAtOpen = UnreadAtOpen(firstId: items[first].id,
-                                        count: UnreadRule.unreadCount(items, marker: marker),
-                                        since: Date(timeIntervalSince1970: Double(items[first].createdAt) / 1000))
-        } else {
-            unreadAtOpen = nil
-        }
-        let target = unreadAtOpen?.firstId ?? last.id
-        // The first unread a little below the top: the "New" divider above it stays clear of the bar.
-        let anchor: UnitPoint = unreadAtOpen == nil ? .bottom : UnitPoint(x: 0.5, y: 0.14)
+        markerAtOpen = reads?.marker(conversationId)
+        openedAt = Int64(Date().timeIntervalSince1970 * 1000)
+        unreadAtOpen = nil
+        refreshUnreadAtOpen()
+        // Build 51: always at the newest message (`ChatScrollRule`); the bar jumps up to the
+        // first unread, and the "New" divider marks it.
         // Arrivals after this moment are what the jump pill counts (the bar covers the rest).
         lastSeenId = last.id
+        atBottom = true
         // After this layout pass: the lazy rows must exist before the list can scroll to one.
         DispatchQueue.main.async {
-            proxy.scrollTo(target, anchor: anchor)
-            if unreadAtOpen == nil { atBottom = true }
+            // The END of the content, not a row: a lazy stack only estimates the heights of rows
+            // it has not laid out, and scrolling to the last row's id could stop short of it.
+            followDown()
+            scrollPosition.scrollTo(edge: .bottom)
+            atBottom = true
             noteReadIfAtBottom()
+            reportVisible()
         }
+    }
+
+    /// What was unread at open, again: rows a catch-up brought in that were written before the
+    /// conversation opened join the bar and the divider (it only grows; used or dismissed, it stays down).
+    private func refreshUnreadAtOpen() {
+        guard positionedFor == conversationId, !barDismissed else { return }
+        let items = unreadItems
+        guard let open = UnreadRule.atOpen(items, markerAtOpen: markerAtOpen, openedAt: openedAt),
+              open.count > (unreadAtOpen?.count ?? 0) else { return }
+        unreadAtOpen = UnreadAtOpen(firstId: items[open.first].id, count: open.count,
+                                    since: Date(timeIntervalSince1970: Double(items[open.first].createdAt) / 1000))
     }
 
     /// At the newest message, in front of the reader, in an active app: read up to it.
@@ -381,11 +457,32 @@ struct ChatSurface: View {
         if let last = messages.last { reads?.markRead(conversationId, upTo: last.unreadItem) }
     }
 
-    /// The bar's text while what was unread at open still is (nil hides the bar).
+    /// The bar's text while what was unread at open is still worth jumping to (nil hides it).
+    /// Opening at the newest message reads it all, so the bar stands on what was unread AT
+    /// OPEN until it is used, dismissed, or the conversation is left.
     private var barState: String? {
-        guard let open = unreadAtOpen, !barDismissed,
-              UnreadRule.unreadCount(unreadItems, marker: reads?.marker(conversationId)) > 0 else { return nil }
+        guard let open = unreadAtOpen, !barDismissed else { return nil }
         return UnreadRule.barText(count: open.count, since: open.since)
+    }
+
+    /// Our own animated scroll to the newest row: it counts as "at the bottom" while it runs
+    /// (at most a second — never longer than the animation could take).
+    private func followDown() {
+        followingDown = true
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(1))
+            followingDown = false
+        }
+    }
+
+    /// DEBUG: what this surface shows, for the end-to-end checks (`E2E.visibleChat`).
+    private func reportVisible() {
+        #if DEBUG
+        guard onScreen else { return }
+        E2E.visibleChat = ["conversation": conversationId, "count": messages.count,
+                           "last": String((messages.last?.body ?? "").prefix(80)), "at_bottom": atBottom,
+                           "bar": barState ?? "", "status": "\(syncStatus)", "at": Int(Date().timeIntervalSince1970)]
+        #endif
     }
 
     /// New messages from others below the reader while they are scrolled up.
@@ -567,7 +664,7 @@ private struct MessageRow: View {
                             .font(.system(size: 15, weight: .semibold)).foregroundStyle(.white)
                         // The plain name above; its trust as a small badge (build 49).
                         if !message.mine, let id = message.authorId, let badge = extras.authorBadge?(id), badge != .none {
-                            TrustBadge(badge: badge, compact: true)
+                            TrustBadgeButton(userId: id, name: message.author, badge: badge)
                         }
                         Text(fullTime).font(.system(size: 11)).foregroundStyle(.white.opacity(0.4))
                     }
@@ -794,6 +891,7 @@ private struct ChatComposer: View {
     let sendError: String?
     let placeholder: String
     let onSend: () -> Void
+    var canSend: () -> Bool = { true }
     var uploading: Bool = false
     var onSendFile: ((URL) -> Void)? = nil
     var onSendMusic: ((MusicTrack) -> Void)? = nil
@@ -952,7 +1050,7 @@ private struct ChatComposer: View {
 
     /// Text (if any) goes as before; each waiting attachment goes exactly as "Attach" sends it.
     private func send() {
-        guard !sending, hasText || !staged.isEmpty else { return }
+        guard !sending, hasText || !staged.isEmpty, canSend() else { return }
         if hasText { onSend() }
         let items = staged
         staged = []
@@ -1028,7 +1126,7 @@ struct ChatSurfacePreview: View {
             sending: false,
             sendError: nil,
             placeholder: "Message #general",
-            onSend: {},
+            onSend: { _ in true },
             headerActions: { AnyView(Image(systemName: "person.badge.plus").foregroundStyle(.white.opacity(0.7))) }
         )
         #if os(macOS)
@@ -1154,6 +1252,51 @@ struct UnreadAtOpen: Equatable {
 }
 
 /// The line above the first message that was new when the conversation opened.
+/// Build 51: "Reconnecting…" while a failed catch-up is being retried, "Couldn't load new
+/// messages · Retry" once the retries ran out. Small, above the list; never covers a message row
+/// for long and never replaces the list.
+/// Where the list is scrolled to, and where its end is (`onScrollGeometryChange`).
+private struct ScrollEdge: Equatable {
+    let offset: CGFloat
+    let end: CGFloat
+}
+
+private struct SyncStatusChip: View {
+    let status: FetchRetryRule.Status
+    let onRetry: (() -> Void)?
+
+    var body: some View {
+        HStack(spacing: 8) {
+            if status == .retrying {
+                ProgressView().controlSize(.mini)
+                Text("Reconnecting…")
+            } else {
+                Image(systemName: "exclamationmark.triangle.fill").foregroundStyle(.orange)
+                Text("Couldn't load new messages")
+                if let onRetry {
+                    Button("Retry", action: onRetry).buttonStyle(.plain).foregroundStyle(Color.skAccent)
+                        .fontWeight(.semibold).accessibilityIdentifier("chat.retry")
+                }
+            }
+        }
+        .font(.caption)
+        .foregroundStyle(.white.opacity(0.85))
+        .padding(.horizontal, 12).padding(.vertical, 6)
+        .background(.ultraThinMaterial, in: Capsule())
+        .accessibilityIdentifier("chat.syncStatus")
+    }
+}
+
+#if os(iOS)
+/// Pull-to-refresh, only where the screen gave an action.
+private struct PullToRefresh: ViewModifier {
+    let action: (() async -> Void)?
+    func body(content: Content) -> some View {
+        if let action { content.refreshable { await action() } } else { content }
+    }
+}
+#endif
+
 private struct NewMessagesDivider: View {
     var body: some View {
         HStack(spacing: 8) {

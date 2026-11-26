@@ -16,6 +16,8 @@ local.properties
 
 # Apple app build artifacts
 apps/apple/Generated/
+# The pinned LiveKit Swift SDK with livekit-swift.patch on it (fetch-livekit-swift.sh).
+apps/apple/Vendor/
 apps/apple/Skwod.xcodeproj/
 apps/apple/build/
 apps/apple/Resources/host-tools/

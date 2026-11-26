@@ -72,6 +72,14 @@ final class PushManager: NSObject, ObservableObject {
                 Task { @MainActor in UIApplication.shared.registerForRemoteNotifications() }
             }
         }
+        startVoIP()
+    }
+
+    /// Calls: at EVERY launch, and first of all (`didFinishLaunching`) — a VoIP push can be what
+    /// started the process, with no skwod reached and no view up, and the system ends an app that
+    /// has nobody to hand it to. Asks for nothing and sends nothing.
+    func startVoIP() {
+        guard Self.enabled else { return }
         if voipRegistry == nil {
             // Created on the main queue so the delegate callbacks arrive there.
             let registry = PKPushRegistry(queue: .main)
@@ -230,7 +238,8 @@ final class PushManager: NSObject, ObservableObject {
         if let bearer { req.setValue("Bearer \(bearer)", forHTTPHeaderField: "Authorization") }
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = try? JSONSerialization.data(withJSONObject: body)
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+        // (`RawSink`, checked as it is sent: never to a retired or suspect front.)
+        guard let (data, resp) = try? await RawSink.data(for: req),
               let code = (resp as? HTTPURLResponse)?.statusCode else { return (nil, nil) }
         return (code, (try? JSONSerialization.jsonObject(with: data)) as? [String: Any])
     }
@@ -492,7 +501,9 @@ final class PushManager: NSObject, ObservableObject {
         if let old = replaced.removeValue(forKey: w.id) { tokens.append(old) }
         let live = (base?.isEmpty == false) ? base : nil
         let root = live ?? ((!w.isP2P && w.server.hasPrefix("https://")) ? w.server : nil)
-        let token = w.token
+        // A p2p skwod is told over its member connection, before the session ends
+        // (`AppState.endSession`): nothing with the session goes through the loopback port.
+        let token = (root.map { isFrontBase(baseUrl: $0) || isFrontSuspect(baseUrl: $0) } ?? false) ? "" : w.token
         Task {
             if !token.isEmpty, let root, let url = URL(string: root)?.appendingPathComponent("api/push/unregister") {
                 _ = await Self.post(url, body: [:], bearer: token)
@@ -615,6 +626,8 @@ final class CallManager: NSObject, CXProviderDelegate {
     /// Which room `current` is for, once a `ring` event has said so.
     private var ring: IncomingCall?
     private var answered = false
+    /// A call this app answered is up.
+    var isAnswered: Bool { current != nil && answered }
     private var timeout: DispatchWorkItem?
     private var roomWait: Task<Void, Never>?
 
@@ -781,6 +794,7 @@ final class CallManager: NSObject, CXProviderDelegate {
         current = nil
         ring = nil
         answered = false
+        DispatchQueue.main.async { MainActor.assumeIsolated { CallCoordinator.shared.app?.store.callMayHaveEnded() } }
         // Whatever happened, calls started from inside the app must be able to use audio.
         try? AudioManager.shared.setEngineAvailability(.default)
     }
@@ -790,18 +804,26 @@ final class CallManager: NSObject, CXProviderDelegate {
     /// nothing is, fail the call rather than open some room.
     private func openAnsweredCall() {
         roomWait?.cancel()
+        // The client (the app may have been launched by the push; and behind the front it is put up
+        // only now that the call was answered).
+        let connected: @MainActor () async -> Void = {
+            for _ in 0..<80 {
+                if Task.isCancelled { return }
+                if let app = CallCoordinator.shared.app, !app.serverURL.isEmpty, app.clientIsOnline { return }
+                try? await Task.sleep(for: .milliseconds(250))
+            }
+        }
         if let ring {
             note("openedServer", ring.serverId)
-            Task { @MainActor in CallCoordinator.shared.open(serverId: ring.serverId) }
+            roomWait = Task { @MainActor in
+                await connected()
+                if !Task.isCancelled { CallCoordinator.shared.open(serverId: ring.serverId) }
+            }
             return
         }
         roomWait = Task { @MainActor [weak self] in
-            // 1. the connection (the app may have been launched by the push)
-            for _ in 0..<80 {
-                if Task.isCancelled { return }
-                if let app = CallCoordinator.shared.app, !app.serverURL.isEmpty, app.client != nil { break }
-                try? await Task.sleep(for: .milliseconds(250))
-            }
+            // 1. the connection
+            await connected()
             // 2. a `ring` event that names the room (`ringArrived` then opens it and cancels us)
             for _ in 0..<16 {
                 if Task.isCancelled { return }
@@ -863,6 +885,8 @@ final class CallManager: NSObject, CXProviderDelegate {
         guard action.callUUID == current else { action.fail(); return }
         timeout?.cancel()
         answered = true
+        // (CallKit's delegate queue is the main one.)
+        MainActor.assumeIsolated { CallCoordinator.shared.app?.callAnswered() }
         note("answered", true)
         // CallKit owns the audio session for this call: hold the audio engine until the system
         // has activated the session (`didActivate`), with a short safety net in case it never says.
@@ -888,10 +912,15 @@ final class CallManager: NSObject, CXProviderDelegate {
 
     func provider(_ provider: CXProvider, didActivate audioSession: AVAudioSession) {
         note("audioActivated", true)
+        audioLive = true
         try? AudioManager.shared.setEngineAvailability(.default)
     }
 
+    /// The system has the call's audio session active right now.
+    private(set) var audioLive = false
+
     func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
+        audioLive = false
         try? AudioManager.shared.setEngineAvailability(.default)
     }
 }
@@ -899,6 +928,12 @@ final class CallManager: NSObject, CXProviderDelegate {
 /// UIKit app delegate bridged into SwiftUI, purely to receive the APNs token (SwiftUI has no
 /// first-class hook for it).
 final class PushAppDelegate: NSObject, UIApplicationDelegate {
+    func application(_ application: UIApplication,
+                     didFinishLaunchingWithOptions launchOptions: [UIApplication.LaunchOptionsKey: Any]? = nil) -> Bool {
+        PushManager.shared.startVoIP()
+        return true
+    }
+
     func application(_ application: UIApplication,
                      didRegisterForRemoteNotificationsWithDeviceToken deviceToken: Data) {
         Task { @MainActor in PushManager.shared.setToken(deviceToken) }

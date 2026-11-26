@@ -14,13 +14,15 @@ type Fut<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send>>;
 /// fake TCP + UDP service on loopback.
 struct FakeBackend {
     host_id: [u8; 32],
-    livekit: Option<LiveKitTarget>,
+    livekit: Target,
     /// Flipped to simulate logout / session expiry / ban of the "good-token" holder.
     revoked: Arc<std::sync::atomic::AtomicBool>,
     /// Set to simulate being kicked/banned from the space that owns ONE room.
     kicked_from_room: Arc<std::sync::Mutex<Option<String>>>,
 }
 
+/// Where LiveKit is NOW (a test moves it: LiveKit restarted on other ports).
+type Target = Arc<std::sync::Mutex<Option<LiveKitTarget>>>;
 type Kicked = Arc<std::sync::Mutex<Option<String>>>;
 
 /// A LiveKit-shaped access token (unsigned — the fake LiveKit doesn't verify).
@@ -68,7 +70,7 @@ impl HostBackend for FakeBackend {
         Duration::from_millis(100)
     }
     fn livekit(&self) -> Fut<Option<LiveKitTarget>> {
-        let t = self.livekit;
+        let t = *self.livekit.lock().unwrap();
         Box::pin(async move { t })
     }
 }
@@ -89,7 +91,7 @@ async fn world_revocable(livekit: Option<LiveKitTarget>) -> (Host, Arc<Member>, 
     let key = SecretKey::generate();
     let revoked = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let kicked: Kicked = Arc::default();
-    let backend = Arc::new(FakeBackend { host_id: *key.public().as_bytes(), livekit, revoked: revoked.clone(), kicked_from_room: kicked.clone() });
+    let backend = Arc::new(FakeBackend { host_id: *key.public().as_bytes(), livekit: Arc::new(std::sync::Mutex::new(livekit)), revoked: revoked.clone(), kicked_from_room: kicked.clone() });
     let host = Host::start(&local_only(NetConfig::host(key.clone())), backend).await.unwrap();
     let member = Member::connect(&local_only(NetConfig::member()), host.loopback_addr()).await.unwrap();
     (host, member, key, revoked, kicked)
@@ -124,7 +126,9 @@ async fn proxy_requires_the_secret_and_strips_it() {
 
     // Another local process that only knows the port gets nothing.
     for path in ["/api/thing", "/", &format!("/{}/api/thing", "0".repeat(32)), &format!("/{secret}x/api")] {
-        assert!(http_get(proxy.port(), path).await.starts_with("HTTP/1.1 404"), "{path}");
+        let out = http_get(proxy.port(), path).await;
+        assert!(out.is_empty() || out.starts_with("HTTP/1.1 404"), "{path}: {out}");
+        assert!(!out.contains("200"), "{path}");
     }
     // LiveKit route without a voice session → refused upstream.
     assert!(http_get(proxy.port(), &format!("/{secret}/lk/rtc")).await.starts_with("HTTP/1.1 502"));
@@ -523,4 +527,164 @@ async fn revocation_stops_inbound_media_and_ends_the_reader_tasks() {
     tokio::time::sleep(Duration::from_millis(500)).await;
     assert_eq!(skwod_net::voice::active_host_readers(media), 0, "readers stop when the connection closes");
     host2.shutdown().await;
+}
+
+/// LiveKit came back on other ports (its old one was taken) while the member's connection stayed
+/// up. Joining again — or the media engine opening signaling again by itself — must move BOTH
+/// ends: the member's loopback port and the host's forwarder. The host used to keep the old one.
+#[tokio::test]
+async fn a_livekit_restarted_on_other_ports_is_followed_on_the_live_connection() {
+    let free = || std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port();
+    let at = |signal, udp, advertised_udp_port| Some(LiveKitTarget { signal, udp, advertised_udp_port });
+    let (signal, media) = fake_livekit().await;
+    let target: Target = Arc::new(std::sync::Mutex::new(at(signal, media, free())));
+    let key = SecretKey::generate();
+    let backend = Arc::new(FakeBackend { host_id: *key.public().as_bytes(), livekit: target.clone(), revoked: Arc::default(), kicked_from_room: Arc::default() });
+    let host = Host::start(&local_only(NetConfig::host(key.clone())), backend).await.unwrap();
+    let member = Member::connect(&local_only(NetConfig::member()), host.loopback_addr()).await.unwrap();
+    let first = member.voice_start("good-token").await.unwrap();
+    let conn = member.connection().await.unwrap().stable_id();
+    let mut buf = vec![0u8; 2048];
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sock.send_to(b"one", ("127.0.0.1", first)).await.unwrap();
+    assert_eq!(recv(&sock, &mut buf).await.0, 8);
+    assert_eq!(skwod_net::voice::active_host_readers(media), 1);
+
+    // Joining again with nothing changed keeps the forwarder (and the call's flow) as it is.
+    assert_eq!(member.voice_start("good-token").await.unwrap(), first);
+    assert_eq!(skwod_net::voice::active_host_readers(media), 1);
+
+    // 1. A fresh join after LiveKit moved.
+    let (signal2, media2) = fake_livekit().await;
+    let second = free();
+    *target.lock().unwrap() = at(signal2, media2, second);
+    assert_eq!(member.voice_start("good-token").await.unwrap(), second);
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sock.send_to(b"two", ("127.0.0.1", second)).await.unwrap();
+    assert_eq!(recv(&sock, &mut buf).await.0, 8, "media reaches the NEW LiveKit");
+    assert_eq!(skwod_net::voice::active_host_readers(media2), 1);
+    assert_eq!(skwod_net::voice::active_host_readers(media), 0, "nothing is left on the old port");
+
+    // 2. No join: the engine reopens signaling by itself.
+    let (signal3, media3) = fake_livekit().await;
+    let third = free();
+    *target.lock().unwrap() = at(signal3, media3, third);
+    tokio::time::sleep(Duration::from_millis(3200)).await;
+    let _signaling = open_signaling(&member, "room-1").await;
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    sock.send_to(b"three", ("127.0.0.1", third)).await.unwrap();
+    assert_eq!(recv(&sock, &mut buf).await.0, 10);
+    assert_eq!((skwod_net::voice::active_host_readers(media3), skwod_net::voice::active_host_readers(media2)), (1, 0));
+    assert_eq!(member.connection().await.unwrap().stable_id(), conn, "all on one connection");
+
+    // LiveKit down: the answer is "no voice", and nothing hangs.
+    *target.lock().unwrap() = None;
+    assert!(matches!(member.voice_start("good-token").await, Err(skwod_net::NetError::VoiceUnavailable)));
+    member.close().await;
+    host.shutdown().await;
+}
+
+/// The counters that tell a blocked media path from an unreachable call server: the port taken on
+/// this device, and an accepted signaling socket.
+#[tokio::test]
+async fn a_taken_media_port_is_its_own_error_and_accepted_signaling_is_counted() {
+    let (signal, media) = fake_livekit().await;
+    let squatter = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let taken = squatter.local_addr().unwrap().port();
+    let (host, member, _) = world(Some(LiveKitTarget { signal, udp: media, advertised_udp_port: taken })).await;
+    assert!(matches!(member.voice_start("good-token").await, Err(skwod_net::NetError::VoicePort)));
+    drop(squatter);
+    member.voice_start("good-token").await.expect("free again");
+    let proxy = LocalProxy::start(member.clone()).await.unwrap();
+    let secret = proxy.base_url().rsplit('/').next().unwrap().to_string();
+    assert_eq!(proxy.livekit_accepted(), 0);
+    let mut tcp = TcpStream::connect(("127.0.0.1", proxy.port())).await.unwrap();
+    tcp.write_all(format!("GET /{secret}/lk/rtc?ws=1&access_token={} HTTP/1.1\r\nhost: x\r\n{WS_HEADERS}", lk_token("room-1", "me")).as_bytes()).await.unwrap();
+    let mut buf = vec![0u8; 512];
+    let n = tokio::time::timeout(Duration::from_secs(5), tcp.read(&mut buf)).await.unwrap().unwrap();
+    assert!(String::from_utf8_lossy(&buf[..n]).starts_with("HTTP/1.1 101"));
+    assert_eq!(proxy.livekit_accepted(), 1);
+    member.close().await;
+    host.shutdown().await;
+}
+
+/// A session that reconnects (Wi-Fi to cellular): the new member needs the port the old one
+/// still holds, while both are connected. Released, the call's media goes on through the new one.
+#[tokio::test]
+async fn a_reconnecting_session_hands_the_media_port_over() {
+    let (signal, media) = fake_livekit().await;
+    let advertised = UdpSocket::bind("127.0.0.1:0").await.unwrap().local_addr().unwrap().port();
+    let (host, old, _) = world(Some(LiveKitTarget { signal, udp: media, advertised_udp_port: advertised })).await;
+    let new = Member::connect(&local_only(NetConfig::member()), host.loopback_addr()).await.unwrap();
+    old.voice_start("good-token").await.unwrap();
+    // One socket of the media engine, through all of it.
+    let sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+    let mut buf = vec![0u8; 2048];
+    sock.send_to(b"one", ("127.0.0.1", advertised)).await.unwrap();
+    recv(&sock, &mut buf).await;
+    assert!(matches!(new.voice_start("good-token").await, Err(skwod_net::NetError::VoicePort)), "held by the old one");
+    old.voice_release().await;
+    assert_eq!(new.voice_start("good-token").await.unwrap(), advertised);
+    sock.send_to(b"two", ("127.0.0.1", advertised)).await.unwrap();
+    let (n, _) = recv(&sock, &mut buf).await;
+    assert_eq!(&buf[..n], b"echo:two");
+    assert!(new.voice_stats().0 >= 1 && new.voice_stats().2 >= 1, "through the new connection");
+    assert!(old.voice_start("bad-token").await.is_err());
+    assert!(old.open_livekit().await.is_err(), "the old one starts nothing again");
+    new.close().await;
+    old.close().await;
+    host.shutdown().await;
+}
+
+/// The host process restarts (same key, same port): the member's session — the same loopback
+/// proxy, the same base URL — carries on without the app doing anything.
+#[tokio::test(flavor = "multi_thread")]
+async fn member_recovers_after_the_host_restarts() {
+    let key = SecretKey::generate();
+    // A port that is free right now (the restarted host binds the same one).
+    let port = std::net::UdpSocket::bind("0.0.0.0:0").unwrap().local_addr().unwrap().port();
+    let cfg = || {
+        let mut cfg = local_only(NetConfig::host(key.clone()));
+        cfg.bind_port = Some(port);
+        cfg
+    };
+    let backend = || Arc::new(FakeBackend { host_id: *key.public().as_bytes(), livekit: Arc::default(), revoked: Arc::default(), kicked_from_room: Arc::default() });
+    let host = Host::start(&cfg(), backend()).await.unwrap();
+    let member = Member::connect(&local_only(NetConfig::member()), host.loopback_addr()).await.unwrap();
+    let proxy = LocalProxy::start(member.clone()).await.unwrap();
+    let url = format!("/{}/a", proxy.base_url().rsplit('/').next().unwrap());
+    assert!(http_get(proxy.port(), &url).await.starts_with("HTTP/1.1 200"));
+    host.shutdown().await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(member.path().await.kind, PathKind::None, "the closed connection is reported as such");
+    // (The released port can take a moment to be free for both address families again.)
+    let mut restarted = None;
+    for _ in 0..30 {
+        match Host::start(&cfg(), backend()).await {
+            Ok(h) => { restarted = Some(h); break; }
+            Err(_) => tokio::time::sleep(Duration::from_millis(100)).await,
+        }
+    }
+    let host = restarted.expect("the host restarts on its port");
+    let again = tokio::time::timeout(Duration::from_secs(10), http_get(proxy.port(), &url)).await.expect("re-dialed in time");
+    assert!(again.starts_with("HTTP/1.1 200"), "{again}");
+    assert_eq!(member.path().await.kind, PathKind::Direct);
+    host.shutdown().await;
+}
+
+/// Build 51: the liveness check the apps run — this proxy, reached through its own port, and
+/// the host answering over the connection — and what it says once the host is gone.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_session_check_follows_the_proxy_and_the_host() {
+    let (host, member, _) = world(None).await;
+    let proxy = LocalProxy::start(member.clone()).await.unwrap();
+    assert!(!proxy.is_closed());
+    assert_eq!(proxy.challenge(Duration::from_secs(2)).await, skwod_net::proxy::Challenge::Ours, "our own proxy answers its challenge");
+    // The fake backend answers every path with 200.
+    assert!(skwod_net::proxy::upstream_answers(member.clone(), Duration::from_secs(3)).await);
+    host.shutdown().await;
+    let started = std::time::Instant::now();
+    assert!(!skwod_net::proxy::upstream_answers(member.clone(), Duration::from_secs(2)).await, "no host, no answer");
+    assert!(started.elapsed() < Duration::from_secs(4), "bounded: {:?}", started.elapsed());
+    assert_eq!(proxy.challenge(Duration::from_secs(2)).await, skwod_net::proxy::Challenge::Ours, "the proxy itself is still ours");
 }

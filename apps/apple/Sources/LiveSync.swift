@@ -17,6 +17,9 @@ extension Notification.Name {
     /// The live socket came (back) up: events may have been missed, so every open screen
     /// catches up once.
     static let skwodLiveConnected = Notification.Name("skwod.live.connected")
+    /// Build 51: catch up NOW (`AppState.catchUp`) — the open conversation first; the app
+    /// then syncs the mailbox and every other joined channel.
+    static let skwodCatchUp = Notification.Name("skwod.live.catchUp")
     /// A server's membership or channel list changed. `object` is the server id.
     static let skwodServerChanged = Notification.Name("skwod.live.serverChanged")
 }
@@ -170,6 +173,8 @@ extension AppState {
     /// was none produced no event here, so catch up once and let open screens do the same.
     func realtimeConnected() {
         NotificationCenter.default.post(name: .skwodLiveConnected, object: nil)
+        socketCameUpSinceSweep = true
+        catchUp()
         // The rosters come again with the subscriptions; nothing from before the gap is kept.
         voiceRoster.reset()
         Task {
@@ -185,6 +190,56 @@ extension AppState {
             await chatModel?.refreshGroups()
             await accountChanged()
             await chatModel?.resumePendingJoin()
+        }
+    }
+
+    // MARK: Catch-up (build 51)
+
+    /// Bring every conversation up to date: the open one first (its screen refreshes on
+    /// `.skwodCatchUp`), then the mailbox (direct and group messages), then every other joined
+    /// channel. Asked for on become-active, wake, network back and every (re)connect; those
+    /// arrive together, so they are coalesced (`CatchUpGate`). Each step is the core's
+    /// cursor-based catch-up — cheap when nothing is new — and it stops at the first failure
+    /// rather than wait out a timeout per channel on a dead connection.
+    func catchUp() {
+        switch catchUpGate.request(now: Date()) {
+        case .queued: return
+        case .start: Task { await runCatchUp(after: 0) }
+        case .startAfter(let wait): Task { await runCatchUp(after: wait) }
+        }
+    }
+
+    private func runCatchUp(after wait: TimeInterval) async {
+        if wait > 0 { try? await Task.sleep(for: .seconds(wait)) }
+        repeat {
+            catchUpGate.started(now: Date())
+            await catchUpOnce()
+        } while catchUpGate.finished()
+    }
+
+    private func catchUpOnce() async {
+        guard client != nil, session != nil else { return }
+        #if DEBUG
+        E2E.sawCatchUp()
+        #endif
+        NotificationCenter.default.post(name: .skwodCatchUp, object: nil)
+        await syncMailbox()
+        chatModel?.recoverIfNeeded()
+        guard connection.isUsable, let chatModel, let me = session?.userId, let asked = bindTicket() else { return }
+        // Not every channel on every window focus (`CatchUpGate.sweepDue`).
+        guard CatchUpGate.sweepDue(lastSweep: lastChannelSweep, now: Date(), socketCameUpSince: socketCameUpSinceSweep) else { return }
+        lastChannelSweep = Date()
+        socketCameUpSinceSweep = false
+        let open: String? = { if case .space(let s) = chatModel.selection { return s.channelId } else { return nil } }()
+        var channels = chatModel.spaces.map(\.channelId).filter { !$0.isEmpty && $0 != "demo" && $0 != open }
+        channels.append(contentsOf: chatModel.feedChannels.values.filter { !channels.contains($0) && $0 != open })
+        for channelId in channels.prefix(40) {
+            guard holds(asked), let client else { return }
+            guard let rows = try? await client.fetchChannelMessages(channelId: channelId, myUserId: me) else { return }
+            guard holds(asked) else { return }
+            await drainDmEvents()
+            _ = rows
+            NotificationCenter.default.post(name: .skwodChannelChanged, object: channelId)
         }
     }
 

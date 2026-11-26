@@ -827,3 +827,32 @@ Bindings must be regenerated (`build-core.sh`) for four additions.
 | Server `POST /api/e2ee/pair-offers` (device-signed), `POST /api/e2ee/pair-requests` (no session), `GET /api/e2ee/pair-requests/by-offer/:offer_id`, `POST …/:id/reveal` (bound session; the nonce for the key seen, once), `POST …/:id/approve` (only after the reveal), `DELETE …/:id` (deny; bound session, limited), `POST …/:id/claim` (signed by the request's identity key; carries the nonce once revealed) | All 404 unless `SKWOD_QR_PAIRING=1`. An unknown / expired / consumed / other-username offer gets a decoy request id and nothing is stored. Offers are stored for at most 5 minutes and consumed on approve, deny, contest and register; every step checks the offer's expiry; a claimed but unregistered session is revoked on contest or expiry. Migration 0019 adds `device_pair_offers` and `device_pair_requests` (separate from `device_link_requests`); 0020 adds `consumed`, `nonce`, `registered`, `session_hash`. |
 | p2p proxy (`skwod-net/src/proxy.rs`) | Also stamps `POST /api/e2ee/pair-requests` with proof of work, as for signup/login (the host answers 428 without it). The polled `…/claim` is not stamped; the host asks no work for it. |
 | Apps | Apple: `NewDevicePairing.swift` (join question → waiting → five emoji → approved → enter), `PairingViews.swift` (pick among four, "None of these"), `PairingCopy.swift`; `signIn(…, pairedLocalId:)`. Android: `AppModel.pairingStart/pairingPoll/pairingEnter/pairingDrop`, `adopt(…, pairedLocalId)`, `PairNewDeviceDialog`, `AddDeviceDialog`, `PairingCopy.kt`. The Mac reads a QR from an image (no camera scan). |
+
+## Build 51 — the cache is let go at once (`cache_lease.rs`)
+
+| Function | What it does |
+|---|---|
+| `SkwodClient.cache_lease() -> CacheLease` *new* | Taken BEFORE `attach_cache`, by an app that shares its caches with another process under a lock (iOS). Holds neither the client nor the cache. |
+| `CacheLease.detach()` *new, plain call* | Ends the client's use of its cache for good, from any thread and without the async runtime; waits only for the database call in progress. An `attach_cache` on its way fails with `NoCache`. From then on what the client receives is not acknowledged (the server hands it out again), what it seals is not sent, and writes fail with `NoCache`. Make a new client. |
+| `CacheLease.detach_if_idle() -> bool` *new, plain call* | The same, unless a registration, link, pairing poll, reset or restore is going on (the host would know a device this install does not remember): `false`, ask again. |
+| `CacheLease.is_over() -> bool` *new, plain call* | Detached, or the client is gone. |
+| `SkwodClient` before (and while) `attach_cache` *changed* | The engine's state and event stores are installed when the client is made and read the cache slot when called; `attach_cache` loads the state and fills the slot under one hold of the engine. With no cache in the slot nothing sealed leaves and nothing read is acknowledged — only a client made for memory (`allow_without_cache`, tests and tools) takes memory for stored. |
+| `SkwodClient.go_online(base_url, token, pinned_server_key) -> bool` *new* | A client made with no way to its host (its cache open, its outbox usable) is given one: same client, same open cache. The pin is applied first (an error changes nothing: the client still reaches nobody), then the session is bound, as `bind_session` does; the new way is kept only if that worked — on an error (host not reached, superseded, removed) the client keeps its old way and the app binds anew. |
+| `pair_poll` | Needs the cache attached (a poll may register): `Cache` error without one. |
+
+Prekeys and a rotated signed prekey are stored before they are uploaded. Android: nothing to do (it has no
+second process and no such lock).
+
+## Build 51 — why a call did not connect
+
+| Function | What changed |
+|---|---|
+| `CoreError.Voice { code }` *new variant* | From `voice_config`, `ensure_voice_channel` and `voice_token` only: `off`, `starting`, `no_access`, `unreachable`, `unavailable`, `port_taken`. A code for the apps' own sentences; nothing a host wrote is in it. Other failures (an update, a replaced sign-in, a removed device) are what they were. |
+| `VoiceConfig` | New fields `status` (`on`/`starting`/`off`), `reason` (short code or empty), `bundled` (the skwod runs its own call server), `external` (another one is saved). A host before build 51 says only `configured`: `status` then follows it. |
+| `SkwodClient.clear_voice_config() -> bool` *new* | Owner only, device-signed (op `voice-config-clear`): forget the saved call server, its key and secret. `false` = none was saved. |
+| `SkwodClient.voice_tunnel() -> P2pVoiceStats?` *new* | The p2p voice tunnel's counters for this session; `None` without p2p. |
+| `P2pVoiceStats` | New fields `undelivered` (answers this device could not hand to the call) and `accepted` (signaling sockets the call server accepted). |
+| Server `GET /api/voice/config` | Adds `status`, `reason`, `bundled`, `external`. `configured` and `url` are unchanged (what a 0.50 app reads). |
+| Server `PUT /api/voice/config` | 409 on a skwod that runs its own call server with none saved (a 0.50 owner app shows its "couldn't save" sentence). |
+| Server `DELETE /api/voice/config` *new* | Owner, device-signed. |
+| Server `POST /api/channels/:id/voice-token` | No call server: **503** `{ code: "voice_off" \| "voice_starting", reason }`, after the permission checks. Was 403 (no credentials yet) or 200 with `url: null` (credentials, call server down). A 0.50 app shows its generic sentence for both the 403 and the 503; for the `url: null` case it used to say "Calls aren't set up on this Skwod." Its own gate (`configured: false`) still comes first in all of them, except when answering a ring. |

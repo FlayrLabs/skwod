@@ -43,7 +43,7 @@ async fn get(state: &AppState, name: &str) -> Option<String> {
     v.and_then(|b| String::from_utf8(b).ok())
 }
 
-async fn put(state: &AppState, name: &str, value: &str) -> Result<(), sqlx::Error> {
+async fn put(db: impl sqlx::Executor<'_, Database = sqlx::Any>, name: &str, value: &str) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO instance_secrets (name, value, created_at) VALUES ($1, $2, $3)
          ON CONFLICT (name) DO UPDATE SET value = excluded.value, created_at = excluded.created_at",
@@ -51,13 +51,13 @@ async fn put(state: &AppState, name: &str, value: &str) -> Result<(), sqlx::Erro
     .bind(name)
     .bind(value.as_bytes())
     .bind(now_ms())
-    .execute(&state.db)
+    .execute(db)
     .await?;
     Ok(())
 }
 
 /// A currently-free port, as a hint. (LiveKit binds it a moment later; a lost race just means
-/// LiveKit fails to start and voice stays off until the next run.)
+/// LiveKit fails to start and the supervisor tries again.)
 fn free_port(udp: bool) -> Option<u16> {
     let lo = (Ipv4Addr::LOCALHOST, 0);
     if udp {
@@ -117,6 +117,160 @@ async fn clear(state: &AppState, names: &[&str]) {
     }
 }
 
+/// Why voice is not running (or what it is waiting for). The code is all a member or the admin
+/// page is told; it never carries an address, a path or a key.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reason {
+    /// Nothing was set up: no bundled call server was looked for, none was saved.
+    NotSetUp,
+    /// Hosting is stopped.
+    Stopped,
+    /// `SKWOD_NO_MANAGED_LIVEKIT` is set.
+    Disabled,
+    /// No `livekit-server` program next to the server or on the PATH.
+    NoBinary,
+    /// The owner saved another call server (`PUT /api/voice/config`); the bundled one stays off.
+    External,
+    /// The bundled call server runs.
+    Managed,
+    /// First start in progress.
+    Launching,
+    /// No free port, or the remembered one is held by another program.
+    Ports,
+    /// `livekit.yaml` could not be written to the data folder.
+    Files,
+    /// The program could not be executed.
+    Exec,
+    /// It exited before it answered (or later).
+    Exited,
+    /// It ran but did not answer in time.
+    NoAnswer,
+    /// The settings could not be stored in the database.
+    Storage,
+}
+
+impl Reason {
+    pub fn code(self) -> &'static str {
+        match self {
+            Reason::NotSetUp => "not_set_up",
+            Reason::Stopped => "stopped",
+            Reason::Disabled => "disabled",
+            Reason::NoBinary => "no_call_server",
+            Reason::External => "external",
+            Reason::Managed => "managed",
+            Reason::Launching => "launching",
+            Reason::Ports => "ports",
+            Reason::Files => "files",
+            Reason::Exec => "exec",
+            Reason::Exited => "exited",
+            Reason::NoAnswer => "no_answer",
+            Reason::Storage => "storage",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VoicePhase {
+    Off,
+    /// Starting, or between two attempts.
+    Starting,
+    On,
+}
+
+impl VoicePhase {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            VoicePhase::Off => "off",
+            VoicePhase::Starting => "starting",
+            VoicePhase::On => "on",
+        }
+    }
+}
+
+/// What the supervisor knows about voice right now — live, not a snapshot of the last start.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VoiceStatus {
+    pub phase: VoicePhase,
+    pub reason: Reason,
+    /// A bundled call server is under supervision (so nobody needs to set one up by hand).
+    pub bundled: bool,
+}
+
+struct Shared {
+    status: std::sync::Mutex<VoiceStatus>,
+    /// The saved call server changed (`voice.rs`): the supervisor looks again.
+    changed: tokio::sync::Notify,
+    /// Held while the voice settings in the database are read-and-written as one step, so the
+    /// supervisor never overwrites a call server the owner is saving at that moment.
+    settings: tokio::sync::Mutex<()>,
+}
+
+/// Shared between the supervisor and everything that answers "is voice on?".
+#[derive(Clone)]
+pub struct VoiceHealth(std::sync::Arc<Shared>);
+
+impl Default for VoiceHealth {
+    fn default() -> Self {
+        let status = VoiceStatus { phase: VoicePhase::Off, reason: Reason::NotSetUp, bundled: false };
+        Self(std::sync::Arc::new(Shared { status: std::sync::Mutex::new(status), changed: Default::default(), settings: Default::default() }))
+    }
+}
+
+impl VoiceHealth {
+    pub fn get(&self) -> VoiceStatus {
+        *self.0.status.lock().unwrap_or_else(|e| e.into_inner())
+    }
+    pub(crate) fn set(&self, phase: VoicePhase, reason: Reason, bundled: bool) {
+        *self.0.status.lock().unwrap_or_else(|e| e.into_inner()) = VoiceStatus { phase, reason, bundled };
+    }
+    /// The saved call server was set or cleared.
+    pub(crate) fn settings_changed(&self) {
+        self.0.changed.notify_one();
+    }
+    pub(crate) async fn settings(&self) -> tokio::sync::MutexGuard<'_, ()> {
+        self.0.settings.lock().await
+    }
+}
+
+/// Voice right now: the supervisor's word where there is a bundled call server, otherwise whether
+/// a call server is saved.
+pub async fn status(state: &AppState) -> VoiceStatus {
+    let health = state.voice.get();
+    if health.bundled {
+        return health;
+    }
+    let saved = get(state, "livekit_url").await.is_some() && get(state, "livekit_api_key").await.is_some() && get(state, "livekit_api_secret").await.is_some();
+    if saved {
+        return VoiceStatus { phase: VoicePhase::On, reason: Reason::External, bundled: false };
+    }
+    health
+}
+
+/// A call server the owner saved (not one this server advertised itself).
+pub(crate) async fn external_url(state: &AppState) -> Option<String> {
+    if get(state, "livekit_managed").await.as_deref() == Some("1") {
+        return None;
+    }
+    get(state, "livekit_url").await
+}
+
+/// Withdraw what this server advertised. A call server the owner saved is never touched.
+async fn withdraw(state: &AppState) {
+    let _settings = state.voice.settings().await;
+    if get(state, "livekit_managed").await.as_deref() == Some("1") {
+        clear(state, &["livekit_url", "livekit_managed"]).await;
+    }
+}
+
+/// An advertisement that was only half written (the process died between two of its rows, before
+/// they were written as one): no managed mark, but exactly the address this server writes — its
+/// own remembered loopback port. Left alone it reads as "the owner saved another call server",
+/// and the bundled one stays off on every start from then on.
+async fn half_written(state: &AppState) -> bool {
+    let (Some(url), Some(port)) = (get(state, "livekit_url").await, get(state, "livekit_signal_port").await) else { return false };
+    url == format!("ws://127.0.0.1:{port}") && get(state, "livekit_managed").await.is_none()
+}
+
 /// A supervised LiveKit child. Dropping it stops the supervisor, which kills the child.
 pub struct ManagedLiveKit {
     supervisor: tokio::task::JoinHandle<()>,
@@ -125,9 +279,12 @@ pub struct ManagedLiveKit {
 impl ManagedLiveKit {
     /// Stop the child now and withdraw the advertisement (the supervisor would only do the
     /// latter if the child exited on its own).
-    pub async fn stop(self, state: &AppState) {
+    pub async fn stop(mut self, state: &AppState) {
         self.supervisor.abort();
-        clear(state, &["livekit_url", "livekit_managed"]).await;
+        // Over before anything is withdrawn: it must not advertise (or report) after this.
+        let _ = (&mut self.supervisor).await;
+        withdraw(state).await;
+        state.voice.set(VoicePhase::Off, Reason::Stopped, true);
     }
 }
 
@@ -140,21 +297,29 @@ impl Drop for ManagedLiveKit {
 /// How long LiveKit gets to come up and answer on its signaling port.
 const HEALTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
-/// Spawn and supervise LiveKit if its binary is available.
+/// Supervise LiveKit if its binary is available. `None` (with the reason logged and in
+/// [`status`]) when there is nothing to supervise.
 pub async fn spawn_managed(state: &AppState, data: &Path) -> Option<ManagedLiveKit> {
     // Whatever a previous run advertised is unverified now: withdraw it BEFORE anything else, so
     // a stale `livekit_url` can never route signaling (and room tokens) to whoever holds that
     // port today. It is re-published only after this run's child proved it owns the port.
-    if get(state, "livekit_managed").await.as_deref() == Some("1") {
-        clear(state, &["livekit_url", "livekit_managed"]).await;
-    } else if get(state, "livekit_url").await.is_some() {
-        return None; // the owner configured their own SFU
-    }
+    withdraw(state).await;
+    let external = external_url(state).await.is_some();
     if std::env::var("SKWOD_NO_MANAGED_LIVEKIT").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")) {
+        tracing::info!(external, "voice: the bundled call server is turned off by SKWOD_NO_MANAGED_LIVEKIT");
+        state.voice.set(VoicePhase::Off, Reason::Disabled, false);
         return None;
     }
-    let bin = find_binary()?;
-    spawn_with(state, data, &bin, HEALTH_TIMEOUT).await
+    let Some(bin) = find_binary() else {
+        tracing::warn!(external, "voice: no bundled call server (livekit-server) was found next to the server or on the PATH");
+        state.voice.set(VoicePhase::Off, Reason::NoBinary, false);
+        return None;
+    };
+    if external && half_written(state).await {
+        tracing::warn!("voice: an unfinished advertisement of an earlier run was removed");
+        clear(state, &["livekit_url"]).await;
+    }
+    Some(spawn_with(state, data, &bin, HEALTH_TIMEOUT).await)
 }
 
 /// PIDs listening on TCP `port`, via `lsof` (macOS, most Linux hosts). `None` when that can't
@@ -174,6 +339,18 @@ async fn port_is_free(addr: std::net::SocketAddr) -> bool {
     tokio::net::TcpStream::connect(addr).await.is_err()
 }
 
+/// Has the child exited? Says how (a signal 9 is usually the memory limit), never anything else.
+fn exited(child: &mut tokio::process::Child) -> bool {
+    match child.try_wait() {
+        Ok(None) => false,
+        Ok(Some(how)) => {
+            tracing::warn!(status = %how, "voice: the call server exited while starting");
+            true
+        }
+        Err(_) => true,
+    }
+}
+
 /// Is OUR child the LiveKit serving on `addr`? All of:
 /// 1. the port answers like LiveKit (`GET /` → 200 `OK`);
 /// 2. the process LISTENING on the port is our child and nobody else (where `lsof` can tell) —
@@ -183,81 +360,145 @@ async fn port_is_free(addr: std::net::SocketAddr) -> bool {
 ///
 /// The caller additionally requires the port to be silent BEFORE the spawn, and withdraws the
 /// advertisement the moment the child exits.
-async fn child_serves(child: &mut tokio::process::Child, addr: std::net::SocketAddr, timeout: std::time::Duration) -> bool {
-    let http = match reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(2)).build() {
-        Ok(c) => c,
-        Err(_) => return false,
-    };
+async fn child_serves(child: &mut tokio::process::Child, addr: std::net::SocketAddr, timeout: std::time::Duration) -> Result<(), Reason> {
+    let http = reqwest::Client::builder().no_proxy().timeout(std::time::Duration::from_secs(2)).build().map_err(|_| Reason::NoAnswer)?;
     let deadline = tokio::time::Instant::now() + timeout;
     loop {
-        if !matches!(child.try_wait(), Ok(None)) {
-            return false; // exited (e.g. a port was taken) or unknowable
+        if exited(child) {
+            return Err(Reason::Exited); // (e.g. a port was taken) or unknowable
         }
         if let Ok(res) = http.get(format!("http://{addr}/")).send().await {
             if res.status().is_success() && res.text().await.is_ok_and(|b| b.trim() == "OK") {
                 if let (Some(pids), Some(ours)) = (listener_pids(addr.port()).await, child.id()) {
                     if pids != [ours] {
-                        return false; // someone else is (also) listening there
+                        return Err(Reason::Ports); // someone else is (also) listening there
                     }
                 }
                 tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                return matches!(child.try_wait(), Ok(None));
+                return if exited(child) { Err(Reason::Exited) } else { Ok(()) };
             }
         }
         if tokio::time::Instant::now() >= deadline {
-            return false;
+            return Err(Reason::NoAnswer);
         }
         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
     }
 }
 
-pub(crate) async fn spawn_with(state: &AppState, data: &Path, bin: &Path, health_timeout: std::time::Duration) -> Option<ManagedLiveKit> {
+pub(crate) async fn spawn_with(state: &AppState, data: &Path, bin: &Path, health_timeout: std::time::Duration) -> ManagedLiveKit {
     spawn_supervised(state, data, bin, health_timeout, RESTART_BACKOFF).await
 }
 
-/// First and longest pause before a LiveKit that exited is started again.
+/// First and longest pause before a LiveKit that did not start, or exited, is started again.
 const RESTART_BACKOFF: (std::time::Duration, std::time::Duration) = (std::time::Duration::from_secs(2), std::time::Duration::from_secs(60));
 /// A child that ran at least this long was healthy: the next restart starts from the short pause.
 const HEALTHY_RUN: std::time::Duration = std::time::Duration::from_secs(60);
+/// After this many failures in a row voice is "off", not "starting" (it is still retried).
+const FAILURES_BEFORE_OFF: u32 = 3;
+/// With another call server saved, how often the supervisor looks again by itself.
+const EXTERNAL_RECHECK: std::time::Duration = std::time::Duration::from_secs(60);
 
-/// [`spawn_with`], with the restart pauses given (tests use short ones).
+/// [`spawn_with`], with the restart pauses given (tests use short ones). Returns once the first
+/// attempt has ended — either way: the supervisor keeps trying from there.
 pub(crate) async fn spawn_supervised(
     state: &AppState,
     data: &Path,
     bin: &Path,
     health_timeout: std::time::Duration,
     backoff: (std::time::Duration, std::time::Duration),
-) -> Option<ManagedLiveKit> {
-    let mut child = launch(state, data, bin, health_timeout).await?;
-    // If the child ever exits, its ports are free for anyone: withdraw the advertisement at
-    // once — and then bring it back. A crashed SFU used to mean "no calls until the host
-    // restarts the server", which on a Mac in a cupboard means "no calls".
-    let (state, data, bin) = (state.clone(), data.to_path_buf(), bin.to_path_buf());
-    let supervisor = tokio::spawn(async move {
-        let mut pause = backoff.0;
-        loop {
-            let started = std::time::Instant::now();
-            let _ = child.wait().await;
-            clear(&state, &["livekit_url", "livekit_managed"]).await;
-            tracing::warn!("managed LiveKit exited — voice is off until it is back; restarting it");
-            if started.elapsed() >= HEALTHY_RUN {
-                pause = backoff.0;
-            }
-            child = loop {
-                tokio::time::sleep(pause).await;
-                pause = (pause * 2).min(backoff.1);
-                if let Some(c) = launch(&state, &data, &bin, health_timeout).await {
-                    break c;
-                }
-            };
-        }
-    });
-    Some(ManagedLiveKit { supervisor })
+) -> ManagedLiveKit {
+    state.voice.set(VoicePhase::Starting, Reason::Launching, true);
+    let (first, decided) = tokio::sync::oneshot::channel();
+    let supervisor = tokio::spawn(supervise(state.clone(), data.to_path_buf(), bin.to_path_buf(), health_timeout, backoff, first));
+    let managed = ManagedLiveKit { supervisor };
+    let _ = decided.await;
+    managed
 }
 
-/// Start one LiveKit child, wait until it serves, and advertise it. `None` = it did not come up
+/// Keep LiveKit running for as long as hosting does. One failure — the FIRST one included — used
+/// to mean "no calls until somebody restarts the server", which for a box in a cupboard means
+/// "no calls".
+async fn supervise(
+    state: AppState,
+    data: PathBuf,
+    bin: PathBuf,
+    health_timeout: std::time::Duration,
+    backoff: (std::time::Duration, std::time::Duration),
+    first: tokio::sync::oneshot::Sender<()>,
+) {
+    let mut first = Some(first);
+    let mut decided = move || {
+        if let Some(first) = first.take() {
+            let _ = first.send(());
+        }
+    };
+    let (mut pause, mut failures, mut told_external) = (backoff.0, 0u32, false);
+    loop {
+        if external_url(&state).await.is_some() {
+            if !told_external {
+                tracing::info!("voice: another call server is saved in this skwod's settings, so the bundled one stays off");
+                told_external = true;
+            }
+            state.voice.set(VoicePhase::On, Reason::External, true);
+            decided();
+            tokio::select! {
+                _ = state.voice.0.changed.notified() => {}
+                _ = tokio::time::sleep(EXTERNAL_RECHECK) => {}
+            }
+            (pause, failures) = (backoff.0, 0);
+            continue;
+        }
+        if told_external {
+            tracing::info!("voice: the saved call server was cleared; starting the bundled one");
+            told_external = false;
+            state.voice.set(VoicePhase::Starting, Reason::Launching, true);
+        }
+        let reason = match launch(&state, &data, &bin, health_timeout).await {
+            Ok(mut child) => {
+                state.voice.set(VoicePhase::On, Reason::Managed, true);
+                decided();
+                let started = std::time::Instant::now();
+                let how = loop {
+                    tokio::select! {
+                        how = child.wait() => break how.ok(),
+                        _ = state.voice.0.changed.notified() => {
+                            if external_url(&state).await.is_some() {
+                                let _ = child.kill().await;
+                                break None;
+                            }
+                        }
+                    }
+                };
+                // Its ports are free for anyone now: withdraw the advertisement at once.
+                withdraw(&state).await;
+                if external_url(&state).await.is_some() {
+                    continue;
+                }
+                if started.elapsed() >= HEALTHY_RUN {
+                    (pause, failures) = (backoff.0, 0);
+                }
+                tracing::warn!(status = how.map(|h| h.to_string()), "voice: the call server exited; voice is off until it is back, restarting it");
+                Reason::Exited
+            }
+            Err(Reason::External) => continue, // saved while we were starting
+            Err(reason) => reason,
+        };
+        failures = failures.saturating_add(1);
+        let phase = if failures < FAILURES_BEFORE_OFF { VoicePhase::Starting } else { VoicePhase::Off };
+        state.voice.set(phase, reason, true);
+        decided();
+        // Not once a minute for ever: the 1st, 2nd, 4th, 8th … failure in a row.
+        if failures.is_power_of_two() {
+            tracing::error!(reason = reason.code(), failures, retry_in_secs = pause.as_secs(), "voice disabled: the call server is not running (nothing is advertised); it will be tried again");
+        }
+        tokio::time::sleep(pause).await;
+        pause = (pause * 2).min(backoff.1);
+    }
+}
+
+/// Start one LiveKit child, wait until it serves, and advertise it. An error = it did not come up
 /// (nothing is advertised).
-async fn launch(state: &AppState, data: &Path, bin: &Path, health_timeout: std::time::Duration) -> Option<tokio::process::Child> {
+async fn launch(state: &AppState, data: &Path, bin: &Path, health_timeout: std::time::Duration) -> Result<tokio::process::Child, Reason> {
     let (key, secret) = match (get(state, "livekit_api_key").await, get(state, "livekit_api_secret").await) {
         (Some(k), Some(s)) => (k, s),
         _ => crate::init::generate_livekit_creds(),
@@ -271,19 +512,21 @@ async fn launch(state: &AppState, data: &Path, bin: &Path, health_timeout: std::
     // up — typically because something else holds one of them now — attempt 2 picks fresh ports.
     let remembered = (stored_port(get(state, "livekit_signal_port").await), stored_port(get(state, "livekit_udp_port").await));
     let mut started = None;
+    let mut reason = Reason::Ports;
     for attempt in 0..2 {
         let (signal_port, udp_port) = match (attempt, remembered) {
             (0, (Some(s), Some(u))) => (s, u),
-            (0, _) | (1, (Some(_), Some(_))) => (free_port(false)?, free_port(true)?),
+            (0, _) | (1, (Some(_), Some(_))) => (free_port(false).ok_or(Reason::Ports)?, free_port(true).ok_or(Reason::Ports)?),
             _ => break, // fresh ports already failed once
         };
         // Something already answering on the port before we start is, by definition, not our child.
         if !port_is_free(std::net::SocketAddr::new(bind_ip, signal_port)).await {
+            reason = Reason::Ports;
             continue;
         }
         if let Err(e) = write_private(&config_path, &render_config(signal_port, udp_port, bind_ip, &key, &secret)) {
-            tracing::error!(error = %e, "cannot write livekit.yaml — voice disabled");
-            return None;
+            tracing::error!(error = %e, "voice disabled: cannot write livekit.yaml");
+            return Err(Reason::Files);
         }
         let spawned = tokio::process::Command::new(bin)
             .arg("--config")
@@ -294,40 +537,50 @@ async fn launch(state: &AppState, data: &Path, bin: &Path, health_timeout: std::
         let mut child = match spawned {
             Ok(c) => c,
             Err(e) => {
-                tracing::error!(error = %e, "cannot start livekit-server — voice disabled");
-                return None;
+                tracing::error!(error = %e, "voice disabled: cannot start livekit-server");
+                return Err(Reason::Exec);
             }
         };
         let signal = std::net::SocketAddr::new(bind_ip, signal_port);
-        if child_serves(&mut child, signal, health_timeout).await {
-            started = Some((child, signal, udp_port));
-            break;
+        match child_serves(&mut child, signal, health_timeout).await {
+            Ok(()) => {
+                started = Some((child, signal, udp_port));
+                break;
+            }
+            Err(why) => reason = why,
         }
         let _ = child.kill().await;
     }
-    let Some((child, signal, udp_port)) = started else {
-        tracing::error!("livekit-server did not come up on its ports — voice disabled (nothing advertised)");
-        return None;
-    };
+    let Some((child, signal, udp_port)) = started else { return Err(reason) };
 
-    // Only now — verified — is the SFU advertised to clients.
-    for (name, value) in [
+    // Only now — verified — is the SFU advertised to clients. All of it or nothing, and never
+    // over a call server the owner saved meanwhile.
+    let _settings = state.voice.settings().await;
+    if external_url(state).await.is_some() {
+        return Err(Reason::External);
+    }
+    let rows = [
+        ("livekit_managed", "1".to_string()),
         ("livekit_url", format!("ws://{signal}")),
         ("livekit_api_key", key),
         ("livekit_api_secret", secret),
         ("livekit_signal_port", signal.port().to_string()),
         ("livekit_udp_port", udp_port.to_string()),
-        ("livekit_managed", "1".to_string()),
-    ] {
-        if let Err(e) = put(state, name, &value).await {
-            tracing::error!(error = %e, "cannot store LiveKit settings — voice disabled");
-            clear(state, &["livekit_url", "livekit_managed"]).await;
-            return None;
+    ];
+    let stored = async {
+        let mut tx = state.db.begin().await?;
+        for (name, value) in &rows {
+            put(&mut *tx, name, value).await?;
         }
+        tx.commit().await
+    };
+    if let Err(e) = stored.await {
+        tracing::error!(error = %e, "voice disabled: cannot store the call server's settings");
+        return Err(Reason::Storage);
     }
     tracing::info!("voice/video enabled: managed LiveKit on loopback (reachable only through p2p)");
 
-    Some(child)
+    Ok(child)
 }
 
 #[cfg(test)]
@@ -387,12 +640,21 @@ s.serve_forever()
         let dir = tempfile::tempdir().unwrap();
         let st = state().await;
         // Dies at once (what LiveKit does when a port is taken).
-        assert!(spawn_with(&st, dir.path(), &script(dir.path(), "exit 1"), Duration::from_secs(2)).await.is_none());
+        let managed = spawn_with(&st, dir.path(), &script(dir.path(), "exit 1"), Duration::from_secs(2)).await;
         assert_eq!(get(&st, "livekit_url").await, None);
+        assert_eq!(status(&st).await, VoiceStatus { phase: VoicePhase::Starting, reason: Reason::Exited, bundled: true });
+        managed.stop(&st).await;
+        assert_eq!(status(&st).await.reason, Reason::Stopped);
         // Alive but not listening.
-        assert!(spawn_with(&st, dir.path(), &script(dir.path(), "sleep 30"), Duration::from_millis(800)).await.is_none());
+        let managed = spawn_with(&st, dir.path(), &script(dir.path(), "sleep 30"), Duration::from_millis(800)).await;
         assert_eq!(get(&st, "livekit_url").await, None);
         assert_eq!(get(&st, "livekit_managed").await, None);
+        assert_eq!(status(&st).await.reason, Reason::NoAnswer);
+        managed.stop(&st).await;
+        // Not a program at all.
+        let managed = spawn_with(&st, dir.path(), &dir.path().join("missing"), Duration::from_millis(800)).await;
+        assert_eq!(status(&st).await.reason, Reason::Exec);
+        managed.stop(&st).await;
     }
 
     #[tokio::test]
@@ -412,17 +674,19 @@ s.serve_forever()
         });
         let dir = tempfile::tempdir().unwrap();
         let st = state().await;
-        put(&st, "livekit_signal_port", &port.to_string()).await.unwrap();
-        put(&st, "livekit_udp_port", "50999").await.unwrap();
+        put(&st.db, "livekit_signal_port", &port.to_string()).await.unwrap();
+        put(&st.db, "livekit_udp_port", "50999").await.unwrap();
         // Worst case for the old check: the child is ALIVE (still starting) while the squatter answers.
-        assert!(spawn_with(&st, dir.path(), &script(dir.path(), "sleep 30"), Duration::from_millis(1500)).await.is_none());
+        let managed = spawn_with(&st, dir.path(), &script(dir.path(), "sleep 30"), Duration::from_millis(1500)).await;
+        assert_ne!(status(&st).await.phase, VoicePhase::On);
+        managed.stop(&st).await;
         assert_eq!(get(&st, "livekit_url").await, None, "the squatted port was never advertised");
         // And when the squatter shows up only AFTER the pre-spawn check, the listener-pid check
         // (where lsof exists) still refuses it.
         if listener_pids(port).await.is_some() {
             let mut alive = tokio::process::Command::new("sleep").arg("30").kill_on_drop(true).spawn().unwrap();
             let addr = std::net::SocketAddr::from(([127, 0, 0, 1], port));
-            assert!(!child_serves(&mut alive, addr, Duration::from_secs(2)).await, "an alive child that isn't the listener is not accepted");
+            assert_eq!(child_serves(&mut alive, addr, Duration::from_secs(2)).await, Err(Reason::Ports), "an alive child that isn't the listener is not accepted");
         }
     }
 
@@ -431,16 +695,139 @@ s.serve_forever()
         let dir = tempfile::tempdir().unwrap();
         let st = state().await;
         // A previous run left a managed URL behind; this run has no LiveKit binary to verify with.
-        put(&st, "livekit_url", "ws://127.0.0.1:7880").await.unwrap();
-        put(&st, "livekit_managed", "1").await.unwrap();
+        put(&st.db, "livekit_url", "ws://127.0.0.1:7880").await.unwrap();
+        put(&st.db, "livekit_managed", "1").await.unwrap();
         std::env::set_var("SKWOD_LIVEKIT_BIN", dir.path().join("does-not-exist"));
+        let (log, said) = captured();
         assert!(spawn_managed(&st, dir.path()).await.is_none());
-        std::env::remove_var("SKWOD_LIVEKIT_BIN");
+        drop(log);
+        assert!(said().contains("no bundled call server"), "this return used to be silent: {}", said());
+        assert_eq!(status(&st).await, VoiceStatus { phase: VoicePhase::Off, reason: Reason::NoBinary, bundled: false });
         assert_eq!(get(&st, "livekit_url").await, None);
         // An owner-configured external SFU is never touched.
-        put(&st, "livekit_url", "wss://sfu.example.org").await.unwrap();
+        for (name, value) in [("livekit_url", "wss://sfu.example.org"), ("livekit_api_key", "k"), ("livekit_api_secret", "s")] {
+            put(&st.db, name, value).await.unwrap();
+        }
         assert!(spawn_managed(&st, dir.path()).await.is_none());
         assert_eq!(get(&st, "livekit_url").await.as_deref(), Some("wss://sfu.example.org"));
+        assert_eq!(status(&st).await.phase, VoicePhase::On, "theirs is what calls use");
+
+        // …nor with a bundled call server next to it, which stays off and says so (this return
+        // was silent too, on every start); the trap is visible and reversible.
+        std::env::set_var("SKWOD_LIVEKIT_BIN", script(dir.path(), "exit 1"));
+        let (log, said) = captured();
+        let managed = spawn_managed(&st, dir.path()).await.expect("supervised, idle");
+        drop(log);
+        assert!(said().contains("another call server is saved"), "{}", said());
+        assert!(!said().contains("sfu.example.org"), "the log names no address");
+        assert_eq!(status(&st).await, VoiceStatus { phase: VoicePhase::On, reason: Reason::External, bundled: true });
+        managed.stop(&st).await;
+        assert_eq!(get(&st, "livekit_url").await.as_deref(), Some("wss://sfu.example.org"), "stopping never clears theirs");
+
+        // An advertisement an earlier run only half wrote is NOT theirs: it is removed.
+        put(&st.db, "livekit_signal_port", "7880").await.unwrap();
+        put(&st.db, "livekit_url", "ws://127.0.0.1:7880").await.unwrap();
+        let managed = spawn_managed(&st, dir.path()).await.expect("supervised");
+        assert_eq!(get(&st, "livekit_url").await, None);
+        assert_eq!(status(&st).await.reason, Reason::Exited, "the bundled server was tried");
+        managed.stop(&st).await;
+        std::env::remove_var("SKWOD_LIVEKIT_BIN");
+    }
+
+    /// Everything logged on this thread until the guard is dropped.
+    fn captured() -> (tracing::subscriber::DefaultGuard, impl Fn() -> String) {
+        #[derive(Clone, Default)]
+        struct Buf(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+        impl std::io::Write for Buf {
+            fn write(&mut self, b: &[u8]) -> std::io::Result<usize> {
+                self.0.lock().unwrap().extend_from_slice(b);
+                Ok(b.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        let buf = Buf::default();
+        let out = buf.clone();
+        let sub = tracing_subscriber::fmt().with_ansi(false).with_writer(move || out.clone()).finish();
+        (tracing::subscriber::set_default(sub), move || String::from_utf8_lossy(&buf.0.lock().unwrap()).into_owned())
+    }
+
+    /// The FIRST start fails and the next succeeds: nobody has to restart the server. (It used to
+    /// return with no supervisor at all.)
+    #[tokio::test]
+    async fn a_first_start_that_fails_is_tried_again() {
+        if !has_python() {
+            eprintln!("skipped: python3 not available for the fake LiveKit");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let st = state().await;
+        let runs = dir.path().join("runs");
+        let body = format!("echo run >> {runs}\nif [ $(wc -l < {runs}) -le 4 ]; then exit 1; fi\n{}", SERVE_OK.replace("SECS", "60"), runs = runs.display());
+        let backoff = (Duration::from_millis(1500), Duration::from_millis(1500));
+        let (log, said) = captured();
+        let managed = spawn_supervised(&st, dir.path(), &script(dir.path(), &body), Duration::from_secs(10), backoff).await;
+        assert_eq!(status(&st).await, VoiceStatus { phase: VoicePhase::Starting, reason: Reason::Exited, bundled: true });
+        assert_eq!(get(&st, "livekit_url").await, None, "nothing is advertised meanwhile");
+        let mut seen = std::collections::HashSet::new();
+        let up = async {
+            while status(&st).await.phase != VoicePhase::On {
+                seen.insert(status(&st).await.phase.as_str());
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(60), up).await.expect("the supervisor tried again by itself");
+        assert!(seen.contains("off"), "after a few failures it says off, not starting: {seen:?}");
+        assert_eq!(status(&st).await.reason, Reason::Managed);
+        assert_eq!(get(&st, "livekit_managed").await.as_deref(), Some("1"));
+        drop(log);
+        let log = said();
+        assert!(log.contains("voice disabled") && log.contains("reason=\"exited\""), "{log}");
+        let secret = get(&st, "livekit_api_secret").await.unwrap();
+        assert!(!log.contains(&secret), "no secret in the log");
+        managed.stop(&st).await;
+        assert_eq!(get(&st, "livekit_url").await, None);
+    }
+
+    /// Clearing a saved call server starts the bundled one, without a restart and with its own
+    /// credentials — and it is never advertised over one that is saved while it starts.
+    #[tokio::test]
+    async fn clearing_the_saved_call_server_starts_the_bundled_one() {
+        if !has_python() {
+            eprintln!("skipped: python3 not available for the fake LiveKit");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let st = state().await;
+        for (name, value) in [("livekit_url", "wss://sfu.example.org"), ("livekit_api_key", "theirkey"), ("livekit_api_secret", "theirsecret")] {
+            put(&st.db, name, value).await.unwrap();
+        }
+        let bin = script(dir.path(), &SERVE_OK.replace("SECS", "60"));
+        let managed = spawn_with(&st, dir.path(), &bin, Duration::from_secs(10)).await;
+        assert_eq!(status(&st).await.reason, Reason::External);
+        clear(&st, &["livekit_url", "livekit_api_key", "livekit_api_secret"]).await; // (the endpoint)
+        st.voice.settings_changed();
+        let up = async {
+            while status(&st).await.reason != Reason::Managed {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        };
+        tokio::time::timeout(Duration::from_secs(30), up).await.expect("started without a restart");
+        assert_ne!(get(&st, "livekit_api_key").await.as_deref(), Some("theirkey"));
+        assert!(!std::fs::read_to_string(dir.path().join("livekit.yaml")).unwrap().contains("theirsecret"));
+        managed.stop(&st).await;
+
+        // Saved while the bundled one was starting: theirs stands.
+        let slow = script(dir.path(), &format!("sleep 1\n{}", SERVE_OK.replace("SECS", "60")));
+        let (a, b) = (st.clone(), dir.path().to_path_buf());
+        let starting = tokio::spawn(async move { spawn_with(&a, &b, &slow, Duration::from_secs(10)).await });
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        put(&st.db, "livekit_url", "wss://sfu.example.org").await.unwrap();
+        let managed = starting.await.unwrap();
+        assert_eq!(get(&st, "livekit_url").await.as_deref(), Some("wss://sfu.example.org"));
+        assert_eq!(status(&st).await.reason, Reason::External);
+        managed.stop(&st).await;
     }
 
     #[tokio::test]
@@ -452,7 +839,7 @@ s.serve_forever()
         let dir = tempfile::tempdir().unwrap();
         let st = state().await;
         let bin = script(dir.path(), &SERVE_OK.replace("SECS", "2.5"));
-        let managed = spawn_with(&st, dir.path(), &bin, Duration::from_secs(10)).await.expect("verified child");
+        let managed = spawn_with(&st, dir.path(), &bin, Duration::from_secs(10)).await;
         let url = get(&st, "livekit_url").await.expect("advertised after verification");
         let port = get(&st, "livekit_signal_port").await.unwrap();
         assert_eq!(url, format!("ws://127.0.0.1:{port}"));
@@ -490,7 +877,7 @@ s.serve_forever()
         let body = format!("echo run >> {}\n{}", runs.display(), SERVE_OK.replace("SECS", "4"));
         let bin = script(dir.path(), &body);
         let backoff = (Duration::from_millis(300), Duration::from_millis(600));
-        let managed = spawn_supervised(&st, dir.path(), &bin, Duration::from_secs(10), backoff).await.expect("verified child");
+        let managed = spawn_supervised(&st, dir.path(), &bin, Duration::from_secs(10), backoff).await;
         assert!(get(&st, "livekit_url").await.is_some());
         let count = || std::fs::read_to_string(&runs).map(|s| s.lines().count()).unwrap_or(0);
         assert_eq!(count(), 1);

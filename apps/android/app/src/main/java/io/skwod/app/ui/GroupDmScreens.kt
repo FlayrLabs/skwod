@@ -75,7 +75,7 @@ fun GroupPickerDialog(title: String, confirm: String, fixed: List<String>, onCan
                             Checkbox(on, onCheckedChange = null, enabled = on || total < GroupRules.MAX_OTHERS)
                             Spacer(Modifier.width(10.dp))
                             Text(shown.name, color = if (shown.strong) Color(0xFFF87171) else Color.White, maxLines = 1)
-                            NameTrustMark(shown)
+                            NameTrustMark(shown, words = true)
                         }
                     }
                 }
@@ -152,7 +152,7 @@ fun GroupPeopleDialog(group: GroupConversation, onClose: () -> Unit) {
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 AvatarImage(AvatarStore.userKey(id), shown.name, size = 30); Spacer(Modifier.width(10.dp))
                                 Text(shown.name, color = if (shown.strong) Color(0xFFF87171) else Color.White, maxLines = 1)
-                                NameTrustMark(shown)
+                                NameTrustMark(shown, words = true)
                             }
                             shown.warning?.let { (text, strong) ->
                                 Text(text, color = if (strong) Color(0xFFF87171) else Color(0xFFFFA726), style = MaterialTheme.typography.labelSmall)
@@ -227,7 +227,7 @@ fun GroupInviteDialog(invitation: GroupConversation, onClose: () -> Unit, onJoin
                             Row(verticalAlignment = Alignment.CenterVertically) {
                                 AvatarImage(AvatarStore.userKey(id), shown.name, size = 28); Spacer(Modifier.width(10.dp))
                                 Text(shown.name, color = if (shown.strong) Color(0xFFF87171) else Color.White, maxLines = 1)
-                                NameTrustMark(shown)
+                                NameTrustMark(shown, words = true)
                             }
                             shown.warning?.let { (text, strong) ->
                                 Text(text, color = if (strong) Color(0xFFF87171) else Color(0xFFFFA726), style = MaterialTheme.typography.labelSmall)

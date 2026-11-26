@@ -15,9 +15,9 @@ name = "skwod_core"
 workspace = true
 
 [dependencies]
-skwod-crypto = { path = "../skwod-crypto", version = "0.50.0" }
-skwod-sync = { path = "../skwod-sync", version = "0.50.0" }
-skwod-net = { path = "../skwod-net", version = "0.50.0" }   # p2p transport (iroh): host addressed by its key
+skwod-crypto = { path = "../skwod-crypto", version = "0.51.0" }
+skwod-sync = { path = "../skwod-sync", version = "0.51.0" }
+skwod-net = { path = "../skwod-net", version = "0.51.0" }   # p2p transport (iroh): host addressed by its key
 uniffi = { version = "0.28", features = ["tokio", "cli"] }
 tokio = { version = "1", features = ["sync", "rt-multi-thread", "time"] }
 thiserror = "1"
@@ -35,6 +35,10 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 futures-util = "0.3"
 tokio-tungstenite = "0.24"
+# tests/dead_sockets.rs: the runtime the exported async functions really run on, and the DHT client.
+async-compat = "0.2"
+futures = "0.3"
+n0-mainline = "=0.7.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }   # examples: RUST_LOG=… for transport debugging
 
 [[bin]]

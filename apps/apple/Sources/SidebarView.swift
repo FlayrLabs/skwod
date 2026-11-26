@@ -78,16 +78,19 @@ struct SidebarView: View {
     /// Voice row tapped: ask the server whether voice is set up, then route — configured opens the
     /// call view; otherwise the host gets the setup panel and everyone else a "ask the host" note.
     private func handleVoiceTap() async {
-        guard let client = app.client else { return }
+        guard let client = app.client, let asked = app.bindTicket() else { return }
+        let serverId = chat.currentServer?.serverId
         voiceChecking = true
         defer { voiceChecking = false }
-        let cfg = try? await client.voiceConfig()
-        if cfg?.configured == true {
-            if let serverId = chat.currentServer?.serverId { app.activeCall = CallTarget(serverId: serverId) }
-        } else if await isInstanceOwner() {
-            showVoiceSetup = true
-        } else {
-            voiceNote = "Voice & video isn't set up on this Skwod yet. Ask the host to turn it on."
+        let cfg: VoiceConfig
+        // A host that did not answer says nothing about voice (it used to open the setup panel).
+        do { cfg = try await client.voiceConfig() } catch { voiceNote = VoiceFailure(error).message; return }
+        let owner = cfg.configured || cfg.bundled ? false : await isInstanceOwner()
+        guard app.holds(asked) else { return }   // (another skwod meanwhile)
+        switch VoiceGate.decide(configured: cfg.configured, status: cfg.status, bundled: cfg.bundled, owner: owner) {
+        case .join: if let serverId { app.activeCall = CallTarget(serverId: serverId) }
+        case .setUp: showVoiceSetup = true
+        case .say(let text): voiceNote = text
         }
     }
 
@@ -96,7 +99,7 @@ struct SidebarView: View {
         guard let token = app.session?.token, let base = URL(string: app.serverURL) else { return false }
         var req = URLRequest(url: base.appendingPathComponent("api/auth/users"))
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        let code = ((try? await URLSession.shared.data(for: req))?.1 as? HTTPURLResponse)?.statusCode ?? 0
+        let code = ((try? await RawSink.data(for: req))?.1 as? HTTPURLResponse)?.statusCode ?? 0
         return code == 200
     }
 
@@ -112,7 +115,7 @@ struct SidebarView: View {
         HoverBar(highlights: false) {
             HStack(spacing: 6) {
                 if chat.inChannelsMode {
-                    Button { chat.showServerBoxes(chat.currentServer?.serverId) } label: {
+                    Button { chat.showServers() } label: {
                         Image(systemName: "chevron.left").font(.system(size: 13, weight: .bold))
                             .foregroundStyle(Color(white: 0.71))
                     }
@@ -305,28 +308,19 @@ struct SidebarView: View {
                         Button { showRestoreBackup = true } label: {
                             Label("Restore from key backup", systemImage: "key.horizontal.fill").font(.caption)
                         }
-                        .buttonStyle(.plain).foregroundStyle(.skAccent)
+                        .buttonStyle(.plain).foregroundStyle(.secondary)
                         .padding(.horizontal, 12).padding(.vertical, 2)
                     } else {
-                        Text("No servers yet — create one or join with an invite.")
-                            .font(.caption).foregroundStyle(.secondary)
-                            .padding(.horizontal, 12).padding(.vertical, 6)
-                        // Still reachable after the provisioning wait gives up — a returning member
-                        // with a passphrase backup shouldn't lose the door once the spinner ends.
-                        Button { showRestoreBackup = true } label: {
-                            Label("Restore from key backup", systemImage: "key.horizontal.fill").font(.caption)
-                        }
-                        .buttonStyle(.plain).foregroundStyle(.skAccent)
-                        .padding(.horizontal, 12).padding(.vertical, 2)
+                        ServersEmptyNote(chat: chat) { showRestoreBackup = true }
                     }
                 } else {
-                    Button { chat.showServerBoxes(nil) } label: {
+                    Button { chat.showServers() } label: {
                         ServerListRow(name: "All channels", channels: chat.spaces.count,
-                                      selected: chat.railServerId == nil && chat.selection == nil, glyph: "square.grid.2x2")
+                                      selected: chat.overview && chat.selection == nil, glyph: "square.grid.2x2")
                     }
                     .buttonStyle(.plain)
                     ForEach(chat.serverGroups) { g in
-                        Button { chat.showServerBoxes(g.serverId) } label: {
+                        Button { chat.openServer(g) } label: {
                             ServerListRow(name: g.name, channels: g.channels.count, selected: chat.isServerActive(g),
                                           inVoice: app.voiceRoster.count(serverId: g.serverId, hidden: BlockList.shared.ids))
                         }
@@ -404,7 +398,7 @@ struct SidebarView: View {
                         Button { chat.selection = .dm(d) } label: {
                             DMRow(name: app.contacts.display(d.peerUserId, claimedName: d.name).label(for: .dmRow), selected: chat.selection == .dm(d),
                                   badge: app.contacts.display(d.peerUserId, claimedName: d.name).badge,
-                                  status: app.realtime.status(userId: d.peerUserId),
+                                  status: app.realtime.dot(userId: d.peerUserId),
                                   peerUserId: d.peerUserId)
                         }
                         .buttonStyle(.plain)
@@ -759,7 +753,7 @@ struct ServerSettingsSheet: View {
                     }
 
                     if isOwner {
-                        accountsCard
+                        VoiceServerCard { accountsCard }
                         Button(role: .destructive) { confirmClearServer = true } label: {
                             HStack(spacing: 6) {
                                 if clearingServer { ProgressView().controlSize(.small) }
@@ -928,7 +922,7 @@ struct ServerSettingsSheet: View {
         guard let token = app.session?.token, let base = URL(string: app.serverURL) else { return }
         var req = URLRequest(url: base.appendingPathComponent("api/auth/users"))
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+        guard let (data, resp) = try? await RawSink.data(for: req),
               (resp as? HTTPURLResponse)?.statusCode == 200,
               let parsed = try? JSONDecoder().decode(AccountList.self, from: data) else {
             isOwner = false
@@ -944,7 +938,7 @@ struct ServerSettingsSheet: View {
         guard let token = app.session?.token, let base = URL(string: app.serverURL) else { return }
         var req = URLRequest(url: base.appendingPathComponent("api/instance/server-creators"))
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+        guard let (data, resp) = try? await RawSink.data(for: req),
               (resp as? HTTPURLResponse)?.statusCode == 200,
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               let list = obj["creators"] as? [[String: Any]] else { return }
@@ -956,7 +950,7 @@ struct ServerSettingsSheet: View {
         var req = URLRequest(url: base.appendingPathComponent("api/instance/server-creators/\(a.userId)"))
         req.httpMethod = grant ? "PUT" : "DELETE"
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        let code = ((try? await URLSession.shared.data(for: req))?.1 as? HTTPURLResponse)?.statusCode ?? 0
+        let code = ((try? await RawSink.data(for: req))?.1 as? HTTPURLResponse)?.statusCode ?? 0
         if code == 200 { if grant { creators.insert(a.userId) } else { creators.remove(a.userId) } }
         else { status = "Couldn't change that grant." }
     }

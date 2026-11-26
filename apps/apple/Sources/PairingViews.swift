@@ -169,7 +169,7 @@ struct AddDeviceSheet: View {
         guard let token = app.session?.token, let base = URL(string: app.serverURL), !app.serverURL.isEmpty else { return nil }
         var req = URLRequest(url: base.appendingPathComponent("api/auth/me")); req.timeoutInterval = 10
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+        guard let (data, resp) = try? await RawSink.data(for: req),
               (resp as? HTTPURLResponse)?.statusCode == 200,
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return nil }
         return obj["username"] as? String

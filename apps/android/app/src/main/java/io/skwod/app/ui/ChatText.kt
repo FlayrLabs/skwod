@@ -478,11 +478,25 @@ fun chipMark(shown: ContactTrust.Shown): String = when {
  * The mark that goes next to a person's name wherever one is shown: a badge for a contact whose
  * safety number the user verified, a quiet "unverified" for a name that is only the server's
  * word, and a loud warning for a name that reads like someone the user knows but is a different
- * account. A name the user pinned themself (KNOWN) carries no mark.
+ * account. A name the user pinned themself (KNOWN) carries no mark. In rows a name the directory
+ * has not answered about yet — every member's, on a newly linked device — is a quiet symbol that
+ * explains itself ([ContactTrust.quiet]); [words]: screens where one decides about people.
  */
 @Composable
-fun NameTrustMark(shown: ContactTrust.Shown) {
+fun NameTrustMark(shown: ContactTrust.Shown, words: Boolean = false, onVerify: (() -> Unit)? = null) {
     when {
+        ContactTrust.quiet(shown, words) -> {
+            var explaining by remember { mutableStateOf(false) }
+            Spacer(Modifier.width(6.dp))
+            Text("?", color = Color.White.copy(alpha = 0.45f), fontSize = 11.sp,
+                modifier = Modifier.clickable { explaining = true }.padding(horizontal = 4.dp)
+                    .semantics { contentDescription = "Name not confirmed yet" })
+            if (explaining) AlertDialog(
+                onDismissRequest = { explaining = false },
+                confirmButton = { TextButton(onClick = { explaining = false }) { Text("OK") } },
+                dismissButton = { if (onVerify != null) TextButton(onClick = { explaining = false; onVerify() }) { Text("Verify safety number") } },
+                text = { Text(shown.warning?.first ?: "") })
+        }
         // Strong flags (impersonation, unusual characters, name doesn't match) in red; "couldn't check" in amber.
         shown.flag != ContactTrust.Flag.NONE -> {
             Spacer(Modifier.width(6.dp))

@@ -90,10 +90,18 @@ Each of these uses audited RustCrypto / dalek crates and is small on purpose.
 
 All **pairwise** traffic — direct messages, sender-key distributions, space keys, provisioning,
 voice keys, device-sibling updates — is sealed-sender encrypted per recipient device and deposited
-in that device's **sealed mailbox**. The deposit request carries no credentials and is made on a
-separate connection that never carries the account token; authorization is the recipient's
-*delivery key*, which the server hands out only with that device's directory entry (i.e. to accounts
-allowed to contact it). The mailbox table has no sender column.
+in that device's **sealed mailbox**. The deposit request carries no credentials (no Authorization
+header, and the loopback front injects none); authorization is the recipient's *delivery key*,
+which the server hands out only with that device's directory entry (i.e. to accounts allowed to
+contact it). The mailbox table has no sender column.
+
+**Known gap (tracked for build 52, `docs/ROADMAP.md`):** the deposit is NOT made on a separate
+network connection. Over https it is a separate HTTP request but may reuse the same TLS
+connection; through p2p it travels over the SAME authenticated member connection (one iroh
+connection per device and host) as this device's signed-in requests. A host that wants to can
+therefore link a deposit to the depositing device by connection, and from there to its account —
+what sealed sender hides from the *message store* is visible in the host's transport layer. The
+recipient-side guarantees (no sender column, no sender in the stored ciphertext) are unaffected.
 
 Sender certificates are libsignal `SenderCertificate`s (6 h — `CERTIFICATE_TTL_MS` in `server/src/keydir.rs`; a removed device can deposit "as" its account for at most that long) issued by the host server. Their
 trust root is signed by the server's Ed25519 instance key — the key the invite pins — so the
@@ -439,6 +447,163 @@ request, and every filing is announced to every device. The owner completes the 
 approving it on a current device, with the PIN, or with the recovery key; an owner with none of
 the three and an attacker who keeps filing has no way back but changing the password (which ends
 the attacker's sessions).
+
+## When a session ends, and when it does not (build 51)
+
+The app drops its stored token only when the HOST refused the CURRENT token, twice, and what was
+asked is still what is bound and stored (`session_check`, `SignOutRule`). A refusal of this device's
+own front — a credential that was replaced, a front that is suspect or re-keyed — is a local error
+(`SignInReplaced`; over the port a 503 with `x-skwod-front`, which is stripped from anything a host
+answers): never forwarded without an Authorization, so it can never come back as the host's 401.
+The host is told a session is over only by a sign-out, the removal of an entry or the account's end —
+not when a skwod moves to another address, its host changes, or relays cannot be confirmed off
+(`SessionEnd`); and not while another entry of the device uses the same session.
+
+**Rotation.** `POST /api/auth/rotate` supersedes the old token (5 minutes of grace, no sliding) and
+issues a new one. Its answer can be lost. The client therefore makes a random *rotation key*, stores
+it before asking, and sends it along; within the grace — never extended — the old token may be
+rotated again by whoever presents the same key, as long as the token issued in its place has not been
+used. That one was never held by anybody and is deleted. What somebody holding a copy of the *old
+token* gains: nothing. Before the owner rotates, a stolen token can be rotated by the thief, as it
+always could (the owner then finds the session ended). After, it is refused for rotation, as it always
+was: the key was never on the wire before that request and is not derivable from the token. Somebody
+who holds the token AND the key has read this device's secure storage. Older hosts ignore the key
+(and refuse, as before); older apps send none (and are refused a second rotation, as before).
+*Residual:* when the answer is lost and the client never asks again within the grace (the app stays
+suspended), the session is lost — the user logs in again with the password — and the token nobody
+holds stays valid, unknown to anyone, until its own idle expiry (30 days). It cannot be dropped with
+the grace: the host cannot tell it from one that was stored and not yet used.
+
+## Turning relays off (build 51)
+
+A member endpoint that may use public relays exists only under a **lease**
+(`core/skwod-net/src/relay_gate.rs`): taken from the process's one relay gate before the endpoint
+is bound, and given back only when its close has *finished* (a close that hangs keeps it; a dropped
+dial, member or session is closed in the background and keeps it until then). One task per endpoint
+owns the lease and the close, and nothing can drop that task, so there is nothing to keep lists of.
+Off means: no lease is given any more, every lease is revoked (dials, voice hand-shakes and
+registrations in progress stop; endpoints start closing), and success is reported only when not one
+lease is left — otherwise the app disconnects every session and says so. The gate starts closed in
+every process (the app, the notification extension) until the stored setting has been applied. It
+is per process: a notification extension already running when the setting changes finishes under
+the setting it started with (seconds). A *host's* own endpoint is the server process's
+`--public-fallback`, not under this gate.
+
+**Remembered routes** (`core/skwod-net/src/routes.rs`). With relays off a member first tries where it
+last reached the host directly. Such an address comes from the selected, non-relay path of a
+connection whose TLS proved the host's key — never from anything the host says; at most four; global
+ones only from sessions without relays, for 3 days. Everything but RFC 1918 / unique local addresses
+(port 1024 and up) and globally routable ones is refused. A private one is kept with the member's own
+address at the time (IPv4 exactly, IPv6 its /64), for 14 days, and tried only while the system's own
+address towards it is still that one: not on another network, a VPN or a mobile network, and not on a
+look-alike network with the same subnet unless it also gave this device the same address. What such a
+first packet carries: the protocol name `skwod/1` (QUIC Initial keys are public) and the sender's address
+and port, not the host's node id (iroh sends no SNI) and not who we are (our certificate goes out only
+after the host's key is proved). They are kept in the device-only Keychain / the encrypted store, with the workspace, deleted
+on sign-out, removal and erase, and are in no backup, log, link or sync. Turning relays off revokes
+first; the routes are read afterwards, from a sample already taken. *Residual:* a host can have its
+members send a few packets to addresses it names, as with any iroh host: its NAT-traversal candidates
+over a live connection are not filtered (its DHT record is, to globally routable addresses). And a host
+that held an address for a while can give it up: whoever has it next may receive a first packet.
+
+## The loopback front and other local processes (build 51)
+
+A p2p skwod is reached through a **front**: a small HTTP proxy inside the app process at
+`http://127.0.0.1:<port>/<128-bit secret>` (`skwod-net/src/proxy.rs`), which carries every request
+over the iroh connection to the host. Every other program on the same device can reach
+127.0.0.1, so the front is designed on the assumption that a local process may probe it, flood
+it, or sit on its port the moment the app lets go of it.
+
+**One front per (host, account), for the life of the process.** Its port and base URL do not
+change when the connection to the host dies (they change only when the front re-keys, below): the core dials a fresh endpoint and swaps it in
+behind the same front (`P2pSession.reconnect`). Streams already open on the old connection finish
+or fail there; the front never replays one (a repeated channel send is deduplicated by the host by
+its message id). Replacements are paced (at least 10 s apart after one that worked, 5 s doubling
+to 60 s after failures); a relay-setting change is not paced, and turning relays **off** closes
+every relay-capable connection at once (current and draining) — the front forwards nothing until
+a compliant connection exists (fail closed).
+
+**The session token is never sent to the loopback port.** The core keeps the token per front and sets it only
+on an explicit sign-in (`P2pSession.sign_in`, `rotate_token`, pairing) — never as a side effect of
+building a client. Sign-in hands out an opaque random credential `front-<128 bits>`; the app's
+core client, its own HTTP and WebSocket code all present only `Authorization: Bearer front-…`, and
+the front replaces exactly that credential with the token on its way to the host. The core's
+own API requests (log-in and sign-up with their passwords, pairing, everything JSON) do not use
+the loopback port at all: they go to the host in process over the member connection (with the
+same proof-of-work stamps). What still crosses loopback: the app's own HTTP and WebSocket
+requests (carrying only the credential), blob transfers of the core (credential only), and the
+LiveKit SDK's traffic (below). Any other
+`Authorization` a client sends is refused; so is an unknown, guessed, older or signed-out credential
+(never forwarded without one). **Injection is opt-in**: a request with no `Authorization` gets none — sealed-sender
+deposits (the core's anonymous client) stay anonymous. A client of a front never holds the real
+token; proofs that hash it resolve it in process. Logout and push unregister go over the member
+connection directly, not through the port, and logout clears the token (and the voice bearer)
+before it returns. Sign-in, rotate, logout, clear and a re-key are serialized: a re-key never
+re-arms a session a sign-out ended.
+
+**What a local process can and cannot do.**
+
+- *Guess or flood.* A connection must name the secret in its first request line within 3 s (1 s
+  when the waiting queue is three-quarters full) or it is closed; it is matched byte by byte as
+  it arrives and closed at the first byte that cannot start `METHOD /<secret>` (an oversized line
+  gets 431). At most 64 connections may wait to name the secret; a newcomer always gets in,
+  evicting the oldest idle one, else the oldest still-incomplete one. Only connections that named
+  the secret count against the 256-connection cap. A refused or evicted connection, an EOF, a
+  reset or an unanswered challenge is never a verdict on the port (it is "slow", and retried).
+- *Sit on the port.* A port the front holds is never released while the process lives; only the
+  OS can take it away (iOS reclaims a suspended app's sockets). When the front moves to another
+  port (a re-key it could not prove in place), the old listener is **parked**, not closed: it stays
+  bound for the life of the process and answers every connection with the same 404 and a close
+  (reading nothing; at most 8 at a time, the rest are dropped), so nothing else can bind it and
+  catch what a stale client still sends there. At most 16 are parked; past that a front that would
+  have to move stays distrusted and forwards nothing instead. A listener whose port can be bound
+  again holds nothing (the OS took it) and is not parked. (A front that is shut down — sign-out,
+  leaving the skwod — retires its URL first and then lets the port go.) The in-process liveness
+  challenge is recognised, once, by its exact (own address, front address) pair, registered before
+  it connects, and never waits in the pre-auth queue: a flood can neither evict nor delay it. A proof
+  that fails — in any check — makes the front SUSPECT at once. A running call may only DELAY the
+  re-key of a front that did not answer (it stays suspect and is asked again); a port that answers
+  as not ours, or a listener that is gone, is re-keyed at once, call or no call. Back in front,
+  every front is suspect until proved except the one carrying a connected call with live audio,
+  which is challenged at once. Going to the background the app
+  marks the front SUSPECT (`P2pSession.suspend`), and so does a listener failure: the core then
+  sends nothing to it — log-in and sign-up included — and the app sends nothing either, until
+  `ensure_front` (the first thing it does on becoming active) proves it ours **in process**:
+  accept-loop state plus a one-time nonce that must reach this front's own handler (a reply from
+  whatever listens on the port proves nothing). Until proved, the front is *unverified* and
+  forwards and injects nothing; once a port answered as NOT ours, no later challenge restores
+  trust (sticky) — only a re-key does. A front not proved ours **re-keys**: always a new secret
+  and a new credential, the old URL retired first; in place on the port it still holds when the
+  challenge was merely unanswered (busy, flooded), else listening again on the same port if it can
+  be had. Nothing is ever sent to a loopback URL that has a front's shape but is not a live front.
+- *What a squatter could receive* if it took a reclaimed port: nothing from the core (suspect), at
+  most an app request racing the suspend (an opaque credential — useless elsewhere and dead after
+  the re-key — and the old secret, dead too). It cannot obtain the session token or a password.
+- *LiveKit.* The LiveKit room JWT (a separate, short-lived, room-scoped credential minted by the
+  host) is still handed to the LiveKit SDK, which sends it to the front's `/lk` URL. It is protected
+  by the front's port never being released while the process holds it; if the OS reclaims the
+  listener during a call and another process takes the port before the re-listen, the SDK's
+  reconnect could hand that process the JWT (room-scoped, short-lived) until the call is
+  re-joined. Voice media authorization uses the session's own token, read in the core — never one
+  handed in by the app — and none after a sign-out. Not substituted in the
+  front: the SDK's own token handling is not ours to rewrite, and could not be verified without
+  call tests.
+
+**Retries never double a message.** A channel send that failed mid-swap and is retried by the
+outbox carries the same message id; the host answers `duplicate: true` for its own repeat
+(`server/src/messages.rs`, `send_message`; tested in `server/src/content_tests.rs`).
+
+**Residuals (not covered by the front).**
+
+- *The macOS host talking to its own local server.* The Mac app that hosts a skwod reaches its own
+  server child over plain `http://127.0.0.1:<port>` with the session token in the header (no p2p
+  front: it is the same machine). That token does cross loopback, and a local process able to sit on
+  that port while the server is down could receive it. The server proves its pinned key before the
+  app sends anything (`HostManager.gatedBase`); the token is the owner's own session on their own
+  host.
+- *The iOS notification extension.* It runs in its own process and makes its own p2p connection
+  when it decrypts a push; its front lives only for that short run and follows the same rules, but
+  it is a separate front with its own port.
 
 ## Voice / video
 

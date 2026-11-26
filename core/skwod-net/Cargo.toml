@@ -29,6 +29,7 @@ base64 = "0.22"
 sha2 = "0.10"   # proof-of-work stamps for unauthenticated first contact
 serde_json = "1"
 thiserror = "1"
+futures-util = { version = "0.3", default-features = false, features = ["std"] }   # the stream of a wrapped address lookup
 tracing = "0.1"
 
 [dev-dependencies]

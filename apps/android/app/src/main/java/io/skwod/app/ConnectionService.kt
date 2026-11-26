@@ -162,6 +162,8 @@ class NotificationActionReceiver : BroadcastReceiver() {
 /** Whether a call is up, and a way for the notification's hang-up button to end it. */
 object CallState {
     val active = androidx.compose.runtime.mutableStateOf(false)
+    /** The workspace whose front carries the connected call. */
+    @Volatile var workspace: String? = null
     val hangupRequests = androidx.compose.runtime.mutableIntStateOf(0)
     fun requestHangup() { hangupRequests.intValue = hangupRequests.intValue + 1 }
     /**

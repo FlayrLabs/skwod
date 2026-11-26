@@ -221,7 +221,7 @@ impl SkwodClient {
         // Where does the server stand? (A blob it no longer has is simply started again.)
         let mut offset = 0u64;
         if let Some(id) = state.blob_id.clone() {
-            match self.api.blob_offset(&id).await {
+            match self.api().blob_offset(&id).await {
                 Ok((_, true)) => {
                     state.done = true;
                     state.sent = state.total;
@@ -240,7 +240,7 @@ impl SkwodClient {
                 if let Some(h) = &state.token_hash {
                     body["download_token_hash"] = serde_json::json!(h);
                 }
-                let created = self.api.post("/api/blobs", body).await?;
+                let created = self.api().post("/api/blobs", body).await?;
                 let id = created["blob_id"].as_str().ok_or(EngineError::Protocol("no blob_id"))?.to_string();
                 // The server chooses this string. It is only ever accepted as a plain UUID —
                 // before it is stored, used in a path, or named in a message.
@@ -268,7 +268,7 @@ impl SkwodClient {
                 tokio::task::spawn_blocking(move || read_chunk(&path, offset, len)).await.map_err(|_| EngineError::Protocol("upload interrupted"))?
             }
             .map_err(|_| EngineError::Protocol("that attachment is no longer on this device; attach it again"))?;
-            match self.api.blob_chunk(&blob_id, offset, chunk).await? {
+            match self.api().blob_chunk(&blob_id, offset, chunk).await? {
                 ChunkOutcome::Accepted { offset: at, complete } => {
                     offset = at.min(state.total);
                     state.sent = offset;
@@ -402,7 +402,7 @@ impl SkwodClient {
         }
         if delete_blob {
             if let Some(blob_id) = self.upload_state(&upload_id).and_then(|s| s.blob_id) {
-                let _ = self.api.blob_delete(&blob_id).await; // refuses anything but a UUID
+                let _ = self.api().blob_delete(&blob_id).await; // refuses anything but a UUID
             }
         }
         self.forget_uploads(&[upload_id]);

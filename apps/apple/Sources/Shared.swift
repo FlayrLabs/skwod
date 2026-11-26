@@ -135,163 +135,17 @@ enum SharedContainer {
     }()
 }
 
-/// One process at a time may hold the encrypted cache open: it carries the Signal session state,
-/// and two processes advancing the same ratchet would corrupt it.
-///
-/// - The APP must actually HOLD this lock before it opens a cache (`holdForApp`). If the
-///   notification extension has it, the app asks it to yield and waits; it never opens the
-///   cache without the lock.
-/// - The EXTENSION only ever tries (`tryAcquire`) and gives up at once if the app has it. While
-///   it holds the lock it watches for the app's yield request (`onYield` / `yieldRequested`):
-///   it stops what it is doing, lets go of its client, and releases.
-///
-/// The lock is an advisory `flock` on a file in the shared container; the yield request is a
-/// marker file beside it plus a Darwin notification (so a waiting extension reacts at once and
-/// one that missed the notification still sees the marker between steps).
-final class StoreLock {
-    static let shared = StoreLock()
-    static let yieldNotification = "io.skwod.store.yield"
+extension CacheLease: StoreLease {}
 
-    private var fd: Int32 = -1
-    private let queue = DispatchQueue(label: "io.skwod.storelock")
-    private var yieldHandler: (() -> Void)?
-    private var observing = false
-    /// Overrides where the lock lives (DEBUG checks on builds with no shared container).
-    var directoryOverride: URL?
-
-    init() {}
-
-    private var directory: URL? { directoryOverride ?? SharedContainer.groupURL }
-    private var path: String? { directory?.appendingPathComponent("store.lock").path }
-    private var yieldPath: String? { directory?.appendingPathComponent("store.yield").path }
-
-    /// Whether this process holds the lock right now. True when there is no shared container:
-    /// no other process can reach the cache then.
-    var isHeld: Bool { queue.sync { path == nil || fd >= 0 } }
-
-    /// One attempt, no waiting. The extension's only way in.
-    func tryAcquire() -> Bool { acquire(timeout: 0) }
-
-    /// Take the lock, waiting up to `timeout` seconds. Returns true if held (or if there is no
-    /// shared container, in which case no other process can touch the cache anyway).
-    @discardableResult
-    func acquire(timeout: TimeInterval = 0) -> Bool {
-        queue.sync {
-            guard let path else { return true }
-            if fd >= 0 { return true }
-            let handle = open(path, O_CREAT | O_RDWR, 0o600)
-            guard handle >= 0 else { return false }
-            let deadline = Date().addingTimeInterval(timeout)
-            while true {
-                if flock(handle, LOCK_EX | LOCK_NB) == 0 { fd = handle; return true }
-                if Date() >= deadline { close(handle); return false }
-                usleep(100_000)
-            }
-        }
-    }
-
-    func release() {
-        queue.sync {
-            guard fd >= 0 else { return }
-            flock(fd, LOCK_UN)
-            close(fd)
-            fd = -1
-        }
-    }
-
-    // MARK: The app's side
-
-    /// Hold the lock for the app, asking the extension to yield for as long as it takes (up to
-    /// `maxWait` — longer than the system ever lets an extension run). Returns whether the lock
-    /// is held; the caller opens a cache ONLY on true.
-    func holdForApp(maxWait: TimeInterval = 40) async -> Bool {
-        if acquire(timeout: 0) { clearYieldRequest(); return true }
-        let deadline = Date().addingTimeInterval(maxWait)
-        StoreLockTrace.note("app_wait_started")
-        while Date() < deadline {
-            requestYield()
-            if acquire(timeout: 0.4) {
-                clearYieldRequest()
-                StoreLockTrace.note("app_acquired_after_wait")
-                return true
-            }
-            if Task.isCancelled { break }
-        }
-        return false
-    }
-
-    /// Tell whoever holds the lock that the app needs the cache now.
-    private func requestYield() {
-        guard let yieldPath else { return }
-        if !FileManager.default.fileExists(atPath: yieldPath) {
-            FileManager.default.createFile(atPath: yieldPath, contents: Data(String(Date().timeIntervalSince1970).utf8))
-            StoreLockTrace.note("yield_requested")
-        }
-        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
-                                             CFNotificationName(Self.yieldNotification as CFString), nil, nil, true)
-    }
-
-    private func clearYieldRequest() {
-        if let yieldPath { try? FileManager.default.removeItem(atPath: yieldPath) }
-    }
-
-    // MARK: The extension's side
-
-    /// The app has asked for the cache (a marker younger than a minute — an old one is debris
-    /// of a run that ended, not a request).
-    var yieldRequested: Bool {
-        guard let yieldPath, let text = try? String(contentsOfFile: yieldPath, encoding: .utf8),
-              let at = Double(text) else { return false }
-        return Date().timeIntervalSince1970 - at < 60
-    }
-
-    /// Call `handler` (once, on an arbitrary thread) when the app asks for the cache.
-    func onYield(_ handler: @escaping () -> Void) {
-        queue.sync { yieldHandler = handler }
-        guard !observing else { return }
-        observing = true
-        let observer = Unmanaged.passUnretained(self).toOpaque()
-        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), observer, { _, observer, _, _, _ in
-            guard let observer else { return }
-            Unmanaged<StoreLock>.fromOpaque(observer).takeUnretainedValue().fireYield()
-        }, Self.yieldNotification as CFString, nil, .deliverImmediately)
-    }
-
-    private func fireYield() {
-        let handler: (() -> Void)? = queue.sync {
-            let h = yieldHandler
-            yieldHandler = nil
-            return h
-        }
-        handler?()
-    }
-}
-
-/// Set (from any thread) when the app asks the extension for the cache.
-final class YieldFlag: @unchecked Sendable {
-    private let lock = NSLock()
-    private var value = false
-    var isSet: Bool { lock.lock(); defer { lock.unlock() }; return value }
-    func set() { lock.lock(); value = true; lock.unlock() }
-}
-
-/// Step markers for the lock hand-over (DEBUG checks read them; a no-op otherwise). Never
-/// content — only which step happened and when.
-enum StoreLockTrace {
-    private static let lock = NSLock()
-    private static var events: [(String, Double)] = []
-    static var enabled = false
-
-    static func note(_ step: String) {
-        guard enabled else { return }
-        lock.lock(); defer { lock.unlock() }
-        events.append((step, Date().timeIntervalSince1970))
-    }
-
-    static func snapshot() -> [[String: Any]] {
-        lock.lock(); defer { lock.unlock() }
-        return events.map { ["step": $0.0, "at_ms": Int($0.1 * 1000)] }
-    }
+extension StoreLock {
+    /// This process's lock on the caches in the shared container. Gated in the iOS app only.
+    static let shared: StoreLock = {
+        #if os(iOS) && !SKWOD_EXTENSION
+        return StoreLock(gated: true, directory: { SharedContainer.groupURL })
+        #else
+        return StoreLock(directory: { SharedContainer.groupURL })
+        #endif
+    }()
 }
 
 /// Where a skwod's mutes are kept (`MuteList`): on this device only, in the Keychain — so

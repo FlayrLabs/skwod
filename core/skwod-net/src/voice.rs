@@ -34,6 +34,13 @@ pub struct VoiceStats {
     pub bytes_up: std::sync::atomic::AtomicU64,
     pub packets_down: std::sync::atomic::AtomicU64,
     pub bytes_down: std::sync::atomic::AtomicU64,
+    /// Packets from the host this device refused to hand to the call: the answer could not be sent
+    /// back to the address the call's socket sent from. On Darwin a socket on a POINT-TO-POINT
+    /// interface (cellular, a VPN's utun) can send to `127.0.0.1`, but the reply is routed out of
+    /// that interface and refused there (EADDRNOTAVAIL: 127/8 must not appear on a wire), while a
+    /// Wi-Fi socket's own address is routed through `lo0` and is answered. So `packets_down` alone
+    /// looks healthy.
+    pub undelivered: std::sync::atomic::AtomicU64,
 }
 const MAX_FRAGMENTS: usize = 15;
 const MAX_PARTIAL: usize = 64;
@@ -250,12 +257,31 @@ fn assign_flow(slots: &mut Vec<(SocketAddr, std::time::Instant)>, from: SocketAd
     Some(i as u8)
 }
 
-/// Member side: bind the loopback candidate LiveKit advertises and shuttle packets to the host.
-/// Returns once the socket is bound; the pump runs until the connection closes or the task is aborted.
-pub(crate) async fn start_member(conn: Connection, udp_port: u16, stats: Arc<VoiceStats>) -> std::io::Result<tokio::task::JoinHandle<()>> {
+/// The loopback media port for a forwarder that replaces `old` (listening on `old_port`). A NEW
+/// port is bound before the old forwarder is let go: if it cannot be, the old one stays as it was
+/// (and with it a call in progress). The SAME port can only be bound once the old one released it.
+pub(crate) async fn rebind_member(old: &mut Option<tokio::task::JoinHandle<()>>, old_port: u16, udp_port: u16) -> std::io::Result<UdpSocket> {
+    let bind = || UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], udp_port)));
+    if old.is_some() && old_port != udp_port {
+        let sock = bind().await?;
+        if let Some(task) = old.take() {
+            task.abort();
+            let _ = task.await;
+        }
+        return Ok(sock);
+    }
+    if let Some(task) = old.take() {
+        task.abort();
+        let _ = task.await; // the old forwarder must release the port before we rebind it
+    }
+    bind().await
+}
+
+/// Member side: shuttle packets between the loopback candidate LiveKit advertises (`sock`, from
+/// [`rebind_member`]) and the host. Runs until the connection closes or the task is aborted.
+pub(crate) fn start_member(conn: Connection, sock: UdpSocket, stats: Arc<VoiceStats>) -> tokio::task::JoinHandle<()> {
     use std::sync::atomic::Ordering::Relaxed;
-    let sock = UdpSocket::bind(SocketAddr::from(([127, 0, 0, 1], udp_port))).await?;
-    Ok(tokio::spawn(async move {
+    tokio::spawn(async move {
         let ids = AtomicU16::new(0);
         let mut reasm = Reassembler::default();
         let mut slots: Vec<(SocketAddr, std::time::Instant)> = Vec::new();
@@ -278,13 +304,15 @@ pub(crate) async fn start_member(conn: Connection, udp_port: u16, stats: Arc<Voi
                         if let Some((to, _)) = slots.get(flow as usize) {
                             stats.packets_down.fetch_add(1, Relaxed);
                             stats.bytes_down.fetch_add(packet.len() as u64, Relaxed);
-                            let _ = sock.send_to(&packet, to).await;
+                            if sock.send_to(&packet, to).await.is_err() {
+                                stats.undelivered.fetch_add(1, Relaxed);
+                            }
                         }
                     }
                 }
             }
         }
-    }))
+    })
 }
 
 /// A socket bound to 127.0.0.1 only ever receives packets that originated on this machine (the
@@ -298,6 +326,52 @@ fn is_local_source(_from: &SocketAddr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn free_port() -> u16 {
+        std::net::UdpSocket::bind("127.0.0.1:0").unwrap().local_addr().unwrap().port()
+    }
+
+    fn bound(port: u16) -> bool {
+        std::net::UdpSocket::bind(("127.0.0.1", port)).is_err()
+    }
+
+    /// A forwarder holding `port`, as `start_member`'s task holds its socket.
+    async fn forwarder(port: u16) -> tokio::task::JoinHandle<()> {
+        let sock = UdpSocket::bind(("127.0.0.1", port)).await.unwrap();
+        tokio::spawn(async move {
+            let _sock = sock;
+            std::future::pending::<()>().await
+        })
+    }
+
+    #[tokio::test]
+    async fn a_new_media_port_is_bound_before_the_old_one_is_let_go() {
+        let (a, b) = (free_port(), free_port());
+        // The new port cannot be had: the old forwarder stays, still on its port.
+        let squatter = std::net::UdpSocket::bind(("127.0.0.1", b)).unwrap();
+        let mut old = Some(forwarder(a).await);
+        assert!(rebind_member(&mut old, a, b).await.is_err());
+        assert!(old.as_ref().is_some_and(|t| !t.is_finished()), "the call keeps its forwarder");
+        assert!(bound(a));
+        drop(squatter);
+        // It can: bound, then the old one is let go.
+        let sock = rebind_member(&mut old, a, b).await.unwrap();
+        assert_eq!(sock.local_addr().unwrap().port(), b);
+        assert!(old.is_none());
+        assert!(!bound(a), "the old port is free");
+    }
+
+    #[tokio::test]
+    async fn the_same_media_port_is_bound_again_once_the_old_forwarder_let_go() {
+        let a = free_port();
+        let mut old = Some(forwarder(a).await);
+        let sock = rebind_member(&mut old, a, a).await.expect("released first, then bound");
+        assert_eq!(sock.local_addr().unwrap().port(), a);
+        assert!(old.is_none());
+        let mut none = None;
+        let other = free_port();
+        assert_eq!(rebind_member(&mut none, 0, other).await.unwrap().local_addr().unwrap().port(), other);
+    }
 
     #[test]
     fn flow_slots_are_recycled_only_when_idle() {

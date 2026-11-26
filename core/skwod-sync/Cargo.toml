@@ -10,7 +10,7 @@ rust-version.workspace = true
 workspace = true
 
 [dependencies]
-skwod-crypto = { path = "../skwod-crypto", version = "0.50.0" }
+skwod-crypto = { path = "../skwod-crypto", version = "0.51.0" }
 # SQLCipher-encrypted local store (the on-device message cache). Vendored so iOS/Android
 # cross-builds don't depend on a system OpenSSL.
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }

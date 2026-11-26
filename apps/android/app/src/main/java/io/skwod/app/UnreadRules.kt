@@ -32,6 +32,19 @@ object UnreadRule {
     fun counts(item: UnreadItem) = !item.mine && !item.system
 
     /** Index of the first unread row, or null. No marker (never opened here) = nothing unread. */
+    /**
+     * Build 51: what was unread when the conversation was OPENED — against the marker as it was
+     * then, counting only rows written before that moment. Rows a catch-up brings in after the list
+     * was already showing (a cold launch opens on the cache first) belong to the bar and the
+     * divider, not to "read on arrival". (first index, count), or null.
+     */
+    fun atOpen(items: List<UnreadItem>, markerAtOpen: ReadMarker?, openedAt: Long): Pair<Int, Int>? {
+        val before = items.withIndex().filter { it.value.createdAt <= openedAt }
+        val rows = before.map { it.value }
+        val first = firstUnreadIndex(rows, markerAtOpen) ?: return null
+        return before[first].index to unreadCount(rows, markerAtOpen)
+    }
+
     fun firstUnreadIndex(items: List<UnreadItem>, marker: ReadMarker?): Int? {
         if (marker == null) return null
         val at = items.indexOfFirst { it.id == marker.messageId }
@@ -96,6 +109,19 @@ object ServerName {
  *  Apple app's `SiblingRules`). The core merged the verifications and lists the contacts it
  *  holds under other keys (`mismatched`): skipped entirely here. */
 object SiblingRules {
+    /** A newly linked device asks its siblings for their state until one has handed it over: the
+     *  sibling may be away, or send before its snapshot is here (then nothing can be taken).
+     *  (A sibling answers one device at most every 10 minutes.) */
+    const val REQUEST_GAP_MS = 11 * 60_000L
+    /** Per launch, at most (a sibling too old to answer is not asked for ever). */
+    const val MAX_REQUESTS = 6
+
+    fun mayRequest(answered: Boolean, asks: Int, lastAsk: Long?, now: Long): Boolean =
+        !answered && asks < MAX_REQUESTS && (lastAsk == null || now - lastAsk >= REQUEST_GAP_MS)
+
+    /** Did this contact book answer the request? Not when nobody in it could be taken. */
+    fun answers(book: Map<String, Contact>, vouched: Collection<String>): Boolean = book.isEmpty() || vouched.isNotEmpty()
+
     const val MAX_AVATAR_BYTES = 96 * 1024
     const val MAX_BATCH_BYTES = 120 * 1024
     const val SEND_BUDGET = 110_000
@@ -210,4 +236,37 @@ object SiblingBook {
         }
         return out
     }
+}
+
+/** Build 49: one gated write of a per-workspace store. The workspace is fixed up front
+ *  ([expected], or the current one); nothing is written when the current workspace or the
+ *  loaded one differs — before the change, or after it (a switch during the call). Returns the
+ *  new value written, or null. */
+object GatedWrite {
+    fun <B : Any> apply(expected: String, current: () -> String?, loadedFor: () -> String?, value: B,
+                        change: (B) -> B, write: (String, B) -> Unit): B? {
+        if (expected.isEmpty() || current() != expected || loadedFor() != expected) return null
+        val next = change(value)
+        if (next === value) return null
+        if (current() != expected || loadedFor() != expected) return null
+        write(expected, next)
+        return next
+    }
+}
+
+/** Build 49: one step bound to the skwod it started in: [call] (the core), then — only if the
+ *  binding still holds — [after] (anything that writes). Returns whether [after] ran. */
+object BoundStep {
+    suspend fun <T : Any> run(asked: T, now: () -> T?, call: suspend () -> Unit, after: suspend () -> Unit): Boolean {
+        call()
+        if (!Asked.holds(asked, now())) return false
+        after()
+        return true
+    }
+}
+
+/** Build 49: "Clear all messages", captured when the confirmation OPENS (the binding, the
+ *  servers, the skwod's name); confirming goes ahead only in that very binding, as its owner. */
+data class ClearAllRequest<T : Any>(val asked: T, val serverIds: List<String>, val skwodName: String) {
+    fun mayProceed(now: T?, isInstanceOwner: Boolean): Boolean = isInstanceOwner && Asked.holds(asked, now) && serverIds.isNotEmpty()
 }

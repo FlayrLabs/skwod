@@ -29,6 +29,8 @@ pub mod lan;
 pub mod member;
 pub mod pow;
 pub mod proxy;
+pub mod relay_gate;
+pub mod routes;
 pub mod voice;
 mod wire;
 
@@ -40,6 +42,8 @@ pub use iroh::{Endpoint, EndpointAddr, EndpointId, SecretKey};
 pub use iroh as iroh_api;
 pub use member::{Member, PathInfo, PathKind};
 pub use proxy::LocalProxy;
+pub use relay_gate::{RelayGate, RelayPermit};
+pub use routes::Routes;
 pub use wire::BiStream;
 
 /// ALPN for the skwod tunnel. Bump the suffix on any incompatible change to the stream preamble.
@@ -59,6 +63,9 @@ pub enum NetError {
     Io(String),
     #[error("voice is not available on this skwod")]
     VoiceUnavailable,
+    /// The loopback port the call's media needs is taken on this device.
+    #[error("another call holds this device's media port")]
+    VoicePort,
 }
 
-pub(crate) type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'static>>;
+pub type BoxFuture<T> = std::pin::Pin<Box<dyn std::future::Future<Output = T> + Send + 'static>>;

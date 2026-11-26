@@ -34,6 +34,9 @@ enum PairingCopy {
 
     static let notApproved = "This device wasn't added: it was denied on your other device, or the code expired. Make a new code there to try again."
 
+    /// The app was sent away while pairing.
+    static let left = "Pairing stopped because you left Skwod. Make a new code on your other device and keep Skwod open until it says you're approved."
+
     static let mismatch = "This device wasn't added: the code didn't check out, so someone may have tampered with it. Make a new code on your other device."
 
     /// What to show when pairing stops with `detail` (the core's error text): a refusal, an expiry

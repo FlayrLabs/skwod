@@ -95,6 +95,12 @@ class JoinFlow(private val model: AppModel) {
     var status by mutableStateOf<JoinStatus?>(null)
 
     private val jobs = HashMap<String, Job>()
+
+    /** A join of [serverId] on the active skwod is being watched here. */
+    fun isWatching(serverId: String): Boolean {
+        val wid = model.current?.id ?: return false
+        return load().any { it.workspaceId == wid && it.serverId == serverId && synchronized(jobs) { jobs["$wid|${it.code}"]?.isActive == true } }
+    }
     private val approvals = Channel<String>(Channel.CONFLATED)
     private val lock = Any()
 
@@ -144,7 +150,7 @@ class JoinFlow(private val model: AppModel) {
     fun begin(code: String) {
         val w = model.current ?: return
         val r = PendingJoinRecord(w.id, w.server, w.username ?: "", code, createdAt = System.currentTimeMillis())
-        put(r); start(r)
+        put(r); start(r, startedHere = true)
     }
 
     /**
@@ -159,20 +165,22 @@ class JoinFlow(private val model: AppModel) {
         val result = try { client.joinByCode(code) } catch (e: Exception) {
             if (!isTransient(e)) return "Couldn't join — check the invite code."
             // The host did not answer. Keep the code and keep trying; say so.
-            put(r); start(r)
+            put(r); start(r, startedHere = true)
             return null
         }
         r = r.copy(serverId = result.serverId, stage = if (result.pending) PendingJoinRecord.Stage.REQUESTED else PendingJoinRecord.Stage.ADMITTED)
         model.chat.tombstones.rejoined(result.serverId)   // joined (again) on purpose
-        put(r); start(r)
+        put(r); start(r, startedHere = true)
         return null
     }
 
-    private fun start(r: PendingJoinRecord) {
+    /** [startedHere]: the user asked for it just now (not resumed): it may open the server, unless
+     *  the host decides on it later ([Landing.joined]). */
+    private fun start(r: PendingJoinRecord, startedHere: Boolean = false) {
         val key = "${r.workspaceId}|${r.code}"
         synchronized(jobs) {
             if (jobs[key]?.isActive == true) return
-            jobs[key] = model.launchJob { run(r) }
+            jobs[key] = model.launchJob { run(r, startedHere) }
         }
     }
 
@@ -182,8 +190,9 @@ class JoinFlow(private val model: AppModel) {
         return !(listOf("400", "401", "403", "404", "409", "410", "422").any { d.contains(it) } || d.contains("invite") || d.contains("not found"))
     }
 
-    private suspend fun run(start: PendingJoinRecord) {
+    private suspend fun run(start: PendingJoinRecord, startedHere: Boolean) {
         var r = start
+        var opens = startedHere
         val alive = { model.current?.id == r.workspaceId && !model.pinFailed }
         // Joining asks members to hand keys to THIS device, so it needs its own keys first.
         var waited = 0
@@ -230,6 +239,7 @@ class JoinFlow(private val model: AppModel) {
         val serverId = r.serverId ?: run { forget(r); status = null; return }
 
         if (r.stage == PendingJoinRecord.Stage.REQUESTED) {
+            opens = false
             status = JoinStatus("Waiting for the host to let you in. You'll walk in as soon as they do — no need to keep this open.")
             // The `join_approved` event ends the wait at once; the slow check covers a missed one.
             while (alive()) {
@@ -250,7 +260,7 @@ class JoinFlow(private val model: AppModel) {
         var round = 0
         while (alive()) {
             val asked = model.chat.askForKeys(serverId)
-            if (model.chat.discover(serverId, asked.peerUserId, asked.peerDeviceId, quiet = false, rounds = if (round == 0) 20 else 6)) {
+            if (model.chat.discover(serverId, asked.peerUserId, asked.peerDeviceId, joining = true, startedHere = opens, rounds = if (round == 0) 20 else 6)) {
                 forget(r); status = null
                 return
             }

@@ -87,21 +87,27 @@ fun MembersSheet(serverId: String, serverName: String, onClose: () -> Unit) {
     LaunchedEffect(serverId, tick) {
         roles.clear(); roles.addAll(try { withContext(Dispatchers.IO) { model.client!!.listRoles(serverId) } } catch (_: Exception) { emptyList() })
         model.realtime.refreshLoop(30_000, match = { (it.topic == "server:$serverId" && it.event != "presence") || it.event == "join_request" }) {
+            val askedAt = model.realtime.presenceClock()
             val fresh = model.listPresenceMembers(serverId)
-            if (fresh.isNotEmpty()) { members.clear(); members.addAll(fresh) }
+            if (fresh.isNotEmpty()) {
+                members.clear(); members.addAll(fresh)
+                model.realtime.seedPresence(fresh.associate { it.userId to it.status }, askedAt)
+            }
             model.waiting.refresh(serverId)
         }
     }
 
     // Poll results overlaid with live socket presence, so flips are instant (no 10s poll wait).
-    // liveStatus reads realtime.presence (Compose state) during composition → auto-recomposes.
-    val live = members.map { it.copy(status = model.realtime.liveStatus(it.userId, it.status)) }
+    // Reads realtime.presence (Compose state) during composition → auto-recomposes.
+    model.realtime.unheard.value
+    val live = members.map { it.copy(status = model.realtime.status(it.userId)) }
     // Someone the server lists but who is still waiting to be let in is not shown as a member.
     val waiting = model.waiting.waiting(serverId)
     val heldIds = waiting.map { it.userId }.toSet()
     val accepted = live.filter { it.userId !in heldIds }
-    val online = accepted.filter { it.status != "offline" }
-    val offline = accepted.filter { it.status == "offline" }
+    val groups = PresenceRoster.groups(accepted, model.realtime.connected.value) { it.status }
+    val online = groups.online
+    val offline = groups.offline
 
     Column(Modifier.fillMaxSize().padding(horizontal = 8.dp)) {
         Row(Modifier.padding(12.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -119,11 +125,15 @@ fun MembersSheet(serverId: String, serverName: String, onClose: () -> Unit) {
             }
             if (online.isNotEmpty()) {
                 item { MemberGroupHeader("Online — ${online.size}") }
-                items(online) { m -> MemberRow(m, onClick = { sheetFor = m }) }
+                items(online) { m -> MemberRow(m, onVerify = { verifying = m }, onClick = { sheetFor = m }) }
             }
             if (offline.isNotEmpty()) {
                 item { MemberGroupHeader("Offline — ${offline.size}") }
-                items(offline) { m -> MemberRow(m, dim = true, onClick = { sheetFor = m }) }
+                items(offline) { m -> MemberRow(m, dim = true, onVerify = { verifying = m }, onClick = { sheetFor = m }) }
+            }
+            if (groups.unknown.isNotEmpty()) {
+                item { MemberGroupHeader(PresenceRoster.unknownTitle(groups.unknown.size)) }
+                items(groups.unknown) { m -> MemberRow(m, onVerify = { verifying = m }, onClick = { sheetFor = m }) }
             }
         }
     }
@@ -286,7 +296,7 @@ private fun WaitingToJoinSection(
                     Row(verticalAlignment = Alignment.CenterVertically) {
                         Text(if (w.displayName.isEmpty()) "Unnamed account" else if (trusted) shown.name else "“${shown.name}”",
                             color = if (shown.strong) Color(0xFFF87171) else if (trusted) Color.White else amber, fontWeight = FontWeight.SemiBold, maxLines = 1)
-                        NameTrustMark(shown)
+                        NameTrustMark(shown, words = true)
                         if (w.isNew) {
                             Spacer(Modifier.width(6.dp))
                             Text("NEW", color = Color.Black, fontSize = 9.sp, fontWeight = FontWeight.Bold,
@@ -328,18 +338,19 @@ private fun MemberGroupHeader(title: String) {
 }
 
 @Composable
-private fun MemberRow(m: PresenceMember, dim: Boolean = false, onClick: () -> Unit) {
+private fun MemberRow(m: PresenceMember, dim: Boolean = false, onVerify: () -> Unit = {}, onClick: () -> Unit) {
     Row(Modifier.fillMaxWidth().clickable(onClick = onClick).padding(horizontal = 12.dp, vertical = 6.dp)
         .then(if (dim) Modifier.alpha(0.45f) else Modifier), verticalAlignment = Alignment.CenterVertically) {
         Box {
             AvatarImage(AvatarStore.userKey(m.userId), m.username, size = 32)
-            Box(Modifier.align(Alignment.BottomEnd).size(11.dp).clip(CircleShape).background(presenceColor(m.status)))
+            Box(Modifier.align(Alignment.BottomEnd).size(11.dp).clip(CircleShape).background(presenceColor(AppModel.get(LocalContext.current).realtime.dot(m.userId))))
         }
         Spacer(Modifier.width(10.dp))
         // The member list is the server's word: shown through the contact book.
-        val shown = AppModel.get(LocalContext.current).contacts.shown(m.userId, m.username)
+        val model = AppModel.get(LocalContext.current)
+        val shown = model.contacts.shown(m.userId, m.username)
         Text(shown.name, color = if (shown.strong) Color(0xFFF87171) else Color.White)
-        NameTrustMark(shown)
+        NameTrustMark(shown, onVerify = if (m.userId == model.session?.userId) null else onVerify)
     }
 }
 
@@ -497,7 +508,9 @@ fun SkwodSettingsSheet(onClose: () -> Unit, onSignOut: () -> Unit) {
     val scope = rememberCoroutineScope()
     var showErase by remember { mutableStateOf(false) }
     var showReports by remember { mutableStateOf(false) }
-    var confirmClearServer by remember { mutableStateOf(false) }
+    // Captured when the confirmation OPENS: the binding, the servers and the skwod's name; keyed
+    // on the skwod, so a switch dismisses it.
+    var confirmClearServer by remember(model.current?.id) { mutableStateOf<ClearAllRequest<BoundClient<uniffi.skwod_core.SkwodClient>>?>(null) }
     // Owner-only: accounts + who may create servers. `accounts == null` until loaded / if not owner.
     var accounts by remember { mutableStateOf<List<Account>?>(null) }
     val creators = remember { mutableStateListOf<String>() }
@@ -528,6 +541,9 @@ fun SkwodSettingsSheet(onClose: () -> Unit, onSignOut: () -> Unit) {
             }
             Spacer(Modifier.height(14.dp))
         }
+
+        // Owner-only, and only while another call server is saved: what calls use, and the way back.
+        if (accounts != null) VoiceServerCard()
 
         // Owner-only: manage accounts + server-creation grants (mirrors the iOS accountsCard).
         accounts?.let { list ->
@@ -594,7 +610,12 @@ fun SkwodSettingsSheet(onClose: () -> Unit, onSignOut: () -> Unit) {
                         "for everyone. Channels, members, and roles stay. This can't be undone.",
                         color = Color.White.copy(alpha = 0.6f), style = MaterialTheme.typography.bodySmall)
                     Spacer(Modifier.height(10.dp))
-                    Button(onClick = { confirmClearServer = true },
+                    Button(onClick = {
+                        val asked = model.bound
+                        if (asked != null) confirmClearServer = ClearAllRequest(asked,
+                            model.chat.spaces.map { it.serverId }.filter { it.isNotEmpty() && it != "demo" }.distinct(),
+                            model.current?.displayName ?: "this Skwod")
+                    },
                         colors = ButtonDefaults.buttonColors(containerColor = Color(0xFFF87171))) {
                         Icon(Icons.Filled.ClearAll, null, tint = Color.Black); Spacer(Modifier.width(6.dp))
                         Text("Clear all messages", color = Color.Black)
@@ -624,22 +645,26 @@ fun SkwodSettingsSheet(onClose: () -> Unit, onSignOut: () -> Unit) {
     if (showReports) ReportsDialog { showReports = false }
     if (showErase) EraseDeviceDialog(onClose = { showErase = false }, onErased = { showErase = false; onSignOut() })
 
-    if (confirmClearServer) {
+    confirmClearServer?.let { req ->
         AlertDialog(
-            onDismissRequest = { confirmClearServer = false },
+            onDismissRequest = { confirmClearServer = null },
             confirmButton = {
                 TextButton(onClick = {
-                    confirmClearServer = false
+                    confirmClearServer = null
+                    // Only in the very skwod (and binding) it was opened in, and only as its owner.
+                    if (!req.mayProceed(model.bound, model.isInstanceOwner)) return@TextButton
                     scope.launch {
-                        val serverIds = model.chat.spaces.map { it.serverId }.filter { it.isNotEmpty() && it != "demo" }.distinct()
                         withContext(Dispatchers.IO) {
-                            for (sid in serverIds) { try { model.client?.clearServerMessages(sid) } catch (_: Exception) {} }
+                            for (sid in req.serverIds) {
+                                if (!Asked.holds(req.asked, model.bound)) break
+                                try { req.asked.client.clearServerMessages(sid) } catch (_: Exception) {}
+                            }
                         }
                     }
                 }) { Text("Clear all messages", color = Color(0xFFF87171)) }
             },
-            dismissButton = { TextButton(onClick = { confirmClearServer = false }) { Text("Cancel") } },
-            title = { Text("Clear all messages in this Skwod?") },
+            dismissButton = { TextButton(onClick = { confirmClearServer = null }) { Text("Cancel") } },
+            title = { Text("Clear all messages in ${req.skwodName}?") },
             text = { Text("Permanently deletes every message, story, and post across all channels, for everyone. Channels, members, and roles stay. This can't be undone.") }
         )
     }

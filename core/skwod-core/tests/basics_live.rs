@@ -118,7 +118,10 @@ async fn fresh_token(base: &str, username: &str, password: &str) -> String {
 }
 
 async fn world() -> Option<World> {
-    let server = start().await?;
+    Some(world_on(start().await?).await)
+}
+
+async fn world_on(server: ServerGuard) -> World {
     let caches = tempfile::tempdir().unwrap();
     let path = |n: &str| caches.path().join(n).to_string_lossy().to_string();
     let a = ApiClient::new(&server.base).signup("alice", "password123").await.expect("signup alice");
@@ -174,7 +177,7 @@ async fn world() -> Option<World> {
         c.sync_channel_membership(w.channel.clone(), w.server_id.clone(), me.clone()).await.expect("share channel key");
     }
     pump(&w).await;
-    Some(w)
+    w
 }
 
 async fn chat(c: &SkwodClient, channel: &str, me: &str) -> Vec<skwod_core::Message> {
@@ -283,6 +286,21 @@ async fn a_dm_arrives_unasked_and_shows_on_the_senders_other_device() {
     assert!(events.iter().any(|e| e.text == "yes!" && e.peer_user_id == w.bob && !e.from_self), "{events:?}");
     let events = w.mac.sync_dms().await.unwrap();
     assert!(events.iter().any(|e| e.text == "yes!" && !e.from_self), "{events:?}");
+}
+
+/// A way to the host that does not work is not taken: the device's session could not be bound
+/// there, so the client keeps the way it had, and its next request still reaches its host.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_go_online_that_fails_leaves_the_client_on_the_way_it_had() {
+    let Some(w) = world().await else { return };
+    assert_eq!(w.bobs.session_state().await, skwod_core::SessionState::Valid);
+    let dead = "http://127.0.0.1:1".to_string();
+    assert!(w.bobs.go_online(dead, w.bob_token.clone(), None).await.is_err(), "nothing answers there");
+    assert_eq!(w.bobs.session_state().await, skwod_core::SessionState::Valid, "still asks its own host");
+    let convo = w.bobs.open_dm(w.alice.clone()).await.unwrap();
+    w.bobs.send_dm(convo, w.alice.clone(), String::new(), "still here".into()).await.expect("sent to its host");
+    let events = w.phone.sync_dms().await.unwrap();
+    assert!(events.iter().any(|e| e.text == "still here"), "{events:?}");
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -506,7 +524,7 @@ async fn sessions_invites_and_fingerprints_tell_the_truth() {
 
     // ---- rotation keeps the sign-in; a dead session reads as signed out, not unreachable ----
     assert_eq!(w.bobs.session_state().await, SessionState::Valid);
-    let rotated = skwod_core::rotate_session(w.server.base.clone(), w.bob_token.clone()).await.expect("rotate");
+    let rotated = skwod_core::rotate_session(w.server.base.clone(), w.bob_token.clone(), skwod_core::new_rotation_key()).await.expect("rotate");
     assert_ne!(rotated.token, w.bob_token);
     assert_eq!(rotated.user_id, w.bob);
     let fresh = SkwodClient::new(w.server.base.clone(), rotated.token.clone());
@@ -515,4 +533,59 @@ async fn sessions_invites_and_fingerprints_tell_the_truth() {
     assert_eq!(fresh.session_state().await, SessionState::SignedOut);
     let nowhere = SkwodClient::new("http://127.0.0.1:1".into(), rotated.token);
     assert_eq!(nowhere.session_state().await, SessionState::Unreachable);
+}
+
+/// Everything the clients send, byte for byte, on its way to the server.
+async fn recorded(mut server: ServerGuard) -> (ServerGuard, std::sync::Arc<std::sync::Mutex<Vec<u8>>>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", listener.local_addr().unwrap());
+    let upstream = std::mem::replace(&mut server.base, base).trim_start_matches("http://").to_string();
+    let log = seen.clone();
+    tokio::spawn(async move {
+        while let Ok((down, _)) = listener.accept().await {
+            let (log, upstream) = (log.clone(), upstream.clone());
+            tokio::spawn(async move {
+                let Ok(up) = tokio::net::TcpStream::connect(&upstream).await else { return };
+                let ((mut dr, mut dw), (mut ur, mut uw)) = (down.into_split(), up.into_split());
+                tokio::spawn(async move { let _ = tokio::io::copy(&mut ur, &mut dw).await; });
+                let mut buf = vec![0u8; 64 * 1024];
+                while let Ok(n) = dr.read(&mut buf).await {
+                    if n == 0 { break }
+                    if uw.write_all(&buf[..n]).await.is_err() { break }
+                    let mut log = log.lock().unwrap();
+                    log.extend_from_slice(b"\n\0");
+                    log.extend_from_slice(&buf[..n]);
+                }
+            });
+        }
+    });
+    (server, seen)
+}
+
+/// Sealed sender, on the wire, as the ENGINE makes it: direct messages, sender keys and device
+/// siblings between real clients and a real server — every deposit goes out with no Authorization
+/// and nothing of the sender's session, while the same clients' other requests carry theirs.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn every_deposit_the_engine_makes_is_anonymous() {
+    let Some(server) = start().await else { return };
+    let (server, seen) = recorded(server).await;
+    let w = world_on(server).await;
+    let convo = w.phone.open_dm(w.bob.clone()).await.unwrap();
+    w.phone.send_dm(convo.clone(), w.bob.clone(), String::new(), "hello".into()).await.unwrap();
+    w.bobs.sync_dms().await.unwrap();
+    let back = w.bobs.open_dm(w.alice.clone()).await.unwrap();
+    w.bobs.send_dm(back, w.alice.clone(), String::new(), "hello yourself".into()).await.unwrap();
+    w.phone.send_channel_message(w.channel.clone(), "to everyone".into()).await.unwrap();
+    let wire = String::from_utf8_lossy(&seen.lock().unwrap()).to_string();
+    let deposits: Vec<&str> = wire.match_indices("POST /api/e2ee/sealed/send").map(|(i, _)| wire[i..].split("\r\n\r\n").next().unwrap()).collect();
+    assert!(deposits.len() >= 3, "the engine deposited: {}", deposits.len());
+    for d in &deposits {
+        let d = d.to_lowercase();
+        for bad in ["authorization", "x-skwod-build", "x-skwod-device-proof", "cookie", "front-"] { assert!(!d.contains(bad), "{bad} on a deposit: {d}"); }
+        for t in [&w.alice_token, &w.bob_token] { assert!(!d.contains(t.as_str())); }
+    }
+    let with = wire.match_indices("authorization: Bearer ").count() + wire.match_indices("Authorization: Bearer ").count();
+    assert!(with > 10, "the control: the clients' own requests carry theirs ({with})");
 }

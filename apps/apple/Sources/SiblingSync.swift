@@ -34,13 +34,23 @@ enum SiblingSync {
         }
     }
 
-    /// A newly linked device asks its siblings once per skwod for their state.
+    /// What was asked this launch, per install.
+    private static var requests: [String: (count: Int, at: TimeInterval)] = [:]
+
+    /// This skwod's answer, for THIS device of the account (one linked again starts over).
+    private static func answeredKey(_ app: AppState, _ wid: String) -> String? {
+        app.deviceId.map { "skwod.siblingStateAnswered.\(wid).\($0)" }
+    }
+
+    /// A newly linked device asks its siblings for their state, until it has it (`mayRequest`).
     static func requestIfNeeded(_ app: AppState) async {
-        guard let client = app.client, let asked = app.bindTicket(), case let wid = asked.workspaceId, !wid.isEmpty else { return }
-        let key = "skwod.siblingStateRequested.\(wid)"
-        guard !UserDefaults.standard.bool(forKey: key) else { return }
+        guard let client = app.client, let asked = app.bindTicket(), case let wid = asked.workspaceId, !wid.isEmpty,
+              let key = answeredKey(app, wid) else { return }
+        let now = PresenceClock.now
+        let before = requests[key]
+        guard SiblingRules.mayRequest(answered: UserDefaults.standard.bool(forKey: key), asks: before?.count ?? 0, lastAsk: before?.at, now: now) else { return }
         if let sent = try? await client.requestSiblingState(), sent > 0, app.holds(asked) {
-            UserDefaults.standard.set(true, forKey: key)
+            requests[key] = ((before?.count ?? 0) + 1, now)
         }
     }
 
@@ -63,6 +73,7 @@ enum SiblingSync {
             case "contacts.v1":
                 guard let book = try? JSONDecoder().decode([String: Contact].self, from: p.body),
                       let verified = app.contacts.mergeFromSibling(book, workspaceId: wid, vouched: vouched, mismatched: mismatched) else { continue }
+                if SiblingRules.answers(book: book, vouched: p.vouchedUsers), let key = answeredKey(app, wid) { UserDefaults.standard.set(true, forKey: key) }
                 // VERIFIED only where the core now says so (it merged the sibling's verification
                 // for exactly the devices this device holds — or not at all).
                 for userId in verified.prefix(500) {

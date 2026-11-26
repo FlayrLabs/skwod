@@ -195,7 +195,7 @@ object E2E {
                 val who = arg.substringBefore(':'); val path = arg.substringAfter(':', "")
                 val found = client.findUser(who)
                 val convo = client.openDm(found.userId)
-                val up = Uploads.prepare(ctx, model, android.net.Uri.fromFile(File(path)), forDm = true)
+                val up = Uploads.prepare(ctx, model, model.bound ?: return "error: no client", android.net.Uri.fromFile(File(path)), forDm = true)
                 client.queueDm(convo, listOf(found.userId), up.body, null, listOf(up.uploadId))
                 Uploads.watch(model); Outbox.flush(model)
                 "ok upload=${up.uploadId} size=${up.attachment.size} token=${up.attachment.token != null}"
@@ -237,7 +237,7 @@ object E2E {
                         "ok sealed=${r.sealedToOwner} quoted=${target != null}"
                     }
                     "upload" -> {
-                        val up = Uploads.prepare(ctx, model, android.net.Uri.fromFile(File(arg)), forDm = false)
+                        val up = Uploads.prepare(ctx, model, model.bound ?: return@run "error: no client", android.net.Uri.fromFile(File(arg)), forDm = false)
                         client.queueChannelMessage(channelId, up.body, null, emptyList(), listOf(up.uploadId))
                         Uploads.watch(model); Outbox.flush(model)
                         "ok upload=${up.uploadId} size=${up.attachment.size}"

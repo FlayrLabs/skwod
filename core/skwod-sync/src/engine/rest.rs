@@ -517,6 +517,12 @@ impl Engine {
         Ok(())
     }
 
+    /// Forget the saved call server (the instance owner only). Device-signed.
+    pub async fn clear_voice_config(&mut self) -> Result<bool, EngineError> {
+        let v = self.destructive(reqwest::Method::DELETE, "/api/voice/config", None, "voice-config-clear", "", b"").await?;
+        Ok(v.get("cleared").and_then(|x| x.as_bool()).unwrap_or(false))
+    }
+
     /// The channels this device has CONFIRMED in `server_id`.
     pub(super) fn channels_of(&self, server_id: &str) -> Vec<String> {
         let mut out: Vec<String> = self.guard.channel_servers.iter().filter(|(_, s)| s.as_str() == server_id).map(|(c, _)| c.clone()).take(MAX_SERVER_ARRAY).collect();

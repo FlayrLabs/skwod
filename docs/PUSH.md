@@ -279,6 +279,17 @@ provisioned is kept for the app; enforced in the engine where keys are made,
 has it; it bumps a generation counter when it has written to the cache so the app re-opens it on
 return.
 
+**Never suspended with the lock (build 51).** iOS kills an app — or an extension — that is suspended
+while it holds a lock on a file in the shared container. So the lock's gate in the app
+(`StoreLock.swift`) is closed until the app is in front, and closing it, synchronously on the way to
+the background, first ends every use of the cache (`CacheLease.detach`), then lets the lock go:
+nothing that was on its way to it (a dial, the reconnect loop, a wake, a ring) can take it from
+behind, and coming to the front opens the cache anew, once. Behind, the cache is held only for a
+live call (answered or joined; not for one that rings), under a background task that is renewed and
+whose warning lets go at once; and for a registration already on its way, under one more. The
+extension lets go before its banner is delivered and when the system says time is up. A VoIP push
+is reported to CallKit from a registry made at every launch and needs neither cache nor lock.
+
 ### What a wake may make the device do (`WakeRule`, `WakeRules.swift`)
 
 Decided before anything is dialed, opened or decrypted, from the wake's `tag` and the mutes:
@@ -311,7 +322,7 @@ Decided before anything is dialed, opened or decrypted, from the wake's `tag` an
   not offered yet (it needs the transport's support).
 - **Time** (`BoundedCall`): 12 s per Skwod and 22 s in all, at most 3 Skwods. A call into the
   core is not interruptible, so a Skwod that has not answered in its time is *left*: it records
-  and claims nothing from then on, and the cache lock is kept until it has really ended.
+  and claims nothing from then on, and is cut off from the cache when the wake ends.
 - **What is announced.** New rows are told by id, never by the server's date. One banner per
   conversation with something new: the newest becomes the push itself, up to 8 more are
   posted beside it, and an id is claimed in the announced ledger only for a banner that is

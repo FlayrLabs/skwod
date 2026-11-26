@@ -76,6 +76,7 @@ jobs:
           PUSH_GATEWAY: ${{ vars.SKWOD_DEFAULT_PUSH_GATEWAY }}
         run: |
           deploy/test-image-release-guard.sh >/dev/null
+          deploy/test-smoke-values.sh >/dev/null
           n="$(deploy/image-release-guard.sh build-number "$REF_NAME" apps/apple/project.yml)"
           git fetch --no-tags --quiet origin +refs/heads/main:refs/remotes/origin/main
           deploy/image-release-guard.sh on-main "$GITHUB_SHA" origin/main

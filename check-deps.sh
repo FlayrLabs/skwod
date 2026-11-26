@@ -18,6 +18,8 @@
 #   6. container pins: every Dockerfile `FROM` is by digest, and the deploy bundle names no
 #      mutable image tag (deploy/test-verify-image.sh).
 # Needs cargo + network:
+#   (6b also fetches the crate and asks for advisories and newer versions;)
+#   6b. the vendored n0-mainline is the pinned patch on the pinned crate (core/vendor/verify.sh);
 #   7. every Cargo.lock is in sync with its manifests (`cargo metadata --locked`);
 #   8. `cargo deny check` (advisories, licences, sources, bans — policy in deny.toml) in each
 #      Rust workspace;
@@ -81,6 +83,11 @@ for ws in core server host; do
     while IFS= read -r line; do echo "    $line"; done <<<"$unexpected"
   fi
 done
+
+echo "==> vendored n0-mainline"
+# Hashes always; with the network also the published crate, advisories (cargo-deny reads none for a
+# crate that is not from crates.io) and upstream versions nobody has looked at.
+if [ "$STATIC_ONLY" = "1" ]; then "$HERE/core/vendor/verify.sh" || fail=1; else "$HERE/core/vendor/verify.sh" --online || fail=1; fi
 
 echo "==> Gradle wrapper"
 PROPS="$HERE/apps/android/gradle/wrapper/gradle-wrapper.properties"

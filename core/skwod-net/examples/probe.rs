@@ -34,7 +34,14 @@ async fn main() {
             .clear_ip_transports()
             .address_lookup(PkarrResolver::n0_dns())
             .bind().await.expect("bind"),
-        _ => skwod_net::bind(&cfg).await.expect("bind"),
+        // What a member's own configuration looks up (not an app's dial: no lease).
+        _ => {
+            let mut b = skwod_net::Endpoint::builder(presets::Minimal)
+                .relay_mode(cfg.plan().relay)
+                .address_lookup(iroh_mainline_address_lookup::DhtAddressLookup::builder().no_publish());
+            if cfg.plan().n0_dns_lookup { b = b.address_lookup(PkarrResolver::n0_dns()); }
+            b.bind().await.expect("bind")
+        }
     };
     let t = Instant::now();
     // `hint:<relay url>`: the app's own config plus a relay hint (e.g. a stale one).

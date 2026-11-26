@@ -8,7 +8,7 @@ final class TypingCenter: ObservableObject {
     private weak var app: AppState?
     private var sweep: Task<Void, Never>?
     /// Who may show as typing in the conversation on screen (set by its chat surface).
-    private var audience: TypingAudience?
+    @Published private var audience: TypingAudience?
 
     func attach(_ app: AppState) {
         self.app = app
@@ -61,7 +61,7 @@ final class TypingCenter: ObservableObject {
     func labels(now: Date) -> [String] {
         // Only for the conversation they were typing in, and only with the setting on.
         guard let app, enabled, state.topic != nil, state.topic == app.realtime.focusedTopic else { return [] }
-        return state.active(now: now).map { app.contacts.authorLabel($0, claimedName: nil) }
+        return state.names(now: now, audience: audience) { app.contacts.display($0, claimedName: $1).label(for: .typing) }
     }
 }
 

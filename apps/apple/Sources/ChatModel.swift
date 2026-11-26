@@ -127,18 +127,142 @@ final class ChatModel: ObservableObject {
         didSet {
             // Tell the relay which chat is on screen — its messages shouldn't notify.
             refocus()
-            // Remember the last-opened channel so re-entering this skwod reopens it (across devices,
-            // via the synced kv store). Only channels — DMs/home don't override it.
-            if case .space(let s) = selection, !loadingSelection {
-                lastChannelId = s.channelId
-                Task { await persistLastChannel(s.channelId) }
+            guard !applying else { return }
+            if selection != nil { landing.opened(); overview = false; closedDraft = nil }
+            // Remember the channel last opened in this server (DMs/home don't override it).
+            if case .space(let s) = selection {
+                railServerId = s.serverId
+                highlightedChannelId = s.channelId
+                memory.opened(s.channelId, in: s.serverId)
+                persistMemory()
             }
+            reveal.send(selection != nil)
         }
     }
-    /// Suppresses the persist while we're restoring the remembered selection on load.
-    private var loadingSelection = false
-    /// The channelId to reopen on next load (synced via kv).
-    private var lastChannelId: String?
+
+    // MARK: The channel a server opens with (`Landing`, build 51)
+
+    @Published private var landing = Landing()
+    /// The app, not the user, is changing `selection`.
+    private var applying = false
+    /// iPhone: slide to the chat (true) or the list (false). Not for a channel opened by default.
+    let reveal = PassthroughSubject<Bool, Never>()
+    /// The user looks at the skwod's list of servers.
+    @Published private(set) var overview = false
+    /// The skwod whose tile was tapped, until its lists are loaded.
+    private var switchingTo: String?
+    @Published private var listsReady = false
+    private var memory = ChannelMemory()
+    private var memoryRead = false
+    private var memoryWrite: Task<Void, Never>?
+    /// Channels the server refused this account to read.
+    private var refused: Set<String> = []
+    /// Servers this account may create channels in.
+    @Published private(set) var channelCreators: Set<String> = []
+    /// Unsent text by conversation (memory only), and what was left in the one that went away.
+    private var drafts: [String: String] = [:]
+    @Published private(set) var closedDraft: String?
+
+    /// What the chat area shows while nothing is open there.
+    var place: Landing.Place {
+        var looking = homeMode
+        #if os(macOS)
+        if overview { looking = true }
+        #endif
+        let mine = loadedFor != nil && loadedFor == app?.current?.id && app?.bound?.workspaceId == loadedFor
+        return landing.place(open: selection != nil || looking, ready: mine && listsReady && (switchingTo == nil || switchingTo == loadedFor),
+                             settingUp: provisioning, memory: memory,
+                             channels: spaces.map { LandingChannel(id: $0.channelId, serverId: $0.serverId, readable: !refused.contains($0.channelId)) })
+    }
+
+    /// Open what was asked for, if it is there and nothing is open. Decided and opened in one step.
+    func land() {
+        guard case .channel(let id) = place, let s = spaces.first(where: { $0.channelId == id }) else { return }
+        let slide = landing.want?.reveal == true
+        landing.landed()
+        if !overview { railServerId = s.serverId }
+        highlightedChannelId = s.channelId
+        set(.space(s))
+        if slide { reveal.send(true) }
+    }
+
+    /// The user asked for a server (nil: any).
+    private func ask(_ server: String?) {
+        closedDraft = nil
+        landing.asked(.init(server: server))
+        land()
+    }
+
+    private func set(_ item: SidebarItem?) { applying = true; selection = item; applying = false }
+
+    /// The open channel went away: said so, with what was being written. Nothing takes its place.
+    private func closeOpen(_ s: RealSpace) {
+        closedDraft = draft(for: conversationKey(s))
+        set(nil)
+    }
+
+    /// "Open a channel", from that state.
+    func openAnother() { ask(railServerId) }
+
+    var placementChosen: Bool { landing.byUser }
+    func conversationKey(_ s: RealSpace) -> String {
+        Landing.conversationKey(workspaceId: loadedFor, serverId: s.serverId, channelId: s.channelId)
+    }
+    func directKey(_ conversationId: String) -> String { Compose.directKey(workspaceId: loadedFor, conversationId: conversationId) }
+    func draft(for key: String) -> String { drafts[key] ?? "" }
+    func keepDraft(_ text: String, for key: String) { drafts[key] = text.isEmpty ? nil : text }
+
+    /// A refused channel is not opened by default again; one that is open stays open.
+    func noteRead(_ s: RealSpace, refusedWith error: Error?) {
+        guard let error else { refused.remove(s.channelId); return }
+        if case CoreError.Engine(let detail) = error, Landing.isReadRefusal(detail) { refused.insert(s.channelId) }
+    }
+
+    /// A skwod's tile was tapped; that switch ended (or did not happen).
+    func switching(to workspaceId: String) {
+        homeMode = false; overview = false; railServerId = nil
+        switchingTo = workspaceId
+        selection = nil
+        ask(nil)
+    }
+    func switchEnded(_ workspaceId: String) {
+        guard switchingTo == workspaceId else { return }
+        switchingTo = nil
+        land()
+    }
+
+    /// Another skwod's lists are about to load.
+    private func resetLanding() {
+        memory = ChannelMemory(); memoryRead = false; memoryWrite = nil
+        listsReady = false; overview = false
+        refused = []; channelCreators = []; drafts = [:]; closedDraft = nil
+        backStack = []; forwardStack = []
+        landing.asked(.init(reveal: landing.want?.reveal == true))
+    }
+
+    /// Read strictly: a memory that could not be read is not written over.
+    private func readMemory(through bound: BoundClient<SkwodClient>) async {
+        let wid = bound.workspaceId
+        let json: String?, old: String?
+        do {
+            json = try await bound.client.kvRead(key: ChannelMemory.storageKey(workspaceId: wid))
+            old = try await bound.client.kvRead(key: "\(wid)|lastChannel")   // builds before 51: one per skwod
+        } catch { return }
+        guard app?.bound?.turn == bound.turn, loadedFor == wid, !memoryRead else { return }
+        if let json, let stored = try? JSONDecoder().decode(ChannelMemory.self, from: Data(json.utf8)) { memory = stored }
+        else if let s = spaces.first(where: { $0.channelId == old }) { memory.opened(s.channelId, in: s.serverId) }
+        memoryRead = true
+    }
+
+    private func persistMemory() {
+        guard memoryRead, let bound = app?.bound, bound.workspaceId == loadedFor, bound.cacheOpen,
+              let data = try? JSONEncoder().encode(memory), let json = String(data: data, encoding: .utf8) else { return }
+        let before = memoryWrite
+        memoryWrite = Task {
+            await before?.value
+            try? await bound.client.kvWrite(key: ChannelMemory.storageKey(workspaceId: bound.workspaceId), value: json)
+        }
+    }
 
     /// Keep the live relay subscribed to every joined channel + DM, with names for notifications.
     private func syncRealtimeTopics() {
@@ -215,8 +339,6 @@ final class ChatModel: ObservableObject {
     var spacesWorkspaceId: String? { loadedFor }
     private var loadedTurn: Int?     // …and the bind turn of the client they were loaded through
     private var spacesRead = false   // `spaces` was read from this workspace's (open) cache
-    private var loadFinishedFor: String?
-    private var wantsLastChannel = false
 
     func bind(_ app: AppState) {
         self.app = app
@@ -241,12 +363,11 @@ final class ChatModel: ObservableObject {
     private var contactWatch: AnyCancellable?
     private var titlesStale = false
 
-    /// Load the persisted lists for the active workspace (called when it changes). `openLastChannel`
-    /// restores the last-viewed channel (app launch); otherwise land on the overview (skwod switch,
-    /// where tapping the tile explicitly means "show me the server list").
+    /// Load the persisted lists for the active workspace (called when it changes) and land in a
+    /// channel. `openLastChannel` (app launch): on iPhone, slide to it.
     func loadIfNeeded(openLastChannel: Bool = false) async {
         guard let app, let wid = app.current?.id else { return }
-        if openLastChannel { wantsLastChannel = true }
+        if openLastChannel, selection == nil, !homeMode { landing.asked(.init(reveal: true)) }
         // Only through the client that has THIS workspace's cache open. While switching,
         // `current` is already the new workspace before its client exists (and the previous
         // one's is gone): loading then would read nothing — or, worse, someone else's lists.
@@ -254,9 +375,10 @@ final class ChatModel: ObservableObject {
         guard let bound = app.bound, bound.workspaceId == wid else {
             // Same workspace, between two binds of it (a retry): everything stays as it is.
             if loadedFor != nil, loadedFor != wid {
-                loadedFor = nil; loadedTurn = nil; loadFinishedFor = nil; spacesRead = false
+                loadedFor = nil; loadedTurn = nil; spacesRead = false
                 selection = nil; railServerId = nil
                 spaces = []
+                resetLanding()
                 objectWillChange.send()
                 park()
                 store = ConversationStore(backend: nil, workspaceId: "")
@@ -269,9 +391,7 @@ final class ChatModel: ObservableObject {
         // (no key yet, the notification extension held the lock, the file would not open) read
         // nothing, and the client of the next bind — the one with the cache — has to be read.
         guard loadedFor != wid || loadedTurn != bound.turn else {
-            // Already loaded through this client: only the "reopen my last channel" part is
-            // left to do.
-            if loadFinishedFor == wid, wantsLastChannel, selection == nil { wantsLastChannel = false; await restoreLastChannel() }
+            land()   // already loaded through this client
             return
         }
         let sameWorkspace = loadedFor == wid
@@ -283,8 +403,10 @@ final class ChatModel: ObservableObject {
             railServerId = nil
             // What was left is another workspace's (account's) business.
             tombstones = LeaveTombstones()
+            stopRecovery()
             spaces = []
             spacesRead = false
+            resetLanding()
         }
         if sameWorkspace, store.ready {
             // These stores were read from this workspace's cache and hold everything decided
@@ -296,7 +418,13 @@ final class ChatModel: ObservableObject {
             bindStore(workspaceId: wid)
             if store.ready { await store.flush() }
         }
+        // (What could not be written while the cache was not open is written now.)
+        if sameWorkspace, bound.cacheOpen {
+            persistMemory()
+            if spacesRead { await persist(spaces, key: "sidebar.spaces") }
+        }
         if bound.cacheOpen, !spacesRead { await readSpaces(through: bound) }
+        if bound.cacheOpen, spacesRead, !memoryRead { await readMemory(through: bound) }
         // BOTH conversation stores (and the ignored groups) are read from the cache before
         // anything is asked of the server: a listing or a delivery checked against a store
         // that has not been read yet would pass as "nobody holds this id". Until this
@@ -308,9 +436,9 @@ final class ChatModel: ObservableObject {
         // (The titles written while the book was not read yet were the generic ones.)
         syncRealtimeTopics()
         migrateContacts()
+        // (Before anything that waits for the server.)
+        if loadedFor == wid, app.bound?.turn == bound.turn, spacesRead { listsReady = true; land(); recoverIfNeeded() }
         await refreshRoster()
-        if wantsLastChannel { wantsLastChannel = false; await restoreLastChannel() }
-        loadFinishedFor = wid
         // Conversations started on another of this account's devices, and anything that arrived
         // while the app was closed.
         await refreshDMList()
@@ -382,24 +510,6 @@ final class ChatModel: ObservableObject {
         }
     }
 
-    /// Select the remembered last-opened channel (kv-synced, so it follows you across devices), or
-    /// the first available channel. No-op if the sidebar has no channels yet.
-    private func restoreLastChannel() async {
-        guard let app, let client = app.client else { return }
-        lastChannelId = await client.kvGet(key: "\(app.current?.id ?? "")|lastChannel")
-        let target = spaces.first(where: { $0.channelId == lastChannelId }) ?? spaces.first
-        guard let target else { return }
-        loadingSelection = true
-        railServerId = target.serverId
-        selection = .space(target)
-        loadingSelection = false
-    }
-
-    private func persistLastChannel(_ channelId: String) async {
-        guard let app, let client = app.client else { return }
-        await client.kvSet(key: "\(app.current?.id ?? "")|lastChannel", value: channelId)
-    }
-
     func addSpace(_ s: RealSpace) {
         guard !tombstones.hides(s.serverId) else { return }
         if !spaces.contains(where: { $0.channelId == s.channelId }) { spaces.insert(s, at: 0) }
@@ -429,7 +539,7 @@ final class ChatModel: ObservableObject {
     var currentServer: ServerGroup? {
         let groups = serverGroups
         var sid = railServerId
-        if case .space(let s) = selection { sid = s.serverId }
+        if sid == nil, case .space(let s) = selection { sid = s.serverId }
         return groups.first { $0.serverId == sid } ?? groups.first
     }
 
@@ -437,17 +547,23 @@ final class ChatModel: ObservableObject {
     /// chat are showing in the main pane).
     func isServerActive(_ group: ServerGroup) -> Bool {
         if homeMode || selection == .feed { return false }
-        if case .space(let s) = selection { return s.serverId == group.serverId }
         return railServerId == group.serverId
     }
 
-    /// Pick a server in the middle list: show its channels as BOXES in the main pane (no channel open
-    /// yet). Pass nil to show every server's channels (the skwod overview).
-    func showServerBoxes(_ serverId: String?) {
+    /// The skwod's list of servers. On iPhone a channel stays open on the page behind it.
+    func showServers() {
         homeMode = false
-        railServerId = serverId
-        if serverId == nil { highlightedChannelId = nil }
+        overview = true
+        landing.left()
+        railServerId = nil
+        highlightedChannelId = nil
+        #if os(iOS)
+        if case .space = selection { reveal.send(false); return }
         selection = nil
+        ask(nil)
+        #else
+        selection = nil
+        #endif
     }
 
     /// The channel highlighted in the list (first one when a server is opened) — on iOS this is
@@ -486,26 +602,27 @@ final class ChatModel: ObservableObject {
         selection = .space(s)
     }
 
-    /// Open a server from the RAIL: show its channels with the first highlighted. On iOS stay on the
-    /// list (don't slide into the full-screen chat); on macOS also open it in the detail pane (the
-    /// 3-pane desktop layout has no navigation cost, so showing the first channel is good UX).
+    /// The user picked a server: its channel list, and in the chat area the channel they last had
+    /// open there, or the first (`Landing`). On iOS the list stays in front (no slide to the chat).
     func openServer(_ g: ServerGroup) {
         homeMode = false
+        overview = false
         railServerId = g.serverId
-        highlightedChannelId = g.channels.first?.channelId
-        #if os(iOS)
-        selection = nil
-        #else
-        selection = g.channels.first.map { .space($0) }
-        #endif
+        memory.server = g.serverId
+        persistMemory()
+        if case .space(let s) = selection, s.serverId == g.serverId {
+            highlightedChannelId = s.channelId
+        } else {
+            highlightedChannelId = nil
+            set(nil)
+            ask(g.serverId)
+        }
+        reveal.send(false)
     }
 
     /// True when a server is picked so the middle column shows ITS channels — whether or not a
-    /// channel's chat is open (railServerId drives it, not just selection).
-    var inChannelsMode: Bool {
-        if case .space = selection { return true }
-        return railServerId != nil
-    }
+    /// channel's chat is open (opening a channel sets railServerId).
+    var inChannelsMode: Bool { railServerId != nil }
 
     /// Channels grouped by server — the skwod → servers → channels hierarchy the sidebar renders.
     /// Insertion order is preserved (newest server first, since addSpace inserts at the front).
@@ -522,49 +639,139 @@ final class ChatModel: ObservableObject {
         return order.compactMap { byServer[$0] }
     }
 
-    /// After a re-login or reinstall: the sidebar cache + device keys are gone but memberships
-    /// survive server-side. Rediscover every server we belong to and ask each host to re-provision
-    /// this (new) device — channels and keys reappear once the host's inbox sync answers. No invite
-    /// code needed: membership is the credential.
-    func recoverMemberships() async {
-        guard let app, let client = app.client, let asked = app.bindTicket(),
-              let token = app.session?.token, let base = URL(string: app.serverURL) else { return }
+    // MARK: Servers this device does not show yet (`ServerRecovery`)
+
+    @Published private(set) var recovery = ServerRecovery()
+    private var recoveryTask: Task<Void, Never>?
+    private var recoveryRun = 0
+    /// Bumped to make it look now.
+    private var recoveryKick = 0
+    /// Servers whose last channel the user removed from the sidebar by hand (this launch).
+    private var removedByHand: Set<String> = []
+
+    private var shownServers: Set<String> { Set(spaces.map(\.serverId)) }
+    private var hiddenServers: Set<String> { Set(tombstones.marks.keys).union(discoveries.keys).union(removedByHand) }
+
+    /// What the empty server list says.
+    var serversState: ServerRecovery.State {
+        recovery.state(setUp: app?.deviceId != nil, shown: shownServers, hidden: hiddenServers)
+    }
+
+    /// After a link, a restore, a re-login or a reinstall the sidebar is empty, but memberships
+    /// survive on the skwod: ask it which servers this account is in, show each as soon as its
+    /// keys are here, and ask the account's other devices and a member for the ones that are
+    /// not — again and again, backing off, until every one is shown. No invite code needed.
+    /// Something gave reason to look again: now.
+    func recoverMemberships() {
+        recovery.nudged()
+        recoveryKick &+= 1
+        startRecovery()
+    }
+
+    /// The same, unless everything the account is in is already here.
+    func recoverIfNeeded() {
+        guard !recovery.settled(shown: shownServers, hidden: hiddenServers) || spaces.isEmpty else { return }
+        recoverMemberships()
+    }
+
+    private func startRecovery() {
+        guard recoveryTask == nil, let origin = app?.current?.id else { return }
+        recoveryRun += 1
+        let run = recoveryRun
+        recoveryTask = Task { [weak self] in
+            await self?.recover(origin: origin)
+            if let self, self.recoveryRun == run { self.recoveryTask = nil }
+        }
+    }
+
+    private func stopRecovery() {
+        recoveryTask?.cancel()
+        recoveryTask = nil
+        recoveryRun += 1
+        recovery = ServerRecovery()
+        removedByHand = []
+    }
+
+    private func recover(origin: String) async {
+        while !Task.isCancelled, app?.current?.id == origin {
+            // Away (nothing is asked from behind), or the skwod is being reached: not an answer, and
+            // not a failure either.
+            while !Task.isCancelled, let app, app.current?.id == origin, app.bound == nil || (!app.clientIsOnline && app.isConnecting) {
+                try? await Task.sleep(for: .milliseconds(500))
+            }
+            await recoverOnce(origin: origin)
+            guard !Task.isCancelled, let app, app.current?.id == origin else { return }
+            if recovery.settled(shown: shownServers, hidden: hiddenServers) { return }
+            recovery.passed()
+            let kick = recoveryKick
+            var waited: TimeInterval = 0
+            while !Task.isCancelled, waited < recovery.delay(active: app.appActive),
+                  kick == recoveryKick || waited < ServerRecovery.spacing {
+                try? await Task.sleep(for: .milliseconds(500))
+                waited += 0.5
+            }
+        }
+    }
+
+    private func recoverOnce(origin: String) async {
+        // Only through this skwod's own client, as a device of the account, with its list read.
+        guard let app, let asked = app.bindTicket(), let client = try? BoundClient.of(app.bound, for: origin),
+              app.clientIsOnline, app.deviceId != nil, loadedFor == origin, spacesRead,
+              let token = app.session?.token, let base = URL(string: app.serverURL), !app.serverURL.isEmpty else {
+            recovery.answered(nil)
+            return
+        }
         var req = URLRequest(url: base.appendingPathComponent("api/servers"))
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
-              (resp as? HTTPURLResponse)?.statusCode == 200,
-              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let servers = obj["servers"] as? [[String: Any]] else { return }
+        let answer = try? await RawSink.data(for: req)
         // The list is the answer of the skwod that was bound when it was asked.
+        guard !Task.isCancelled, app.holds(asked) else { return }
+        guard let (data, resp) = answer, (resp as? HTTPURLResponse)?.statusCode == 200,
+              let owners = ServerListRule.owners(data) else {
+            recovery.answered(nil)
+            return
+        }
+        recovery.answered(Set(owners.keys))
+        guard !recovery.missing(shown: shownServers, hidden: hiddenServers).isEmpty else { return }
+        // (The keys may be in it. A join being watched syncs it already, and each wakes the other.)
+        if discoveries.isEmpty { await app.syncMailbox() }
+        var revealed = false
+        for sid in recovery.missing(shown: shownServers, hidden: hiddenServers).sorted() {
+            guard !Task.isCancelled, app.holds(asked) else { return }
+            let named = ((try? await client.listChannels(serverId: sid)) ?? []).filter { $0.name != nil && $0.kind != "voice" }
+            let name = (try? await client.serverName(serverId: sid)).flatMap { $0 }
+            guard !Task.isCancelled, app.holds(asked), !hiddenServers.contains(sid) else { continue }
+            for ch in named {
+                addSpaceQuietly(RealSpace(name: name ?? "Server", channelName: ch.name ?? "channel", serverId: sid,
+                                          channelId: ch.channelId, inviteCode: "", spaceKeyHex: ""), at: spaces.count)
+            }
+            if !named.isEmpty { revealed = true; continue }
+            recovery.found(sid, keyed: name != nil)
+            let now = Date().timeIntervalSince1970
+            guard name == nil, recovery.mayAsk(sid, now: now) else { continue }
+            recovery.didAsk(sid, now: now)
+            await askForKeys(of: sid, ownerId: owners[sid] ?? "", client: client, asked: asked)
+        }
+        guard revealed, !Task.isCancelled, app.holds(asked) else { return }
+        land()
+        // Their feeds, their members' names (`refreshRoster`), their roles.
+        await syncServerChannels()
+    }
+
+    /// Any confirmed member can provision this device — but ask BOTH another member AND this
+    /// account's own other devices, because whichever is ONLINE gets to answer (and only an own
+    /// device's space key is accepted without a pin).
+    private func askForKeys(of sid: String, ownerId: String, client: SkwodClient, asked: BindTicket) async {
+        guard let app, let me = app.session?.userId else { return }
+        let members = (try? await client.listMembers(serverId: sid)) ?? []
+        if let p = members.first(where: { $0.userId == ownerId && $0.userId != me }) ?? members.first(where: { $0.userId != me }),
+           app.holds(asked), let found = try? await client.findUser(username: p.username), found.userId == p.userId, app.holds(asked) {
+            try? await client.requestProvision(serverId: sid, hostUserId: found.userId, hostDeviceId: found.deviceId)
+        }
         guard app.holds(asked) else { return }
-        let me = app.session?.userId
-        for srv in servers {
-            guard app.holds(asked) else { return }
-            guard let sid = srv["server_id"] as? String,
-                  let ownerId = srv["owner_id"] as? String,
-                  !spaces.contains(where: { $0.serverId == sid }) else { continue }
-            // Any confirmed member can provision us — but ask BOTH another member AND all of this
-            // account's OWN other devices, because whichever is ONLINE gets to answer. (Asking only
-            // the other member fails when they're offline; and only an own device's space key is
-            // accepted anyway — a different account's SKEY is rejected by the trust guard. So the
-            // own-device ask is the reliable path for a linked second device.)
-            guard let members = try? await client.listMembers(serverId: sid) else { continue }
-            let provisioner = members.first(where: { $0.userId == ownerId && $0.userId != me })
-                ?? members.first(where: { $0.userId != me })
-            var peer: (userId: String, deviceId: String)?
-            if let p = provisioner, let found = try? await client.findUser(username: p.username), found.userId == p.userId {
-                peer = (found.userId, found.deviceId)
-                try? await client.requestProvision(serverId: sid, hostUserId: found.userId, hostDeviceId: found.deviceId)
-            }
-            if let me, let ownDevices = try? await client.listOwnDevices() {
-                for device in ownDevices where device != app.deviceId {
-                    if peer == nil { peer = (me, device) }
-                    try? await client.requestProvision(serverId: sid, hostUserId: me, hostDeviceId: device)
-                }
-            }
-            // A join that is being watched already covers this server.
-            if discoveries[sid] != nil { continue }
-            Task { await discover(serverId: sid, hostUserId: peer?.userId, hostDeviceId: peer?.deviceId, quiet: true) }
+        // (One request goes to every device of the account.)
+        if let device = (try? await client.listOwnDevices())?.first(where: { $0 != app.deviceId }), app.holds(asked) {
+            try? await client.requestProvision(serverId: sid, hostUserId: me, hostDeviceId: device)
         }
     }
 
@@ -583,7 +790,7 @@ final class ChatModel: ObservableObject {
             // (Builds before 43b listed them; drop any that were saved.)
             let voice = Set(channels.filter { $0.kind == "voice" }.map(\.channelId))
             if spaces.contains(where: { voice.contains($0.channelId) }) {
-                if case .space(let open) = selection, voice.contains(open.channelId) { selection = nil }
+                if case .space(let open) = selection, voice.contains(open.channelId) { closeOpen(open) }
                 spaces.removeAll { voice.contains($0.channelId) }
                 added = true
             }
@@ -672,7 +879,7 @@ final class ChatModel: ObservableObject {
             rolesAskedAt[sid] = Date()
             var req = URLRequest(url: base.appendingPathComponent("api/servers/\(sid)/members"))
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-            guard let (data, resp) = try? await URLSession.shared.data(for: req),
+            guard let (data, resp) = try? await RawSink.data(for: req),
                   (resp as? HTTPURLResponse)?.statusCode == 200,
                   let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let members = obj["members"] as? [[String: Any]],
@@ -683,6 +890,8 @@ final class ChatModel: ObservableObject {
             guard app.holds(asked) else { return }
             let ruleRoles: [ServerRoleRule.Role] = roles.map { .init(id: $0.roleId, permissions: $0.permissions, isDefault: $0.isDefault) }
             pinnedOwners[sid] = .some(pinned)
+            if Landing.mayCreateChannels(isOwner: pinned == me, permissions: ServerRoleRule.permissions(myRoleIds: mine, roles: ruleRoles)) { channelCreators.insert(sid) }
+            else { channelCreators.remove(sid) }
             serverRoles[sid] = ServerRoleRule.role(me: me, ownerId: pinned, myRoleIds: mine, roles: ruleRoles)
             var perms: [String: Int64] = [:]
             for m in members.prefix(5000) {
@@ -708,10 +917,13 @@ final class ChatModel: ObservableObject {
               let base = URL(string: app.serverURL), !app.serverURL.isEmpty else { return }
         var req = URLRequest(url: base.appendingPathComponent("api/servers"))
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+        guard let (data, resp) = try? await RawSink.data(for: req),
               (resp as? HTTPURLResponse)?.statusCode == 200,
               let owners = ServerListRule.owners(data), app.holds(asked) else { return }
         serverOwners = owners
+        // In the list but not here (joined on another device, keys still to come): look for it.
+        recovery.answered(Set(owners.keys))
+        if !recovery.settled(shown: shownServers, hidden: hiddenServers) { startRecovery() }
         await refreshRoles(Array(owners.keys))
         let gone = Set(spaces.map(\.serverId)).filter { !$0.isEmpty && $0 != "demo" && owners[$0] == nil }
         if !gone.isEmpty { dropServers(gone) }
@@ -756,12 +968,11 @@ final class ChatModel: ObservableObject {
         // now, and nothing already in flight can bring it back while the host answers.
         guard let asked = app.bindTicket(), tombstones.begin(serverId) else { return nil }
         let before = spaces
-        let openBefore = selection
         hideServers([serverId])
         var req = URLRequest(url: base.appendingPathComponent("api/servers/\(serverId)/members/\(me)"))
         req.httpMethod = "DELETE"
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        let code = ((try? await URLSession.shared.data(for: req))?.1 as? HTTPURLResponse)?.statusCode ?? 0
+        let code = ((try? await RawSink.data(for: req))?.1 as? HTTPURLResponse)?.statusCode ?? 0
         // Another skwod (or account) is on screen now: its sidebar is not touched. (Its
         // tombstones were reset by the switch; this one's list is read afresh next time.)
         guard app.holds(asked) else {
@@ -773,7 +984,6 @@ final class ChatModel: ObservableObject {
             // It did not happen: the channels come back where they were.
             if tombstones.failed(serverId) {
                 spaces = LeaveTombstones.restore(before: before, now: spaces, serverId: serverId, server: \.serverId, key: \.channelId)
-                if selection == nil, case .space(let open) = openBefore, open.serverId == serverId { selection = openBefore }
                 Task { await persist(spaces, key: "sidebar.spaces") }
             }
             return code == 400 ? "You own this server: delete it instead." : "Couldn't leave the server — check your connection and try again."
@@ -804,6 +1014,8 @@ final class ChatModel: ObservableObject {
 
     private func dropServers(_ ids: Set<String>) {
         tombstones.dropped(ids)
+        for id in ids { memory.forget(id) }
+        persistMemory()
         hideServers(ids)
     }
 
@@ -811,7 +1023,7 @@ final class ChatModel: ObservableObject {
     private func hideServers(_ ids: Set<String>) {
         // A join still being watched for one of them (waiting for keys) stops here.
         for id in ids { discoveries[id]?.cancel(); discoveries[id] = nil }
-        if case .space(let open) = selection, ids.contains(open.serverId) { selection = nil }
+        if case .space(let open) = selection, ids.contains(open.serverId) { closeOpen(open) }
         if let rail = railServerId, ids.contains(rail) { railServerId = nil }
         spaces.removeAll { ids.contains($0.serverId) }
         Task { await persist(spaces, key: "sidebar.spaces") }
@@ -820,7 +1032,8 @@ final class ChatModel: ObservableObject {
     /// Remove a channel from the sidebar (client-side only — the space itself lives on).
     func removeSpace(_ s: RealSpace) {
         spaces.removeAll { $0.id == s.id }
-        if selection == .space(s) { selection = nil }
+        if !shownServers.contains(s.serverId) { removedByHand.insert(s.serverId) }
+        if selection == .space(s) { closeOpen(s) }
         Task { await persist(spaces, key: "sidebar.spaces") }
     }
 
@@ -847,7 +1060,7 @@ final class ChatModel: ObservableObject {
     /// keys) and every channel is revealed the moment they do. The join is remembered on disk
     /// (`PendingJoinStore`) until it is finished, so quitting the app in the middle loses nothing.
     /// Returns an error string to show inline, or nil if the join was accepted/queued.
-    func joinByCode(_ code: String, afterSignup: Bool = false) async -> String? {
+    func joinByCode(_ code: String, afterSignup: Bool = false, resumed: Bool = false) async -> String? {
         guard let app, let client = app.client, let address = app.current?.server else { return "Not signed in." }
         var record = PendingJoinStore.get(address: address) ?? PendingJoin(code: code)
         record.code = code
@@ -875,12 +1088,13 @@ final class ChatModel: ObservableObject {
         }
         record.serverId = result.serverId
         tombstones.rejoined(result.serverId)   // joined (again) on purpose
+        removedByHand.remove(result.serverId)
         record.hostUserId = result.hostUserId
         record.hostDeviceId = result.hostDeviceId
         record.awaitingApproval = result.pending
         PendingJoinStore.set(record, address: address)
         joinStatus = result.pending ? .waitingForApproval : .settingUp(problem: nil)
-        watch(record)
+        watch(record, startedHere: !result.pending && !resumed)
         return nil
     }
 
@@ -894,7 +1108,7 @@ final class ChatModel: ObservableObject {
             guard !joinInFlight else { return }
             joinInFlight = true
             defer { joinInFlight = false }
-            _ = await joinByCode(record.code, afterSignup: true)
+            _ = await joinByCode(record.code, afterSignup: true, resumed: true)
             return
         }
         if spaces.contains(where: { $0.serverId == serverId }) {
@@ -953,14 +1167,17 @@ final class ChatModel: ObservableObject {
     }
 
     /// The mailbox was just synced: keys may have arrived — let the watchers look now.
-    func mailboxSynced() { if !discoveries.isEmpty { discoverKick += 1 } }
+    func mailboxSynced() {
+        if !discoveries.isEmpty { discoverKick += 1 }
+        recoveryKick &+= 1
+    }
 
-    private func watch(_ record: PendingJoin) {
+    private func watch(_ record: PendingJoin, startedHere: Bool = false) {
         guard let serverId = record.serverId else { return }
         discoveries[serverId]?.cancel()
         discoveries[serverId] = Task { [weak self] in
             await self?.discover(serverId: serverId, hostUserId: record.hostUserId, hostDeviceId: record.hostDeviceId,
-                                 quiet: false, joining: true)
+                                 startedHere: startedHere)
             self?.discoveries[serverId] = nil
         }
     }
@@ -970,14 +1187,12 @@ final class ChatModel: ObservableObject {
     /// when they have arrived), then lists channels; decrypted names mean provisioning is done.
     ///
     /// It looks when told to (`discoverKick`: the `join_approved` event, a `sealed` mailbox
-    /// sync, a reconnect) and otherwise every 25 s. A user-started join (`joining`) is watched
-    /// for as long as it is pending — it is also resumed on the next launch; background
-    /// recovery gives up after a while. While a member without keys, the request for them is
+    /// sync, a reconnect) and otherwise every 25 s, for as long as the join is pending — it is
+    /// also resumed on the next launch. While a member without keys, the request for them is
     /// repeated with backoff and a failure is SHOWN, not swallowed.
-    /// `quiet` = append channels without changing the user's current selection (background recovery
-    /// of many servers at login must not yank the user into a freshly-discovered channel); an
-    /// explicit user-initiated join passes quiet=false so it opens the joined channel.
-    private func discover(serverId: String, hostUserId: String?, hostDeviceId: String?, quiet: Bool = false, joining: Bool = false) async {
+    /// Nothing that is open changes; `startedHere` (a join the user just made) opens the server if
+    /// nothing is (`Landing.joined`).
+    private func discover(serverId: String, hostUserId: String?, hostDeviceId: String?, startedHere: Bool = false) async {
         // A discovery belongs to the skwod it was started in. It outlives rebinds of that
         // skwod (it waits for the client to come back), but after a switch to another skwod it
         // stops: what the first server lists is never added to the second's sidebar.
@@ -1004,22 +1219,23 @@ final class ChatModel: ObservableObject {
                     guard stillThere(), app.bound?.workspaceId == origin else { return }
                     // Left or deleted meanwhile (the watch was cancelled): it stays out.
                     if Task.isCancelled || tombstones.hides(serverId) { return }
-                    for ch in named {
+                    // (A joined server goes to the front, in the order it lists its channels.)
+                    for ch in named.reversed() {
                         let space = RealSpace(name: spaceName, channelName: ch.name ?? "channel", serverId: serverId,
                                               channelId: ch.channelId, inviteCode: "", spaceKeyHex: "")
-                        if quiet { addSpaceQuietly(space) } else { addSpace(space) }
+                        addSpaceQuietly(space, at: 0)
                     }
-                    if joining {
-                        if let address = app.current?.server { PendingJoinStore.clear(address: address) }
-                        joinStatus = nil
-                    }
+                    landing.joined(serverId, startedHere: startedHere, open: selection != nil || homeMode)
+                    land()
+                    if let address = app.current?.server { PendingJoinStore.clear(address: address) }
+                    joinStatus = nil
                     return
                 }
             }
             // A member whose keys have not come: ask whoever can hand them over — and keep
             // asking, a little less often each time. (While the request still needs approval
             // there is nobody to ask: the approver provisions us when they let us in.)
-            if member, joining, Date() >= nextAsk {
+            if member, Date() >= nextAsk {
                 if case .waitingForApproval = joinStatus { joinStatus = .settingUp(problem: nil) }
                 var asked = false
                 var failure: Error?
@@ -1047,32 +1263,24 @@ final class ChatModel: ObservableObject {
                 }
             }
             pass += 1
-            if !joining, pass >= 40 { return }
-            // Wait for a nudge, or 25 s (background recovery: 3 s, as before).
+            // Wait for a nudge, or 25 s.
             let kick = discoverKick
-            let slices = joining ? 50 : 6
-            for _ in 0..<slices where kick == discoverKick && !Task.isCancelled {
+            for _ in 0..<50 where kick == discoverKick && !Task.isCancelled {
                 try? await Task.sleep(for: .milliseconds(500))
             }
         }
     }
 
     /// Append a channel without touching selection/homeMode — for background discovery.
-    private func addSpaceQuietly(_ s: RealSpace) {
+    private func addSpaceQuietly(_ s: RealSpace, at index: Int) {
         guard !spaces.contains(where: { $0.channelId == s.channelId }), !tombstones.hides(s.serverId) else { return }
-        let wasEmpty = spaces.isEmpty
-        spaces.append(s)
-        // First channels to arrive after an empty load (re-login recovery) — open one so the skwod
-        // lands on a conversation instead of the blank overview.
-        if wasEmpty, selection == nil, !homeMode {
-            Task { await restoreLastChannel() }
-        }
+        spaces.insert(s, at: index)
         Task { await persist(spaces, key: "sidebar.spaces") }
         touchKeyBackup()
     }
 
     /// Enter the DMs/Friends home (the skwod rail icon): the list shows your Direct Messages.
-    func showHome() { homeMode = true; selection = nil }
+    func showHome() { homeMode = true; overview = false; landing.left(); selection = nil }
 
     // MARK: navigation history (back/forward titlebar arrows)
 
@@ -1086,6 +1294,9 @@ final class ChatModel: ObservableObject {
     /// selection can change (sidebar click, rail switch, join flow) is captured in one place.
     func recordNavigation(from old: SidebarItem?) {
         if navigating { navigating = false; return }
+        // Nothing open, or another skwod's channel, is not a place to go back to.
+        guard let old else { return }
+        if case .space(let s) = old, !spaces.contains(where: { $0.channelId == s.channelId }) { return }
         backStack.append(old)
         forwardStack.removeAll()
         updateNavFlags()
@@ -1094,7 +1305,7 @@ final class ChatModel: ObservableObject {
     func goBack() {
         guard let prev = backStack.popLast() else { return }
         navigating = true
-        forwardStack.append(selection)
+        if selection != nil { forwardStack.append(selection) }
         selection = prev
         updateNavFlags()
     }
@@ -1102,7 +1313,7 @@ final class ChatModel: ObservableObject {
     func goForward() {
         guard let next = forwardStack.popLast() else { return }
         navigating = true
-        backStack.append(selection)
+        if selection != nil { backStack.append(selection) }
         selection = next
         updateNavFlags()
     }

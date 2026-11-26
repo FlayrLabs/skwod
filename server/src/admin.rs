@@ -420,6 +420,7 @@ async fn status(State(admin): State<Admin>, ConnectInfo(peer): ConnectInfo<Socke
     let st = ctl.status();
     let count = |sql: &'static str| async move { sqlx::query_scalar::<_, i64>(sql).fetch_one(&ctl.state.db).await.unwrap_or(0) };
     let owner_claimed = ctl.owner_claimed().await;
+    let voice = crate::livekit::status(&ctl.state).await;
     let invite = current_invite(ctl, local).await.map(|(link, kind, expires_at)| json!({ "link": link, "kind": kind, "expires_at": expires_at }));
     Json(json!({
         "phase": st.phase.as_str(),
@@ -444,7 +445,11 @@ async fn status(State(admin): State<Admin>, ConnectInfo(peer): ConnectInfo<Socke
         "members": count("SELECT count(*) FROM users").await,
         "online": ctl.state.ws_conns.lock().await.len(),
         "spaces": count("SELECT count(*) FROM servers").await,
-        "voice": st.voice,
+        "voice": voice.phase == crate::livekit::VoicePhase::On,
+        "voice_status": voice.phase.as_str(),
+        "voice_reason": voice.reason.code(),
+        // Only its name, so the host can see what calls use; the owner clears it in the app.
+        "voice_server": crate::livekit::external_url(&ctl.state).await.and_then(|u| url::Url::parse(&u).ok()?.host_str().map(str::to_string)),
         "p2p": st.p2p,
         "local_discovery": st.local_discovery,
         "public_fallback": ctl.state.p2p.get().map(|p| p.public_fallback),

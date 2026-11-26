@@ -273,9 +273,12 @@ object LocalData {
     /** The roster names the contact book was seeded from, in the encrypted store. */
     fun rosterName(workspaceId: String) = "roster-$workspaceId"
 
+    /** Where the host was last reached directly (the core's, opaque), in the encrypted store. */
+    fun routesName(workspaceId: String) = "routes-$workspaceId"
+
     /** Everything the ENCRYPTED store keeps under this skwod's id. */
     fun secretNames(workspaceId: String): List<String> =
-        listOf(cacheKeyName(workspaceId), mutesName(workspaceId), announcedName(workspaceId), contactsName(workspaceId), rosterName(workspaceId))
+        listOf(cacheKeyName(workspaceId), mutesName(workspaceId), announcedName(workspaceId), contactsName(workspaceId), rosterName(workspaceId), routesName(workspaceId))
 
     /**
      * Copies of an unreadable contact book are kept beside it as `contacts-<id>.unreadable.<ms>`

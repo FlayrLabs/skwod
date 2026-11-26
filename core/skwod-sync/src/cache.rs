@@ -431,8 +431,10 @@ impl Cache {
             }
             Ok::<_, CacheError>(())
         })();
-        match result {
-            Ok(()) => Ok(self.conn.execute_batch("COMMIT")?),
+        match result.and_then(|()| Ok(self.conn.execute_batch("COMMIT")?)) {
+            Ok(()) => Ok(()),
+            // A COMMIT can fail too (the disk is full, another connection is reading), and SQLite
+            // then leaves the transaction — and its lock on the file — open.
             Err(e) => {
                 let _ = self.conn.execute_batch("ROLLBACK");
                 Err(e)
@@ -746,6 +748,29 @@ mod tests {
         c.sent_put("dm:new", b"new", 900).unwrap();
         c.sent_prune(500).unwrap();
         assert_eq!((c.sent_get("dm:old").unwrap(), c.sent_get("dm:new").unwrap().as_deref()), (None, Some(&b"new"[..])));
+    }
+
+    /// A COMMIT that fails (another connection holds a read lock) leaves nothing open: no
+    /// transaction, no lock on the file, and the next write goes through.
+    #[test]
+    fn a_failed_commit_leaves_no_transaction_and_no_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("cache.db");
+        let c = Cache::open(&path, &key(8)).unwrap();
+        c.persist_send("engine-state", b"ratchet-1", None).unwrap();
+        c.conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        let reader = Cache::open(&path, &key(8)).unwrap();
+        reader.conn.execute_batch("BEGIN; SELECT count(*) FROM sessions;").unwrap();
+        assert!(c.persist_send("engine-state", b"ratchet-2", Some(&msg("m1", "dm:x", 10))).is_err(), "the reader blocks the commit");
+        assert!(c.conn.is_autocommit(), "no transaction is left open");
+        reader.conn.execute_batch("COMMIT").unwrap();
+        // Nothing of it was kept, and another connection can write at once.
+        reader.conn.busy_timeout(std::time::Duration::ZERO).unwrap();
+        assert_eq!(reader.session_get("engine-state").unwrap().as_deref(), Some(&b"ratchet-1"[..]));
+        assert!(reader.message("dm:x", "m1").unwrap().is_none());
+        reader.kv_set("k", "v").unwrap();
+        c.persist_send("engine-state", b"ratchet-3", None).unwrap();
+        assert_eq!(c.session_get("engine-state").unwrap().as_deref(), Some(&b"ratchet-3"[..]));
     }
 
     #[test]

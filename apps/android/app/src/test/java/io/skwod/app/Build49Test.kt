@@ -157,7 +157,7 @@ class Build49Test {
     @Test fun onlyTheExplicitVerifyRaisesTrust() {
         val root = java.io.File("src/main/java")
         val raisers = root.walkTopDown().filter { it.extension == "kt" }.flatMap { f ->
-            f.readLines().filter { l -> l.contains("setVerified(") && !l.contains("fun setVerified") && !l.trim().startsWith("//") && !l.trim().startsWith("*") }
+            f.readLines().filter { l -> (l.contains("setVerified(") || l.contains("setVerifiedIn(")) && !l.contains("fun setVerified") && !l.trim().startsWith("//") && !l.trim().startsWith("*") }
                 .filter { l -> !l.contains(", false,") }.map { f.name }
         }.toList()
         // The explicit verify, and the store's workspace-bound sibling raise
@@ -219,5 +219,66 @@ class Build49Test {
         book = ContactTrust.unverify(book, "v")
         assertEquals(TrustLevel.UNVERIFIED, book["v"]?.level)
         assertEquals(TrustLevel.KNOWN, SiblingRules.mergedContact(null, Contact("k", "kim", TrustLevel.VERIFIED, true), true, false, emptyMap())?.level)
+    }
+
+    /** A skwod switch during a sibling-driven change writes nothing, to either skwod. */
+    @Test fun aSwitchDuringASiblingWriteWritesNothing() {
+        var current = "w1"
+        val writes = mutableListOf<String>()
+        // Switch in the middle of the change.
+        val r = GatedWrite.apply("w1", { current }, { current }, mapOf("a" to 1), { current = "w2"; it + ("b" to 2) }) { w, _ -> writes += w }
+        assertNull(r)
+        assertTrue(writes.isEmpty())
+        // Already switched (or the other skwod's book loaded): nothing either.
+        current = "w2"
+        assertNull(GatedWrite.apply("w1", { current }, { "w2" }, mapOf("a" to 1), { it + ("b" to 2) }) { w, _ -> writes += w })
+        assertNull(GatedWrite.apply("w1", { "w1" }, { "w2" }, mapOf("a" to 1), { it + ("b" to 2) }) { w, _ -> writes += w })
+        assertTrue(writes.isEmpty())
+        // The same skwod throughout: written, to that skwod's key.
+        current = "w1"
+        assertEquals(mapOf("a" to 1, "b" to 2), GatedWrite.apply("w1", { current }, { current }, mapOf("a" to 1), { it + ("b" to 2) }) { w, _ -> writes += w })
+        assertEquals(listOf("w1"), writes)
+    }
+
+    /** Every contact-book writer names its workspace: no write falls back to `model.current`. */
+    @Test fun everyContactWriterNamesItsWorkspace() {
+        val src = java.io.File("src/main/java/io/skwod/app/Contacts.kt").readText()
+        for (w in listOf("migrate", "claim", "markKnown", "dmOpened", "setVerified", "noteStatusRead"))
+            assertTrue(w, Regex("""fun $w\(workspaceId: String,""").containsMatchIn(src))
+        assertTrue(src.contains("private fun update(workspaceId: String,"))
+        assertFalse("a nullable fallback is back", src.contains("expectedWorkspace"))
+        // The GatedWrite rule itself: a different current skwod writes nothing.
+        val writes = mutableListOf<String>()
+        assertNull(GatedWrite.apply("w1", { "w2" }, { "w1" }, mapOf("a" to 1), { it + ("b" to 2) }) { w, _ -> writes += w })
+        assertTrue(writes.isEmpty())
+    }
+
+    /** The verify gate runs against the book being written: a flagged (look-alike) name is refused. */
+    @Test fun verifyGateInsideTheWriteRefusesAFlaggedEntry() {
+        val book = mapOf("u-alice" to Contact("u-alice", "alice", TrustLevel.KNOWN))
+        assertNull(ContactTrust.verifiedBook(book, "u-mallory", "alice", emptyMap(), emptyMap()))
+        val ok = ContactTrust.verifiedBook(book, "u-bob", "bob", emptyMap(), mapOf("u-bob|bob" to WaitingTrust.Lookup.Found("u-bob")))
+        assertEquals(TrustLevel.VERIFIED, ok?.get("u-bob")?.level)
+    }
+
+    /** A skwod switch during the verify call: nothing is recorded. */
+    @Test fun aSwitchDuringVerifyWritesNothing() = kotlinx.coroutines.runBlocking {
+        var bound: Any? = "binding-1"
+        val asked = bound!!
+        var recorded = false
+        val ran = BoundStep.run(asked, { bound }, { bound = "binding-2" }) { recorded = true }
+        assertFalse(ran); assertFalse(recorded)
+        bound = asked
+        assertTrue(BoundStep.run(asked, { bound }, {}) { recorded = true }); assertTrue(recorded)
+    }
+
+    /** Clear all: a switch between opening and confirming aborts; so does not being the owner. */
+    @Test fun clearAllIsAbortedAfterASwitch() {
+        val b1 = Any(); val b2 = Any()
+        val req = ClearAllRequest(b1, listOf("s1"), "Weekend Squad")
+        assertFalse(req.mayProceed(b2, isInstanceOwner = true))
+        assertFalse(req.mayProceed(null, isInstanceOwner = true))
+        assertFalse(req.mayProceed(b1, isInstanceOwner = false))
+        assertTrue(req.mayProceed(b1, isInstanceOwner = true))
     }
 }

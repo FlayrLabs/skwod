@@ -27,6 +27,8 @@ use crate::state::{new_id, now_ms, AppState};
 /// The expiry is only rewritten when it has drifted this far from "ttl from now" — so a busy
 /// client costs one extra column write an hour, not one per request.
 const SLIDE_SLACK_MS: i64 = 60 * 60 * 1000;
+/// See [`rotate`].
+pub const ROTATION_KEY_HEADER: &str = "x-skwod-rotation-key";
 /// After a rotation the previous token keeps working this long, for requests already in flight
 /// and for a client that never saw the response.
 pub const ROTATE_GRACE_MS: i64 = 5 * 60 * 1000;
@@ -200,7 +202,7 @@ pub(crate) async fn touch_session_device(state: &AppState, hash: &[u8]) -> Resul
     // new expiry = min(now + ttl, origin + max), and never earlier than the current one (a
     // rotated-away token is left to run out its grace period).
     let live: Option<(String, Option<String>, Option<i64>)> = sqlx::query_as(
-        "UPDATE sessions SET last_used_at = $1,
+        "UPDATE sessions SET last_used_at = $1, used = 1,
                 expires_at = CASE
                     WHEN expires_at - $1 > $2 - $3 THEN expires_at
                     WHEN origin_at + $4 < $1 + $2 THEN CASE WHEN origin_at + $4 > expires_at THEN origin_at + $4 ELSE expires_at END
@@ -456,6 +458,13 @@ pub(crate) async fn create_session(state: &AppState, user_id: &str) -> Result<Se
 /// (`origin_at`), so rotating never extends the absolute lifetime. The push registration made
 /// under the old token moves to the new one — a rotation must not cost the device its wakes —
 /// and the old token keeps working for [`ROTATE_GRACE_MS`] and then is gone.
+///
+/// The answer can be lost. A client that sent a **rotation key** ([`ROTATION_KEY_HEADER`]: random,
+/// its own, stored before it asked) may therefore ask again with the old token — within the old
+/// token's grace, which is never extended, and only while the token issued in its place has not
+/// been used: that one was never held by anybody, and is deleted. Whoever holds only the old token
+/// (and not the key) gets nothing from this: it cannot rotate, exactly as before. Without a key
+/// (an older app) a rotated token cannot rotate again, as before.
 async fn rotate(State(state): State<AppState>, headers: axum::http::HeaderMap) -> Result<Json<SessionResponse>, ApiError> {
     let old = headers
         .get(axum::http::header::AUTHORIZATION)
@@ -464,16 +473,23 @@ async fn rotate(State(state): State<AppState>, headers: axum::http::HeaderMap) -
         .ok_or(ApiError::Unauthorized)?;
     let old_hash = token_hash(old);
     let now = now_ms();
-    let mut tx = state.db.begin().await?;
-    // Only a live, not-yet-rotated session can be rotated (a stolen old token cannot mint new ones
-    // once its owner has rotated).
-    #[allow(clippy::type_complexity)]
-    let row: Option<(String, i64, Option<String>, Option<i64>, i64)> = sqlx::query_as("SELECT user_id, origin_at, device_id, device_generation, pre_migration FROM sessions WHERE token_hash = $1 AND expires_at > $2 AND superseded = 0")
+    let key_hash: Option<Vec<u8>> = headers.get(ROTATION_KEY_HEADER).and_then(|v| v.to_str().ok()).filter(|k| (32..=128).contains(&k.len())).map(token_hash);
+    let row: Option<(String, i64, i64, Option<Vec<u8>>, Option<Vec<u8>>)> = sqlx::query_as("SELECT user_id, origin_at, superseded, rotation_key, successor_hash FROM sessions WHERE token_hash = $1 AND expires_at > $2")
         .bind(&old_hash)
         .bind(now)
-        .fetch_optional(&mut *tx)
+        .fetch_optional(&state.db)
         .await?;
-    let (user_id, origin_at, device_id, device_generation, pre_migration) = row.ok_or(ApiError::Unauthorized)?;
+    let (user_id, origin_at, superseded, rotation_key, successor) = row.ok_or(ApiError::Unauthorized)?;
+    // Only a live, not-yet-rotated session can be rotated (a stolen old token cannot mint new ones
+    // once its owner has rotated) — or one whose rotation's answer was lost, by whoever holds the
+    // key it was asked with, while what it issued is unused.
+    let unheld = if superseded == 0 { None } else {
+        let (Some(presented), Some(stored), Some(successor)) = (&key_hash, &rotation_key, successor) else { return Err(ApiError::Unauthorized) };
+        if !bool::from(subtle::ConstantTimeEq::ct_eq(presented.as_slice(), stored.as_slice())) { return Err(ApiError::Unauthorized) }
+        let unused: Option<i64> = sqlx::query_scalar("SELECT 1 FROM sessions WHERE token_hash = $1 AND used = 0 AND superseded = 0").bind(&successor).fetch_optional(&state.db).await?;
+        if unused.is_none() { return Err(ApiError::Unauthorized) }
+        Some(successor)
+    };
     state.limiter.check(&format!("rotate:{user_id}"), 30, crate::limiter::HOUR)?;
     let mut raw = [0u8; 32];
     rand::rngs::OsRng.fill_bytes(&mut raw);
@@ -482,6 +498,51 @@ async fn rotate(State(state): State<AppState>, headers: axum::http::HeaderMap) -
     let expires_at = (now + state.session_ttl_ms).min(origin_at + state.session_max_ms);
     if expires_at <= now {
         return Err(ApiError::Unauthorized);
+    }
+    let mut tx = state.db.begin().await?;
+    // The row is CLAIMED first, as what was read above: of any number of rotations at the same
+    // moment one goes on and the others change nothing — the key and the successor recorded are
+    // both the winner's. (A write first, too: nothing in here rests on an earlier read.)
+    #[allow(clippy::type_complexity)]
+    let claimed: Option<(Option<String>, Option<i64>, i64)> = match &unheld {
+        // A session issued for "Add a device" belongs to its pairing request until it registered
+        // the device: what revokes the request must find it, so it is not rotated before.
+        None => sqlx::query_as(
+            "UPDATE sessions SET superseded = 1, expires_at = CASE WHEN expires_at < $1 THEN expires_at ELSE $1 END, rotation_key = $3, successor_hash = $4
+              WHERE token_hash = $2 AND superseded = 0 AND expires_at > $5
+                AND (device_id IS NOT NULL OR NOT EXISTS (SELECT 1 FROM device_pair_requests WHERE session_hash = $2 AND registered = 0))
+              RETURNING device_id, device_generation, pre_migration",
+        )
+        .bind(now + ROTATE_GRACE_MS)
+        .bind(&old_hash)
+        .bind(&key_hash)
+        .bind(&new_hash)
+        .bind(now)
+        .fetch_optional(&mut *tx)
+        .await?,
+        // (A grace that is running is never extended.)
+        Some(unheld) => sqlx::query_as("UPDATE sessions SET successor_hash = $1 WHERE token_hash = $2 AND superseded = 1 AND successor_hash = $3 AND expires_at > $4 RETURNING device_id, device_generation, pre_migration")
+            .bind(&new_hash)
+            .bind(&old_hash)
+            .bind(unheld)
+            .bind(now)
+            .fetch_optional(&mut *tx)
+            .await?,
+    };
+    let Some((device_id, device_generation, pre_migration)) = claimed else {
+        tx.rollback().await?;
+        let still: Option<i64> = sqlx::query_scalar("SELECT 1 FROM sessions WHERE token_hash = $1 AND superseded = 0 AND expires_at > $2").bind(&old_hash).bind(now).fetch_optional(&state.db).await?;
+        return Err(if still.is_some() { ApiError::Conflict("this device is still being added") } else { ApiError::Unauthorized });
+    };
+    // The one nobody ever held is taken out of use here, as it is NOW: neither used nor rotated
+    // itself meanwhile (which marks it superseded, not used). Its row stays until what hangs on it
+    // has moved.
+    if let Some(unheld) = &unheld {
+        let taken = sqlx::query("UPDATE sessions SET superseded = 1 WHERE token_hash = $1 AND used = 0 AND superseded = 0").bind(unheld).execute(&mut *tx).await?.rows_affected();
+        if taken != 1 {
+            tx.rollback().await?;
+            return Err(ApiError::Unauthorized);
+        }
     }
     // The new token speaks for the same device as the one it replaces.
     sqlx::query(
@@ -501,18 +562,18 @@ async fn rotate(State(state): State<AppState>, headers: axum::http::HeaderMap) -
     .bind(pre_migration)
     .execute(&mut *tx)
     .await?;
-    sqlx::query("UPDATE push_registrations SET session_hash = $1, updated_at = $2 WHERE session_hash = $3")
-        .bind(&new_hash)
-        .bind(now)
-        .bind(&old_hash)
-        .execute(&mut *tx)
-        .await?;
-    sqlx::query("UPDATE push_tokens SET session_hash = $1 WHERE session_hash = $2").bind(&new_hash).bind(&old_hash).execute(&mut *tx).await?;
-    sqlx::query("UPDATE sessions SET superseded = 1, expires_at = CASE WHEN expires_at < $1 THEN expires_at ELSE $1 END WHERE token_hash = $2")
-        .bind(now + ROTATE_GRACE_MS)
-        .bind(&old_hash)
-        .execute(&mut *tx)
-        .await?;
+    for from in std::iter::once(&old_hash).chain(&unheld) {
+        sqlx::query("UPDATE push_registrations SET session_hash = $1, updated_at = $2 WHERE session_hash = $3")
+            .bind(&new_hash)
+            .bind(now)
+            .bind(from)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("UPDATE push_tokens SET session_hash = $1 WHERE session_hash = $2").bind(&new_hash).bind(from).execute(&mut *tx).await?;
+    }
+    if let Some(unheld) = &unheld {
+        sqlx::query("DELETE FROM sessions WHERE token_hash = $1").bind(unheld).execute(&mut *tx).await?;
+    }
     tx.commit().await?;
     Ok(Json(SessionResponse { user_id, token, expires_at }))
 }

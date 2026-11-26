@@ -8,9 +8,11 @@ members = [
     "skwod-core",
     "skwod-net",
 ]
+# Third-party source kept here (see vendor/verify.sh), not ours.
+exclude = ["vendor"]
 
 [workspace.package]
-version = "0.50.0"
+version = "0.51.0"
 edition = "2021"
 license = "AGPL-3.0-only"     # ADR-011 (supersedes ADR-002): we link libsignal
 rust-version = "1.93.1"     # libsignal v0.108.0 MSRV
@@ -30,3 +32,8 @@ opt-level = 3
 opt-level = 3
 [profile.dev.package.skwod-net]
 opt-level = 3
+
+# The published 0.7.2 plus vendor/n0-mainline-0.7.2.patch: a DHT socket that iOS took away (or that
+# dies in any other way) made its task spin for ever and kept the only thread of the apps' runtime.
+[patch.crates-io]
+n0-mainline = { path = "vendor/n0-mainline" }

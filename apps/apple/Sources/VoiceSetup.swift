@@ -147,9 +147,80 @@ struct VoiceSetupSheet: View {
             let d = String(describing: error).lowercased()
             self.error = d.contains("forbidden") || d.contains("403")
                 ? "Only the host can turn this on."
+                : d.contains("409")
+                    ? "This Skwod has its own call server. There is nothing to set up."
                 : d.contains("badrequest") || d.contains("400")
                     ? "Check the URL (wss://…), key, and secret."
                     : "Couldn't save — check the values and your connection."
+        }
+    }
+}
+
+extension VoiceFailure {
+    /// A failed voice request of the core.
+    init(_ error: Error) {
+        if case CoreError.Voice(let code) = error { self.init(code: code) } else { self = .other }
+    }
+}
+
+/// Skwod settings, host only: the call server saved for this skwod, if one is, and the way back to
+/// its own. Shown only while one is saved. The server takes it from the owner's device alone (signed).
+struct VoiceServerCard<Below: View>: View {
+    /// The settings card under it (one column, so nothing shows — no gap either — when none is saved).
+    @ViewBuilder var below: Below
+    @EnvironmentObject private var app: AppState
+    @State private var config: VoiceConfig?
+    @State private var confirm = false
+    @State private var busy = false
+    @State private var note = ""
+
+    private var host: String { config?.url.flatMap { URLComponents(string: $0)?.host } ?? "another server" }
+    private var bundled: Bool { config?.bundled == true }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 18) {
+            if config?.external == true {
+                GlassCard {
+                    VStack(alignment: .leading, spacing: 8) {
+                        Text("Voice & video").font(.callout.weight(.semibold)).foregroundStyle(.white)
+                        Text("Calls use a call server saved here: \(host).").font(.caption).foregroundStyle(.white.opacity(0.55))
+                        Button(role: .destructive) { confirm = true } label: {
+                            HStack(spacing: 6) {
+                                if busy { ProgressView().controlSize(.small) }
+                                Text(bundled ? "Use this Skwod's own call server" : "Remove it")
+                            }
+                        }
+                        .buttonStyle(.glass).disabled(busy)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                }
+            }
+            if !note.isEmpty { Text(note).font(.caption).foregroundStyle(.white.opacity(0.6)) }
+            below
+        }
+        .task { await load() }
+        .confirmationDialog(bundled ? "Use this Skwod's own call server?" : "Remove the saved call server?", isPresented: $confirm, titleVisibility: .visible) {
+            Button(bundled ? "Use its own" : "Remove", role: .destructive) { Task { await clear() } }
+            Button("Cancel", role: .cancel) {}
+        } message: {
+            Text("The saved address, key and secret are removed. Calls in progress end." + (bundled ? "" : " Voice is off until a call server is set up again."))
+        }
+    }
+
+    private func load() async {
+        config = try? await app.client?.voiceConfig()
+    }
+
+    private func clear() async {
+        guard let client = app.client, !busy else { return }
+        busy = true
+        defer { busy = false }
+        do {
+            _ = try await client.clearVoiceConfig()
+            note = bundled ? "Done. Voice is starting." : "Removed."
+            await load()
+        } catch {
+            note = "Couldn't remove it. Check your connection and try again."
         }
     }
 }

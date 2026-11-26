@@ -102,6 +102,12 @@ enum E2E {
 
     @MainActor static func sawEvent(_ name: String) { events[name, default: 0] += 1 }
 
+    // ---- build 51: catch-up and what the open conversation shows ----
+    @MainActor private static var catchUps = 0
+    @MainActor static func sawCatchUp() { catchUps += 1 }
+    /// What the chat surface on screen shows right now (written by `ChatSurface`).
+    @MainActor static var visibleChat: [String: Any] = [:]
+
     // ---- build 44: outbox, reports, blocks ----
     @MainActor private static var outbox: [String: Any] = [:]
     @MainActor private static var reports: [[String: Any]] = []
@@ -240,6 +246,9 @@ enum E2E {
             "delivered": delivered,
             "events": events,
             "socket_live": app.realtime.isLive,
+            "catch_ups": catchUps,
+            "visible_chat": visibleChat,
+            "connection": app.connection.title,
             "dm_events": dmEvents,
             "outbox": outbox,
             "uploads": uploads,
@@ -523,7 +532,7 @@ enum E2E {
                 target = .dm(conversationId: d.convo, peers: [d.peer])
             }
             let before = Self.residentMemory()
-            note(command, await outcome { try await StreamedUpload.queue(.file(URL(fileURLWithPath: path)), to: target, app: app) }
+            note(command, await outcome { guard let bound = app.bound else { throw AttachmentError.notSignedIn }; try await StreamedUpload.queue(.file(URL(fileURLWithPath: path)), to: target, through: bound.client, workspace: bound.workspaceId, app: app) }
                  + " memory_delta_mb=\((Int64(Self.residentMemory()) - Int64(before)) / 1_048_576)")
         case "uploads":
             let pending = await client.pendingUploads()
@@ -920,9 +929,18 @@ enum E2E {
             app.enterBackground(); app.setActive(false)
             note(command, "socket_live=\(app.realtime.isLive)")
         case "foreground":
+            app.store.becameActive()
             app.setActive(true)
             await app.enterForeground()
             note(command, "ok")
+        case "relay":
+            // relay:on|off — what the "Use a relay when needed" toggle does.
+            UserDefaults.standard.set(arg == "on", forKey: "skwod.p2p.publicFallback")
+            await app.reconnectAfterTransportSettingChange()
+            note(command, "publicFallback=\(P2PManager.publicFallback)")
+        case "check":
+            // An urgent connection check (what a foreground or a network change runs).
+            note(command, "\(await app.checkConnection(urgent: true))")
         case "join":
             note(command, await chat.joinByCode(arg) ?? "ok")
         case "open":
@@ -1077,7 +1095,7 @@ enum E2E {
               // member list + a matching findUser: still only the quiet "unverified" marker…
               && ContactTrust.display(userId: "u-sam", claimedName: "sam", book: ["u-sam": serverOnly], roster: ["u-sam": "sam"], lookup: true).badge == .unverified
               // …and without that match (another id, nobody, no answer) it is flagged.
-              && ContactTrust.display(userId: "u-sam", claimedName: "sam", book: [:], lookup: false).badge == .unconfirmed
+              && ContactTrust.display(userId: "u-sam", claimedName: "sam", book: [:], lookup: false).badge == .mismatch
               && ContactTrust.display(userId: "u-sam", claimedName: "sam", book: [:], lookup: false).text.hasPrefix("Unknown contact")
               && ContactTrust.display(userId: "u-sam", claimedName: "sam", book: [:], lookup: nil) == .init(text: "sam", badge: .unconfirmed)
               && ContactTrust.merged(existing: book["u-merhan"], name: "mallory", level: .unverified) == book["u-merhan"]

@@ -548,6 +548,36 @@ async fn a_claimed_session_is_revoked_when_the_request_is_contested() {
     assert_ne!(send(&app, "POST", "/api/e2ee/devices/register", Some(&session), Some(body)).await.0, StatusCode::OK);
 }
 
+/// A claimed session is its request's until it registered the device: rotating it would leave the
+/// contest (or the expiry) nothing to revoke. Refused without ending anything; afterwards it
+/// rotates like any other.
+#[tokio::test]
+async fn a_claimed_session_is_not_rotated_away_from_its_request() {
+    let (state, app) = app().await;
+    let (user_id, token) = signup(&app, "alice").await;
+    let (linker, linker_dev) = first_device(&app, &token).await;
+    let o = offer();
+    register_offer(&app, &token, &linker, &user_id, "alice", &o).await;
+    let (_, _, session, _) = paired(&app, &token, &linker, &linker_dev, &user_id, &o).await;
+    let before = sessions_of(&state, &user_id).await;
+    assert_eq!(send(&app, "POST", "/api/auth/rotate", Some(&session), None).await.0, StatusCode::CONFLICT);
+    assert_eq!(sessions_of(&state, &user_id).await, before, "nothing was issued");
+    assert_eq!(send(&app, "GET", "/api/auth/me", Some(&session), None).await.0, StatusCode::OK, "and nothing ended");
+    crate::pairing::contest_for_tests(&state, &o).await;
+    assert_eq!(send(&app, "GET", "/api/auth/me", Some(&session), None).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(sessions_of(&state, &user_id).await, before - 1, "the contest left no session behind");
+
+    let o = offer();
+    register_offer(&app, &token, &linker, &user_id, "alice", &o).await;
+    let (mut store, _, session, link_sig) = paired(&app, &token, &linker, &linker_dev, &user_id, &o).await;
+    let (mut body, _) = crate::accounts_tests::keys(&mut store);
+    body["link"] = json!({ "device_id": linker_dev, "signature": link_sig });
+    assert_eq!(send(&app, "POST", "/api/e2ee/devices/register", Some(&session), Some(body)).await.0, StatusCode::OK);
+    let (status, v) = send(&app, "POST", "/api/auth/rotate", Some(&session), None).await;
+    assert_eq!(status, StatusCode::OK, "{v}");
+    assert_eq!(send(&app, "GET", "/api/auth/me", v["token"].as_str(), None).await.0, StatusCode::OK);
+}
+
 /// L4: only a session bound to a current device may deny, and only so often.
 #[tokio::test]
 async fn deny_needs_a_bound_device_session_and_is_rate_limited() {

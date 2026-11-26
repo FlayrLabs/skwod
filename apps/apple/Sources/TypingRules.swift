@@ -7,6 +7,13 @@ struct TypingAudience: Equatable {
     /// The channel id, or the DM / group conversation id.
     var conversationId: String
     var members: Set<String>
+    /// user id → the name the conversation has for them (a claim: the trust rules decide what shows).
+    var names: [String: String] = [:]
+
+    init(conversationId: String, members: Set<String>) { self.conversationId = conversationId; self.members = members }
+    init(conversationId: String, names: [String: String]) {
+        self.conversationId = conversationId; members = Set(names.keys); self.names = names
+    }
 
     /// Is `userId` typing in `topic` ("channel:<id>" / "dm:<id>") someone this audience allows?
     static func accepts(userId: String, topic: String, audience: TypingAudience?) -> Bool {
@@ -58,6 +65,12 @@ struct TypingState: Equatable {
     func active(now: Date) -> [String] {
         typers.filter { now.timeIntervalSince($0.value) < Self.lifetime }
             .sorted { ($0.value, $0.key) < ($1.value, $1.key) }.map(\.key)
+    }
+
+    /// What to call them: each with the name the conversation claims for them (what its message
+    /// headers start from), through `label`, the contact book's rule.
+    func names(now: Date, audience: TypingAudience?, label: (String, String?) -> String) -> [String] {
+        active(now: now).map { label($0, audience?.names[$0]) }
     }
 
     /// "Sam is typing…", "Sam and Robin are typing…", "Several people are typing…".

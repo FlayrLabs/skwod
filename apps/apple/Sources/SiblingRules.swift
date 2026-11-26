@@ -6,6 +6,20 @@ import Foundation
 /// its own rules and lists the contacts whose devices it sees differently (`mismatched`): those
 /// are skipped here entirely. Foundation only: the logic tests compile it.
 enum SiblingRules {
+    /// A newly linked device asks its siblings for their state until one has handed it over: the
+    /// sibling may be away, or send before its snapshot is here (then nothing can be taken).
+    /// (A sibling answers one device at most every 10 minutes.)
+    static let requestGap: TimeInterval = 11 * 60
+    /// Per launch, at most (a sibling too old to answer is not asked for ever).
+    static let maxRequests = 6
+
+    static func mayRequest(answered: Bool, asks: Int, lastAsk: TimeInterval?, now: TimeInterval) -> Bool {
+        !answered && asks < maxRequests && (lastAsk.map { now - $0 >= requestGap } ?? true)
+    }
+
+    /// Did this contact book answer the request? Not when nobody in it could be taken.
+    static func answers(book: [String: Contact], vouched: [String]) -> Bool { book.isEmpty || !vouched.isEmpty }
+
     /// One synced contact against what this device has (`book`: the book as merged so far,
     /// local entries first). A name the user set here (known or verified) always wins; a synced
     /// name never counts for more than KNOWN here — VERIFIED comes only from the core's own

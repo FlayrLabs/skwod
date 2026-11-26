@@ -40,7 +40,7 @@ print the `skwod://` form. Grammar and tests: `core/skwod-net/src/invite.rs`; th
 | Connectivity | iroh QUIC, hole punching, UPnP/NAT-PMP/PCP on the host. | iroh `=1.4.1` (pinned) |
 | API | The unchanged axum router, served in-process on each QUIC bi-stream. No extra listener. | `server/src/p2p.rs` |
 | Apps | A loopback HTTP proxy inside the app process: `http://127.0.0.1:<port>/<128-bit secret>` replaces the server URL everywhere (Rust core, URLSession, OkHttp, WebSocket). | `skwod-net/src/proxy.rs` |
-| Voice/video | LiveKit signaling on a stream (served by hyper, bound to the room named in the LiveKit token); media as QUIC datagrams into a loopback forwarder. LiveKit advertises one ICE candidate, `127.0.0.1:<udp port>`. | `host.rs`, `voice.rs`, `server/src/livekit.rs` |
+| Voice/video | Always supervised: a call server that does not start the first time, or exits, is tried again (2 s → 60 s), and whether it runs is asked live (`GET /api/voice/config`: `status` `on`/`starting`/`off` and a short `reason`; a token request while it is down is 503 with `code` `voice_off`/`voice_starting`). A LiveKit that came back on other ports is followed on the live connection: every join, and every new signaling stream, asks the host again, and both ends move. LiveKit signaling on a stream (served by hyper, bound to the room named in the LiveKit token); media as QUIC datagrams into a loopback forwarder. LiveKit advertises one ICE candidate, `127.0.0.1:<udp port>`. | `host.rs`, `voice.rs`, `server/src/livekit.rs` |
 
 Stream kinds on ALPN `skwod/1` (one preamble byte): `1` HTTP, `2` LiveKit signaling, `3` voice hello.
 
@@ -68,7 +68,15 @@ on loopback directly. Only remote members go through the tunnel.
 Host: `skwod run --public-fallback false` / `SKWOD_PUBLIC_FALLBACK=false`. Member: second argument
 of `p2p_connect`. With it off, a connection needs a direct path: same LAN, a public/IPv6 address,
 a UPnP mapping, or a hand-forwarded port (`--p2p-port` + `--p2p-external-addr`). Behind a NAT
-without any of those, the host is unreachable — that is the price of strict independence.
+without any of those, the host is unreachable from outside its own network — that is the price of
+strict independence. A member remembers where it last reached the host directly (`routes.rs`) and
+tries that first: on the host's own network a member that connected there once connects again. The
+host keeps its UDP port across restarts (`<data>/p2p.port`) unless `--p2p-port` says which.
+
+Neither setting stops the **DHT**: it is how a host is found, so members and hosts contact its
+bootstrap nodes (`router.bittorrent.com` and others, `relay.pkarr.org` among them — a DHT node here,
+not a relay), whose names are resolved through the system's DNS. Whoever runs that DNS or the network
+sees that BitTorrent's DHT is used, not which skwod.
 
 Other switches: `--no-p2p`, `--local-discovery`, `--admin-listen`, `--wait-for-start`, `SKWOD_NO_MANAGED_LIVEKIT=1`, `SKWOD_TRUSTED_PROXIES`, `SKWOD_OPEN_SIGNUP=1`, `SKWOD_LIVEKIT_BIN`,
 `SKWOD_LIVEKIT_UDP_ADDR`, `SKWOD_P2P_DEBUG=1` (lifts the address-free logging — troubleshooting only).
@@ -78,6 +86,7 @@ Other switches: `--no-p2p`, `--local-discovery`, `--admin-listen`, `--wait-for-s
 | Observer | `public_fallback=false` | `public_fallback=true` |
 |---|---|---|
 | Anyone holding the invite / node id | The host's **public** IP:port via the DHT, and when it last published (≤ 1 h granularity). Never a LAN/private/CGNAT/ULA address. | Same, plus the host's relay URL (which n0 relay region it is near). |
+| Whoever now has an address the host was once reached at | With relays off only: one QUIC first packet (and its repeats) naming the protocol `skwod/1` — that somebody here uses Skwod — and the sender's address. Not which skwod, host or account; the handshake fails on the key before our certificate is sent. A private address is tried only while this device has the address it had when it learned it (IPv6: the same /64), so only a look-alike network that also gave it that address can receive it. | nothing: not tried. |
 | Devices on the host's LAN | nothing, unless the host opted in to local discovery; then a service name that changes hourly and is meaningless without the invite's LAN key, plus the host's private addresses. | same. |
 | DHT nodes queried | The querier's IP and the record it asked for. The host's record is stored under — and carries — its public key, so the nodes that store or serve it learn the node id and the host's IP without ever seeing an invite; nodes near that key can log the IP of everyone who looks it up. | Same. |
 | The host | Each member's IP on a direct path. Never logged; held in memory only for the per-source connection limiter (≤ 1 min). | Direct: same. Relayed: the relay's address, not the member's. |

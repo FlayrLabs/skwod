@@ -188,11 +188,15 @@ class FeedModel(private val model: AppModel, private val chat: AppChat) {
     private suspend fun send(draft: FeedDraft): Boolean {
         // One at a time: a second tap while the first is still uploading posts nothing.
         if (sending != null) return false
+        // Where it goes and through what is settled here, at the tap ([Compose]).
+        val from = Compose.sender(model.bound, chat.spacesWorkspaceId)
+        val store = model.blobStore()
+        val target = draft.serverId ?: targetServer?.first
         sending = FeedSend(if (draft.photo == null) FeedSend.Stage.SENDING else FeedSend.Stage.ENCRYPTING, story = draft.story)
         failedDraft = null
         try {
             Uploads.refreshLimit(model)
-            val ok = send(if (draft.story) STORY_TAG else FEED_TAG, draft, if (draft.story) "Couldn't add your story" else "Couldn't post")
+            val ok = send(from, store, target, if (draft.story) STORY_TAG else FEED_TAG, draft, if (draft.story) "Couldn't add your story" else "Couldn't post")
             if (!ok) failedDraft = draft
             return ok
         } finally { sending = null }
@@ -217,18 +221,18 @@ class FeedModel(private val model: AppModel, private val chat: AppChat) {
         else -> "$what — check your connection and try again."
     }
 
-    private suspend fun send(tag: String, draft: FeedDraft, what: String): Boolean {
+    private suspend fun send(from: BoundClient<uniffi.skwod_core.SkwodClient>?, store: BlobStore?, target: String?, tag: String, draft: FeedDraft, what: String): Boolean {
         val (text, photo, music) = Triple(draft.text, draft.photo, draft.music)
         error = null
-        val client = model.client ?: run { error = "$what — not connected."; return false }
-        val sid = draft.serverId ?: targetServer?.first ?: run { error = "$what — join a server first."; return false }
-        val cid = chat.feedChannel(sid) ?: run { error = "$what — couldn't reach this server's feed. Check your connection."; return false }
+        val client = from?.client ?: run { error = "$what — not connected."; return false }
+        val sid = target ?: run { error = "$what — join a server first."; return false }
+        val cid = (if (model.bound?.workspaceId == from.workspaceId) chat.feedChannel(sid) else null) ?: run { error = "$what — couldn't reach this server's feed. Check your connection."; return false }
         try {
             val payload = JSONObject()
             if (text.isNotEmpty()) payload.put("text", text)
             val blobIds = ArrayList<String>()
             if (photo != null) {
-                val store = model.blobStore() ?: run { error = "$what — not connected."; return false }
+                if (store == null) { error = "$what — not connected."; return false }
                 // The picture itself: pixels only, sealed, uploaded once, linked to the post.
                 val full = FeedMedia.downscaledJpeg(photo) ?: run { error = "$what — that picture couldn't be read."; return false }
                 val up = AttachmentService.uploadImageBytes(full, store, thumbMaxDimension = FeedMedia.THUMB_DIMENSION,
@@ -255,7 +259,7 @@ class FeedModel(private val model: AppModel, private val chat: AppChat) {
             }
             catch (e: Exception) {
                 // Uploaded but never posted: take the picture off the host again.
-                model.blobStore()?.let { store -> blobIds.forEach { store.delete(it) } }
+                blobIds.forEach { store?.delete(it) }
                 throw e
             }
         } catch (e: Exception) { error = failure(what, e); return false }
@@ -265,7 +269,7 @@ class FeedModel(private val model: AppModel, private val chat: AppChat) {
 
     suspend fun comment(post: FeedItem, text: String): Boolean {
         error = null
-        val client = model.client ?: run { error = "Couldn't comment — not connected."; return false }
+        val client = Compose.sender(model.bound, chat.spacesWorkspaceId)?.client ?: run { error = Compose.OPENING; return false }
         val t = text.trim(); if (t.isEmpty()) return false
         val cid = post.channelId.ifEmpty { chat.feedChannel(post.serverId) ?: "" }
         if (cid.isEmpty()) { error = "Couldn't comment — this post's server can't be reached."; return false }

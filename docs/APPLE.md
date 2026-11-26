@@ -17,7 +17,8 @@ xcodebuild -project Skwod.xcodeproj -scheme Skwod-iOS \
 ```
 
 The Swift packages (Sparkle, LiveKit and LiveKit's WebRTC and FFI binaries) are pinned:
-`project.yml` names exact versions and `xcodegen generate` installs the committed
+`project.yml` names exact versions (LiveKit's SDK: a commit, in `fetch-livekit-swift.sh`, with
+`livekit-swift.patch` on it; `xcodegen generate` fetches it) and installs the committed
 `Package.resolved` into the generated project. Add `-onlyUsePackageVersionsFromResolvedFile` to
 `xcodebuild` to make it fail instead of re-resolving.
 
@@ -129,8 +130,11 @@ banner), `Sources/PushManager.swift` (`CallManager`: CallKit on iOS), `Sources/R
   call sheet; closing the sheet for any reason disconnects (`AppState.activeCall` → `CallSession.end`).
   The room is created by whoever opens the call first. The server lets any member who may
   connect to voice create a server's *first* voice channel (and hands back the existing one
-  otherwise — `server/src/structure.rs`, `open_first_voice_room`); the app's "ask the host to
-  open the call once" message is only reachable against an older server.
+  otherwise — `server/src/structure.rs`, `open_first_voice_room`).
+- **A failed join says where it stopped** (`VoiceFailure.swift`, one table with Android:
+  `shared-test-vectors/voice-failures.json`): voice off or starting on the skwod, host not reached,
+  may not join, media path blocked on this device, media not getting through. Host not reached and
+  voice starting are tried once more first, with a fresh token.
 - **Media.** Microphone on join; camera on request; on iOS also switch camera and speaker/earpiece.
   Remote cameras show in a grid. Picture-in-picture is **not** implemented (LiveKit's Swift SDK has
   no ready-made one; it needs an `AVPictureInPictureVideoCallViewController` fed from a sample-buffer
@@ -322,13 +326,30 @@ Things this setup taught us:
   member (or the SFU itself) is already on that port. Calls on one machine therefore use the
   loopback address of the server (the "host's own app" path); the p2p tunnel leg is covered by the
   Android run and by `skwod-net`'s tests, not by the Apple run.
-- **A full-tunnel VPN on the Mac breaks the Simulator's media path** to anything on loopback: on
-  iOS the media engine only uses the interfaces the system path monitor reports (the VPN
-  interface alone), and a socket bound to the VPN address cannot exchange packets with
-  `127.0.0.1`. `SKWOD_E2E_LOOPBACK_ICE=1` makes the engine offer a loopback candidate too. The same
-  mechanism would stop a call over the p2p tunnel on a **real iPhone with a full-tunnel VPN** —
-  not verified on a device; the fix belongs in the media engine's network filter, which the
-  LiveKit SDK does not expose (see "Not verified").
+- **A call on cellular (or with a full-tunnel VPN).** The media path of a p2p call is
+  `127.0.0.1:<port>` on this device (the tunnel's forwarder). WebRTC ignores the loopback interface
+  by default and binds one UDP socket per OTHER interface the system path monitor lists. On Wi-Fi
+  that socket is answered; on a point-to-point interface it is not: its packets do arrive at
+  `127.0.0.1`, but the system routes its own address out of that interface, and a packet from
+  127/8 may not leave one (XNU `ip_output.c`, "127/8 must not appear on wire"), so the forwarder's
+  reply fails with EADDRNOTAVAIL. Wi-Fi's own address is routed through `lo0`, which is why the
+  same call works there. Measured on a Mac with a utun interface; cellular (`pdp_ip0`) is
+  point-to-point too, but the phone itself was not measured. Binding the forwarder's socket to
+  `lo0` (IP_BOUND_IF) does not help; TCP from such a socket is not answered either.
+  - So a call whose server is on loopback ALSO gathers candidates on loopback:
+    `LiveKitSDK.setGathersLoopback`, added to the pinned SDK by `livekit-swift.patch` (a public WebRTC
+    option the SDK does not expose; `fetch-livekit-swift.sh` fetches the commit and applies it
+    before `xcodegen generate`). That socket is bound to 127.0.0.1, reachable from this device
+    alone; WebRTC prefers it (network cost 0), and it stays when the phone moves between Wi-Fi and
+    cellular. The other interfaces' candidates are what they were, and an external call server
+    keeps the SDK's own behaviour. Checked with the pinned WebRTC on a Mac, in one process, against
+    a single 127.0.0.1 candidate: `en0` answered 5 of 5 checks, `utun` 0 of 8, `lo0` 5 of 5 and
+    chosen. Not checked on a phone.
+  - The forwarder counts answers it could not hand over (`P2pVoiceStats.undelivered`), which is
+    how the app tells this from a host that does not answer (`VoiceFailure.swift`).
+  - Moving between networks during a call: the p2p connection migrates by itself, or the session
+    reconnects; then the media port goes to the new connection at once (it used to stay with the
+    old one for its 15 s grace).
 - **The Simulator has no system call screen.** CallKit accepts an incoming call and ends it about
   a second later. `SKWOD_E2E_AUTOANSWER=1` requests the answer through CallKit at once, which is
   enough to see the answer path open the ring's room.
@@ -342,7 +363,8 @@ Things this setup taught us:
   generated media; the Simulator has no camera).
 - CallKit's incoming screen, answering from the lock screen, the audio-session hand-over
   (`didActivate`), and the VoIP push — all need a signed build on a device and the gateway.
-- A call over the p2p tunnel from an Apple client, and the full-tunnel-VPN case above.
+- A call over the p2p tunnel from an Apple client on cellular, with a full-tunnel VPN, and moving
+  between Wi-Fi and cellular during a call.
 
 ## Release checklist (what only the owner can do)
 

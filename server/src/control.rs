@@ -38,7 +38,6 @@ pub struct Status {
     pub phase: Phase,
     /// Something the host should know (e.g. the p2p endpoint could not start).
     pub problem: Option<String>,
-    pub voice: bool,
     pub p2p: bool,
     /// Announcing on the local network right now (opt-in).
     pub local_discovery: bool,
@@ -85,7 +84,7 @@ async fn put_secret(state: &AppState, name: &str, value: &str) {
 
 impl HostControl {
     pub fn new(state: AppState, router: Router, data: PathBuf, p2p: Option<P2pOptions>) -> Self {
-        let status = Status { phase: Phase::Stopped, problem: None, voice: false, p2p: false, local_discovery: false, setup_code: None, friend_invite: None };
+        let status = Status { phase: Phase::Stopped, problem: None, p2p: false, local_discovery: false, setup_code: None, friend_invite: None };
         Self { state, router, data, p2p, running: Default::default(), status: Mutex::new(status), quit: tokio::sync::Notify::new() }
     }
 
@@ -149,9 +148,9 @@ impl HostControl {
             self.set(|s| s.setup_code = Some(code.clone()));
         }
 
-        // Voice: supervise a local LiveKit if its binary is available (no-op otherwise).
+        // Voice: supervise a local LiveKit if its binary is available. Whether it runs is never
+        // remembered here: `livekit::status` answers that when somebody asks.
         running.livekit = crate::livekit::spawn_managed(&self.state, &self.data).await;
-        let voice = running.livekit.is_some() || crate::p2p::livekit_target(&self.state).await.is_some();
 
         let mut problem = None;
         let mut lan = false;
@@ -186,7 +185,6 @@ impl HostControl {
         let p2p = running.p2p.is_some();
         self.set(|s| {
             s.phase = Phase::Running;
-            s.voice = voice;
             s.p2p = p2p;
             s.local_discovery = lan;
             s.problem = problem;
@@ -265,7 +263,6 @@ impl HostControl {
         }
         self.set(|s| {
             s.phase = Phase::Stopped;
-            s.voice = false;
             s.p2p = false;
             s.local_discovery = false;
             s.problem = None;

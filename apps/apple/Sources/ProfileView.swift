@@ -525,6 +525,8 @@ struct ProfileView: View {
             #endif
             Toggle(isOn: Binding(get: { publicFallback }, set: { v in
                 publicFallback = v
+                // The notification extension dials with the same setting.
+                NotificationState.publicFallback = v
                 Task { await app.reconnectAfterTransportSettingChange() }
             })) {
                 VStack(alignment: .leading, spacing: 1) {

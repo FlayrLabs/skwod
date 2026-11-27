@@ -259,6 +259,7 @@ final class CallSession: NSObject, ObservableObject {
     private weak var app: AppState?
     private var keyProvider: BaseKeyProvider?
     private(set) var channelId = ""
+    private var workspaceId = ""
     private var serverId = ""
     private var myUserId = ""
     private var callSalt: String?
@@ -293,9 +294,12 @@ final class CallSession: NSObject, ObservableObject {
         guard !started else { return }
         started = true
         self.app = app
-        guard let client = app.client, let me = app.session?.userId, let serverId else {
+        // (The skwod the call was started in; its client, and no other's, for as long as it lasts.)
+        guard let bound = app.bound, app.callIsIn(bound.workspaceId), let me = app.session?.userId, let serverId else {
             fail("You're not in a server."); return
         }
+        let client = bound.client
+        workspaceId = bound.workspaceId
         self.serverId = serverId
         myUserId = me
         room.add(delegate: self)
@@ -313,13 +317,7 @@ final class CallSession: NSObject, ObservableObject {
                 return
             }
             // 1. Resolve the voice channel + learn member names.
-            do {
-                channelId = try await client.ensureVoiceChannel(serverId: serverId, name: "General")
-            } catch let error where String(describing: error).contains("403") {
-                // The room is created the first time someone who may manage channels opens it.
-                fail("This server has no call room yet. Ask the host to open the call once — after that everyone can start one.")
-                return
-            }
+            channelId = try await client.ensureVoiceChannel(serverId: serverId, name: "General")
             await loadNames(client: client)
 
             // 2. FAIL CLOSED if this device can't do E2EE for the channel (not registered, no sender
@@ -335,15 +333,38 @@ final class CallSession: NSObject, ObservableObject {
 
             // 3. Token + connect with E2EE on. The keyring is still empty here, which is itself
             //    fail-closed: nothing can be decrypted or published until keys are registered.
-            let tok = try await client.voiceToken(channelId: channelId)
-            guard let url = tok.url, !url.isEmpty else { fail("Calls aren't set up on this Skwod."); return }
-            guard !ended else { return }
-            phase = .connecting
-            // ONE key provider for the room: LiveKit attaches a frame cryptor fed by it to every
-            // track this device publishes or receives — microphone and camera alike.
-            let opts = RoomOptions(e2eeOptions: E2EEOptions(keyProvider: provider),
-                                   reportRemoteTrackStatistics: Self.wantsStatistics)
-            try await room.connect(url: url, token: tok.token, connectOptions: Self.connectOptions(for: url), roomOptions: opts)
+            //    Nothing has been joined until `connect` returns, so a host that was not reached, or
+            //    whose call server is still starting, is tried once more with a fresh token.
+            var retried = false
+            while true {
+                let before = Self.tunnel(client)
+                do {
+                    let tok = try await client.voiceToken(channelId: channelId)
+                    guard let url = tok.url, !url.isEmpty else { fail("Calls aren't set up on this Skwod."); return }
+                    guard !ended else { return }
+                    phase = .connecting
+                    // ONE key provider for the room: LiveKit attaches a frame cryptor fed by it to
+                    // every track this device publishes or receives — microphone and camera alike.
+                    let opts = RoomOptions(e2eeOptions: E2EEOptions(keyProvider: provider),
+                                           reportRemoteTrackStatistics: Self.wantsStatistics)
+                    // Through the tunnel the call server is on this device's 127.0.0.1: ICE then also
+                    // gathers on the loopback interface. A socket on a point-to-point interface
+                    // (cellular) can send there and is never answered, and one on Wi-Fi goes away
+                    // with it (docs/APPLE.md, "A call on cellular").
+                    LiveKitSDK.setGathersLoopback(Self.isLoopback(url))
+                    try await room.connect(url: url, token: tok.token, connectOptions: Self.connectOptions(for: url), roomOptions: opts)
+                    break
+                } catch {
+                    guard let failure = Self.failure(error, before: before, after: Self.tunnel(client)) else { throw error }
+                    #if DEBUG
+                    CallDebug.lastError = String(describing: error)
+                    #endif
+                    guard failure.retriesOnce, !retried, !ended else { fail(failure.message); return }
+                    retried = true
+                    try? await Task.sleep(for: .seconds(failure == .starting ? 4 : 1.5))
+                    guard !ended else { return }
+                }
+            }
             guard !ended else { await room.disconnect(); return }
 
             // 4. Per-call keys: each device generates a RANDOM media key for this room session and
@@ -368,8 +389,25 @@ final class CallSession: NSObject, ObservableObject {
             #if DEBUG
             CallDebug.lastError = String(describing: error)
             #endif
-            // Deliberately generic: the underlying error can carry an address.
-            fail("Couldn't join the call. Check your connection and try again.")
+            // Fixed sentences only: the underlying error can carry an address.
+            fail(VoiceFailure(error).message)
+        }
+    }
+
+    private static func tunnel(_ client: SkwodClient) -> VoiceFailure.Counters? {
+        client.voiceTunnel().map { .init(accepted: $0.accepted, up: $0.packetsUp, down: $0.packetsDown, undelivered: $0.undelivered) }
+    }
+
+    /// Where joining stopped. nil: not about reaching the call (an update, a closed view…).
+    private static func failure(_ error: Error, before: VoiceFailure.Counters?, after: VoiceFailure.Counters?) -> VoiceFailure? {
+        if case CoreError.Voice(let code) = error { return VoiceFailure(code: code) }
+        guard let type = (error as? LiveKitError)?.type else { return nil }
+        switch type {
+        case .cancelled: return nil
+        case .timedOut, .webRTC: return .media(before: before, after: after)
+        case .network, .serviceNotFound, .joinFailure, .serverShutdown, .serverPingTimedOut: return .unreachable
+        case .validation, .insufficientPermissions: return .unavailable
+        default: return .other
         }
     }
 
@@ -394,6 +432,8 @@ final class CallSession: NSObject, ObservableObject {
     private func fail(_ message: String) {
         errorText = message
         phase = .failed
+        // (It may have been the only reason the cache is held behind the front.)
+        app?.store.callMayHaveEnded()
     }
 
     /// Microphone permission, asked with the system prompt the first time.
@@ -456,7 +496,7 @@ final class CallSession: NSObject, ObservableObject {
             var tick = 0
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(2))
-                guard let self, !self.ended, let client = self.app?.client, let provider = self.keyProvider,
+                guard let self, !self.ended, let client = try? BoundClient.of(self.app?.bound, for: self.workspaceId), let provider = self.keyProvider,
                       let salt = self.callSalt else { continue }
                 if tick % 5 == 0 { await self.loadNames(client: client) }
                 tick += 1
@@ -520,7 +560,7 @@ final class CallSession: NSObject, ObservableObject {
     /// "Ring everyone": the skwod rings every member who could pick up — a `ring` event for the
     /// devices that are connected, a wake through the push gateway for the ones that are asleep.
     func ringEveryone() async {
-        guard ringState == .idle, !channelId.isEmpty, let app, let token = app.session?.token,
+        guard ringState == .idle, !channelId.isEmpty, let app, app.current?.id == workspaceId, let token = app.session?.token,
               let base = URL(string: app.serverURL), !app.serverURL.isEmpty else { return }
         ringState = .sending
         var req = URLRequest(url: base.appendingPathComponent("api/channels/\(channelId)/ring"))
@@ -528,7 +568,7 @@ final class CallSession: NSObject, ObservableObject {
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
         req.httpBody = Data("{}".utf8)
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+        guard let (data, resp) = try? await RawSink.data(for: req),
               (resp as? HTTPURLResponse)?.statusCode == 200 else {
             ringState = .failed
             // The server allows three rings a minute; let the button come back.
@@ -545,6 +585,10 @@ final class CallSession: NSObject, ObservableObject {
         #endif
     }
 
+    private static func isLoopback(_ url: String) -> Bool {
+        (URLComponents(string: url)?.host?.lowercased()).map(InviteLink.isLoopback) ?? false
+    }
+
     /// When the SFU is reached on this device's loopback — the p2p tunnel's forwarder, or a Mac
     /// host's own SFU — its one ICE candidate is `127.0.0.1`, so there is nothing a STUN or TURN
     /// server could add. LiveKit hands every client public STUN servers by default (Google's and
@@ -557,9 +601,7 @@ final class CallSession: NSObject, ObservableObject {
     /// Nothing is subscribed to automatically: `admitEncryptedTracks` picks what this device
     /// receives.
     private static func connectOptions(for url: String) -> ConnectOptions {
-        guard let host = URLComponents(string: url)?.host?.lowercased(), InviteLink.isLoopback(host) else {
-            return ConnectOptions(autoSubscribe: false)
-        }
+        guard isLoopback(url) else { return ConnectOptions(autoSubscribe: false) }
         return ConnectOptions(autoSubscribe: false,
                               iceServers: [IceServer(urls: ["stun:127.0.0.1:9"], username: nil, credential: nil)])
     }

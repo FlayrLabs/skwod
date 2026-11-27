@@ -42,7 +42,9 @@ async fn world() -> World {
     let app = crate::api::router(state.clone());
     let host = crate::p2p::start_with(state.clone(), app.clone(), &local_only(NetConfig::host(SecretKey::generate()))).await.unwrap();
     let member = Member::connect(&local_only(NetConfig::member()), host.loopback_addr()).await.unwrap();
-    let proxy = LocalProxy::start(member.clone()).await.unwrap();
+    // (The front takes credentials only, and swaps them for the token: here the credential names it.)
+    let tokens: skwod_net::proxy::TokenSource = std::sync::Arc::new(|_, credential| credential.strip_prefix("front-").map(str::to_string));
+    let proxy = LocalProxy::start_with_tokens(member.clone(), tokens).await.unwrap();
     World { app, state, host, member, proxy, http: reqwest::Client::new() }
 }
 
@@ -51,7 +53,7 @@ impl World {
     async fn member_send(&self, method: reqwest::Method, path: &str, token: Option<&str>, body: Option<Value>) -> (u16, Value) {
         let mut req = self.http.request(method, format!("{}{path}", self.proxy.base_url()));
         if let Some(t) = token {
-            req = req.bearer_auth(t);
+            req = req.bearer_auth(format!("front-{t}"));
         }
         if let Some(b) = body {
             req = req.json(&b);
@@ -89,6 +91,10 @@ async fn http_and_websocket_round_trip_through_the_tunnel() {
     assert_eq!(status, 200);
     let (status, _) = w.member_send(Method::GET, "/api/auth/me", None, None).await;
     assert_eq!(status, 401, "auth still applies inside the tunnel");
+
+    // A session token itself is never taken over loopback: refused by the front, not sent on.
+    let raw = w.http.get(format!("{}/api/auth/me", w.proxy.base_url())).bearer_auth(&token).send().await.unwrap();
+    assert_eq!((raw.status().as_u16(), raw.headers().get("x-skwod-front").and_then(|v| v.to_str().ok())), (503, Some("stale-credential")));
 
     // WebSocket subscription through the proxy (HTTP upgrade → raw QUIC stream).
     let ws_url = format!("{}/api/ws?token={token}", w.proxy.base_url().replacen("http://", "ws://", 1));
@@ -392,5 +398,44 @@ async fn local_discovery_is_off_until_the_host_opts_in() {
     assert_eq!(send(&app, "GET", "/api/instance/p2p", None, None).await.0, axum::http::StatusCode::UNAUTHORIZED, "never to strangers");
     let link = crate::p2p::invite_link_with(host.node_id(), Some("SKWD-AAAA-BBBB"), *state.lan_key.lock().unwrap());
     assert_eq!(skwod_net::Invite::parse(&link).unwrap().lan_key, cfg.lan_key);
+    host.shutdown().await;
+}
+
+/// The host comes back on the port it was last reached at; a taken one is given up, not fatal.
+#[tokio::test]
+async fn the_udp_port_survives_a_restart() {
+    let (_, db) = crate::tests::test_app().await;
+    let data = tempfile::tempdir().unwrap();
+    let key = SecretKey::generate();
+    let start = |port: Option<u16>| {
+        let state = AppState::new(db.clone(), data.path().join("blobs"));
+        let app = crate::api::router(state.clone());
+        let mut cfg = local_only(NetConfig::host(key.clone()));
+        cfg.bind_port = port;
+        let data = data.path().to_path_buf();
+        async move { crate::p2p::start_on_last_port(state, app, cfg, &data).await.unwrap() }
+    };
+    let port_of = |h: &skwod_net::Host| h.endpoint().bound_sockets().iter().find(|s| s.is_ipv4()).unwrap().port();
+    let host = start(None).await;
+    let first = port_of(&host);
+    host.shutdown().await;
+    let host = start(None).await;
+    assert_eq!(port_of(&host), first);
+    host.shutdown().await;
+    let squatter = std::net::UdpSocket::bind(("0.0.0.0", first)).unwrap();
+    let host = start(None).await;
+    let second = port_of(&host);
+    assert_ne!(second, first);
+    host.shutdown().await;
+    drop(squatter);
+    let host = start(None).await;
+    assert_eq!(port_of(&host), second, "the new one is kept");
+    host.shutdown().await;
+    // The operator's choice is the operator's: used, and not remembered.
+    let host = start(Some(first)).await;
+    assert_eq!(port_of(&host), first);
+    host.shutdown().await;
+    let host = start(None).await;
+    assert_eq!(port_of(&host), second);
     host.shutdown().await;
 }

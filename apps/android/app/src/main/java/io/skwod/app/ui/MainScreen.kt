@@ -52,23 +52,14 @@ fun MainScreen(onSignOut: () -> Unit) {
     // up any channels the host added since we last synced.
     LaunchedEffect(model.current?.id) {
         chat.loadIfNeeded()
-        launch { chat.recoverMemberships() }
         launch { chat.syncServerChannels() }
     }
-    // Selection change drives the pager: a picked destination slides to the chat, home slides back.
-    LaunchedEffect(chat.selection) {
-        pager.animateScrollToPage(if (chat.selection == null) 0 else 1)
-    }
+    // What the user opens drives the pager: a picked destination slides to the chat, home slides back.
+    LaunchedEffect(chat.pageRequest) { chat.takePageRequest()?.let { pager.animateScrollToPage(it) } }
     // And the pager drives notification focus: swiping back to the list means the chat is no
     // longer on screen, so its messages must notify again (selection stays for state, focus clears).
     LaunchedEffect(pager.settledPage) {
-        if (pager.settledPage == 0) model.realtime.focusedTopic = null
-        else model.realtime.focusedTopic = when (val sel = chat.selection) {
-            is SidebarItem.Space -> "channel:${sel.space.channelId}"
-            is SidebarItem.Dm -> "dm:${sel.dm.conversationId}"
-            is SidebarItem.Group -> "dm:${sel.group.conversationId}"
-            else -> null
-        }
+        chat.chatPageVisible = pager.settledPage == 1
     }
 
     // Updates come from the public release feed, not from the connected skwod: the daily check
@@ -102,14 +93,16 @@ fun MainScreen(onSignOut: () -> Unit) {
                 }
             } else {
                 Box(Modifier.fillMaxSize().background(Color.White.copy(alpha = 0.085f))) {
-                    DrawerChat(chat)
+                    DrawerChat(chat, inFront = pager.settledPage == 1)
                 }
             }
         }
         Column(Modifier.align(Alignment.TopCenter).statusBarsPadding(), horizontalAlignment = Alignment.CenterHorizontally) {
-            ConnectionBanner()
             HostNewerBanner()
             UpdateBanner()
+            // Below the screen's header: it stays up for a whole outage, and the way back (and the
+            // title) must not be under it.
+            ConnectionBanner(Modifier.padding(top = SCREEN_HEADER))
         }
     }
 
@@ -317,8 +310,8 @@ private fun ServerRail(chat: AppChat, onSignOut: () -> Unit) {
                 RailTile(active = active, onLongClick = { skwodMenuFor = w.localId }, onClick = {
                     // The skwod already open stays open (no teardown, no login flash); one whose
                     // session is over opens its login without leaving the one in use.
-                    if (!w.isSignedOut || w.id == model.current?.id) { chat.homeMode = false; chat.selection = null; chat.railServerId = null }
-                    scope.launch { withContext(Dispatchers.IO) { model.tapSkwod(w) }; tick++ }
+                    if (w.id == model.current?.id) chat.showServers() else if (!w.isSignedOut) chat.switching(w.id)
+                    scope.launch { withContext(Dispatchers.IO) { model.tapSkwod(w) }; chat.switchEnded(w.id); tick++ }
                 }) {
                     Box(Modifier.fillMaxSize().semantics { contentDescription = listOfNotNull(label, WorkspaceLabel.state(w)).joinToString(". ") }) {
                         AvatarTile(w.instanceId?.let { AvatarStore.skwodKey(it) }, w.displayName, size = 44, corner = 14)
@@ -430,7 +423,8 @@ private fun DrawerList(chat: AppChat, onSignOut: () -> Unit) {
         return
     }
     if (showSettings) {
-        SkwodSettingsSheet(onClose = { showSettings = false }, onSignOut = onSignOut)
+        // Keyed on the skwod: a switch dismisses (and never carries over) the settings sheet.
+        key(model.current?.id) { SkwodSettingsSheet(onClose = { showSettings = false }, onSignOut = onSignOut) }
         return
     }
     rolesFor?.let { sp ->
@@ -450,7 +444,7 @@ private fun DrawerList(chat: AppChat, onSignOut: () -> Unit) {
                 Row(Modifier.fillMaxWidth().padding(horizontal = 8.dp, vertical = 6.dp),
                     verticalAlignment = Alignment.CenterVertically) {
                     if (chat.inChannelsMode) {
-                        IconButton(onClick = { chat.showServerBoxes(null) }, modifier = Modifier.size(28.dp)) {
+                        IconButton(onClick = { chat.showServers() }, modifier = Modifier.size(28.dp)) {
                             Icon(Icons.Filled.ChevronLeft, "Back to servers", tint = Color.White.copy(alpha = 0.85f))
                         }
                         Spacer(Modifier.width(4.dp))
@@ -543,18 +537,25 @@ private fun DrawerList(chat: AppChat, onSignOut: () -> Unit) {
                         horizontalAlignment = Alignment.CenterHorizontally) {
                         Icon(Icons.Filled.Groups, null, tint = Color.White.copy(alpha = 0.4f), modifier = Modifier.size(40.dp))
                         Spacer(Modifier.height(10.dp))
-                        Text("No servers yet", color = Color.White, style = MaterialTheme.typography.titleMedium)
+                        val servers = chat.serversState()
+                        if (servers == ServerRecovery.State.LOADING || servers == ServerRecovery.State.WAITING_FOR_KEYS) {
+                            CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = Color.White)
+                            Spacer(Modifier.height(8.dp))
+                        }
+                        Text(servers.title, color = Color.White, style = MaterialTheme.typography.titleMedium,
+                            textAlign = androidx.compose.ui.text.style.TextAlign.Center)
                         Spacer(Modifier.height(4.dp))
-                        Text("Join one with an invite code from a friend who hosts a Skwod.",
+                        if (servers.detail.isNotEmpty()) Text(servers.detail,
                             color = Color.White.copy(alpha = 0.55f), style = MaterialTheme.typography.bodySmall,
                             textAlign = androidx.compose.ui.text.style.TextAlign.Center)
                         Spacer(Modifier.height(14.dp))
-                        Button(onClick = { showJoin = true },
+                        if (servers == ServerRecovery.State.FAILED) OutlinedButton(onClick = { model.launchIO { chat.recoverMemberships() } }) { Text("Retry") }
+                        if (servers == ServerRecovery.State.NONE) Button(onClick = { showJoin = true },
                             colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color.Black)) {
                             Icon(Icons.Filled.ConfirmationNumber, null); Spacer(Modifier.width(6.dp))
                             Text("Join with a code", fontWeight = FontWeight.SemiBold)
                         }
-                        if (model.canCreateServers) {
+                        if (servers == ServerRecovery.State.NONE && model.canCreateServers) {
                             Spacer(Modifier.height(8.dp))
                             OutlinedButton(onClick = { showCreate = true }) {
                                 Icon(Icons.Filled.Add, null); Spacer(Modifier.width(6.dp)); Text("Create a server")
@@ -598,14 +599,21 @@ private fun DrawerList(chat: AppChat, onSignOut: () -> Unit) {
                                 if (voiceChecking) return@clickable
                                 voiceChecking = true
                                 drawerScope.launch {
-                                    val cfg = try { withContext(Dispatchers.IO) { model.client?.voiceConfig() } } catch (_: Exception) { null }
+                                    // A host that did not answer says nothing about voice (it used to
+                                    // open the setup panel).
+                                    val gate = try {
+                                        withContext(Dispatchers.IO) { model.client?.voiceConfig() }?.let { cfg ->
+                                            val owner = !cfg.configured && !cfg.bundled && withContext(Dispatchers.IO) { model.listAccounts() != null }
+                                            VoiceGate.decide(cfg.configured, cfg.status, cfg.bundled, owner)
+                                        }
+                                    } catch (c: kotlinx.coroutines.CancellationException) { throw c }
+                                    catch (e: Exception) { VoiceGate.Say(voiceFailureOf(e).message) }
                                     voiceChecking = false
-                                    if (cfg?.configured == true) {
-                                        voiceCallServer = voiceServerId
-                                    } else {
-                                        val owner = withContext(Dispatchers.IO) { model.listAccounts() != null }
-                                        if (owner) showVoiceSetup = true
-                                        else Toast.makeText(voiceCtx, "Voice isn't set up yet — ask the host to turn it on.", Toast.LENGTH_SHORT).show()
+                                    when (gate) {
+                                        VoiceGate.Join -> voiceCallServer = voiceServerId
+                                        VoiceGate.SetUp -> showVoiceSetup = true
+                                        is VoiceGate.Say -> Toast.makeText(voiceCtx, gate.text, Toast.LENGTH_LONG).show()
+                                        null -> {}
                                     }
                                 }
                             }
@@ -864,17 +872,41 @@ private fun MobileYouBar(onSignOut: () -> Unit, modifier: Modifier = Modifier) {
 
 /** Page 1: the selected chat/DM/home/feed. */
 @Composable
-private fun DrawerChat(chat: AppChat) {
+private fun DrawerChat(chat: AppChat, inFront: Boolean) {
     when (val sel = chat.selection) {
         is SidebarItem.Home -> DmHomeView(chat)
         is SidebarItem.Feed -> FeedView(chat)
         // Keyed by conversation: switching chats starts a fresh composition, so nothing waiting
         // in one composer (a pasted picture, a paste still being read) follows into the next.
-        is SidebarItem.Space -> key("channel:" + sel.space.channelId) { ChannelView(sel.space, onBack = { chat.selection = null }) }
-        is SidebarItem.Dm -> key("dm:" + sel.dm.conversationId) { DmChatView(sel.dm, onBack = { chat.selection = null }) }
-        is SidebarItem.Group -> key("group:" + sel.group.conversationId) { GroupChatView(sel.group, onBack = { chat.selection = null }) }
-        null -> Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-            Text("Pick a channel", color = Color.White.copy(alpha = 0.5f))
+        is SidebarItem.Space -> key("channel:" + chat.conversationKey(sel.space)) { ChannelView(sel.space, onBack = { chat.requestPage(0) }, inFront = inFront) }
+        is SidebarItem.Dm -> key("dm:" + chat.directKey(sel.dm.conversationId)) { DmChatView(sel.dm, onBack = { chat.requestPage(0) }) }
+        is SidebarItem.Group -> key("group:" + chat.directKey(sel.group.conversationId)) { GroupChatView(sel.group, onBack = { chat.requestPage(0) }) }
+        null -> if (chat.homeMode) DmHomeView(chat) else LandingPane(chat)
+    }
+}
+
+/** The chat area while no channel is open ([Landing.Place]). */
+@Composable
+private fun LandingPane(chat: AppChat) {
+    val place = chat.place
+    LaunchedEffect(place) { chat.land() }   // what was asked for arrived
+    val draft = chat.closedDraft ?: ""
+    val (title, detail) = when (place) {
+        is Landing.Place.Empty -> "No channel to open" to "There is no text channel here that you can read."
+        Landing.Place.NoServers -> chat.serversState().let { it.title to it.detail }
+        Landing.Place.Closed -> (if (chat.closedDraft == null) "No channel is open" else "This channel isn't available any more") to (if (draft.isEmpty()) "" else "You were writing:")
+        else -> "Loading channels…" to ""
+    }
+    Column(Modifier.fillMaxSize().padding(40.dp), verticalArrangement = Arrangement.Center, horizontalAlignment = Alignment.CenterHorizontally) {
+        if (place is Landing.Place.Loading || place is Landing.Place.Channel) {
+            CircularProgressIndicator(Modifier.size(16.dp), strokeWidth = 2.dp, color = Color.White)
+            Spacer(Modifier.height(10.dp))
+        }
+        Text(title, color = Color.White.copy(alpha = 0.5f))
+        if (detail.isNotEmpty()) Text(detail, color = Color.White.copy(alpha = 0.5f), style = MaterialTheme.typography.bodySmall)
+        if (place is Landing.Place.Closed) {
+            if (draft.isNotEmpty()) androidx.compose.foundation.text.selection.SelectionContainer { Text(draft, color = Color.White.copy(alpha = 0.7f)) }
+            if (chat.spaces.isNotEmpty()) OutlinedButton(onClick = { chat.openAnother() }) { Text("Open a channel") }
         }
     }
 }

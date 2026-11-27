@@ -36,12 +36,19 @@ struct GameMessage<T: Decodable> {
 struct GameSync {
     let app: AppState
     let channelId: String
+    /// The skwod the channel is in: a move goes through its cache, or nowhere.
+    let home: String?
+    init(app: AppState, channelId: String) {
+        self.app = app
+        self.channelId = channelId
+        home = app.chatModel?.spacesWorkspaceId
+    }
 
     /// Encrypt + post a game event. Returns false when it could not be sent (the caller says
     /// so; the next sync reconciles state either way).
     @discardableResult
     func send<T: Encodable>(_ event: T) async -> Bool {
-        guard let client = app.client,
+        guard let client = Outbox.client(of: home, app),
               let data = try? JSONEncoder().encode(event),
               let json = String(data: data, encoding: .utf8) else { return false }
         // Queued, like everything a person does: a move made while the connection is down is

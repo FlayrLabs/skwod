@@ -24,6 +24,23 @@ enum Outbox {
     /// Messages the user composed that are waiting to be accepted (for the sent sound).
     private static var composedWaiting = 0
 
+    /// The client that has the cache of `home` open right now — that skwod's, or none.
+    static func client(of home: String?, _ app: AppState) -> SkwodClient? {
+        home.flatMap { try? BoundClient.withCache(app.bound, for: $0) }
+    }
+
+    /// Queue what was sent where it was sent (`SendOrder`). A local write: nothing is waited for.
+    static func queue(_ order: SendOrder, through client: SkwodClient) async throws {
+        switch order.place {
+        case .channel(let id):
+            if let message = order.editing { try await client.queueChannelEdit(channelId: id, messageId: message, text: order.text) }
+            else { _ = try await client.queueChannelMessage(channelId: id, text: order.text, replyToId: order.replyTo, blobIds: [], uploadIds: []) }
+        case .direct(let id, let peers):
+            if let message = order.editing { try await client.queueDmEdit(conversationId: id, peerUserIds: peers, messageId: message, text: order.text) }
+            else { _ = try await client.queueDm(conversationId: id, peerUserIds: peers, text: order.text, replyToId: order.replyTo, uploadIds: []) }
+        }
+    }
+
     /// Deliver what is queued (coalesced: a burst of sends makes one pass, then one more).
     /// Call after queueing, when the live connection comes up, and on the slow safety timers.
     static func flush(_ app: AppState) async {

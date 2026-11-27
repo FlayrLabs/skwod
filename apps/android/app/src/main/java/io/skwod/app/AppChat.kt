@@ -6,6 +6,8 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
@@ -133,24 +135,137 @@ class AppChat(private val model: AppModel) {
     val spaces = mutableStateListOf<RealSpace>()
     val dms = mutableStateListOf<DMConversation>()
     private val selectionState = mutableStateOf<SidebarItem?>(null)
-    /** Suppresses the last-channel persist while restoring the remembered selection on load. */
-    private var loadingSelection = false
+    /** Assigned: something the user opened or closed. The app's own changes go through [put]. */
     var selection: SidebarItem?
         get() = selectionState.value
         set(v) {
-            selectionState.value = v
-            // Tell the relay which chat is on screen — its messages shouldn't notify.
-            model.realtime.focusedTopic = when (v) {
-                is SidebarItem.Space -> "channel:${v.space.channelId}"
-                is SidebarItem.Dm -> "dm:${v.dm.conversationId}"
-                is SidebarItem.Group -> "dm:${v.group.conversationId}"
-                else -> null
+            put(v)
+            if (v != null) { landing = landing.opened(); overview = false; closedDraft = null }
+            // Remember the channel last opened in this server (DMs/home don't override it).
+            if (v is SidebarItem.Space) {
+                railServerId = v.space.serverId
+                highlightedChannelId = v.space.channelId
+                memory = memory.opened(v.space.channelId, v.space.serverId)
+                persistMemory()
             }
-            // Remember the last-opened channel (kv-synced across devices) so re-entering reopens it.
-            if (v is SidebarItem.Space && !loadingSelection) {
-                model.launchIO { try { model.client?.kvSet("${model.current?.id}|lastChannel", v.space.channelId) } catch (_: Exception) {} }
+            requestPage(if (v == null) 0 else 1)
+        }
+    fun put(v: SidebarItem?) { selectionState.value = v; refocus() }
+
+    /** Is the chat page of the pager in front? Nothing behind the list counts as seen. */
+    var chatPageVisible = false
+        set(v) { field = v; refocus() }
+
+    /** Tell the relay which chat is on screen — its messages shouldn't notify. */
+    private fun refocus() {
+        model.realtime.focusedTopic = if (!chatPageVisible) null else when (val v = selection) {
+            is SidebarItem.Space -> "channel:${v.space.channelId}"
+            is SidebarItem.Dm -> "dm:${v.dm.conversationId}"
+            is SidebarItem.Group -> "dm:${v.group.conversationId}"
+            else -> null
+        }
+    }
+
+    /** The page the pager is to show (0 list, 1 chat) and a counter: each request is acted on once,
+     *  also one for the channel that is already open. Not for a channel opened by default. */
+    var pageRequest by mutableStateOf(0 to 0)
+        private set
+    private var pageHandled = 0
+    fun requestPage(page: Int) { pageRequest = page to pageRequest.second + 1 }
+    fun takePageRequest(): Int? = pageRequest.takeIf { it.second > pageHandled }?.let { pageHandled = it.second; it.first }
+
+    // ---- the channel a server opens with ([Landing], build 51) ----
+
+    private var landing by mutableStateOf(Landing())
+    /** The user looks at the skwod's list of servers (a channel stays open on the page behind it). */
+    private var overview = false
+    /** The skwod whose tile was tapped, until its lists are loaded. */
+    private var switchingTo: String? = null
+    private var listsReady by mutableStateOf(false)
+    @Volatile private var memory = ChannelMemory()
+    @Volatile private var memoryRead = false
+    private val memoryLock = Mutex()
+    /** Channels the server refused this account to read. */
+    private var refused = setOf<String>()
+    /** Unsent text by conversation (memory only), and what was left in the one that went away. */
+    private val drafts = java.util.concurrent.ConcurrentHashMap<String, String>()
+    var closedDraft by mutableStateOf<String?>(null)
+        private set
+
+    /** What the chat area shows while nothing is open there. */
+    val place: Landing.Place get() {
+        val mine = loadedFor != null && loadedFor == model.current?.id && model.bound?.workspaceId == loadedFor
+        return landing.place(open = selection != null || homeMode, ready = listsReady && mine && (switchingTo == null || switchingTo == loadedFor),
+            settingUp = provisioning, memory = memory, channels = spaces.toList().map { LandingChannel(it.channelId, it.serverId, it.channelId !in refused) })
+    }
+
+    /** Open what was asked for, if it is there and nothing is open. On the main thread, like every tap. */
+    fun land() {
+        val id = (place as? Landing.Place.Channel)?.id ?: return
+        val s = spaces.toList().firstOrNull { it.channelId == id } ?: return
+        val slide = landing.want?.reveal == true
+        landing = landing.landed()
+        if (!overview) railServerId = s.serverId
+        highlightedChannelId = s.channelId
+        put(SidebarItem.Space(s))
+        if (slide) requestPage(1)
+    }
+
+    /** The user asked for a server (null: any). */
+    private fun ask(server: String?) { closedDraft = null; landing = landing.asked(Landing.Want(server)); land() }
+
+    /** The open channel went away: said so, with what was being written. Nothing takes its place. */
+    private fun closeOpen(s: RealSpace) { closedDraft = draft(conversationKey(s)); put(null) }
+
+    /** "Open a channel", from that state. */
+    fun openAnother() = ask(railServerId)
+
+    fun conversationKey(s: RealSpace): String = Landing.conversationKey(model.current?.id, s.serverId, s.channelId)
+    fun directKey(conversationId: String): String = Compose.directKey(model.current?.id, conversationId)
+    fun draft(key: String): String = drafts[key] ?: ""
+    fun keepDraft(key: String, text: String) { if (text.isEmpty()) drafts.remove(key) else drafts[key] = text }
+
+    /** A refused channel is not opened by default again; one that is open stays open. */
+    fun noteRead(s: RealSpace, failure: Exception?) {
+        if (failure == null) refused = refused - s.channelId
+        else if (Landing.isReadRefusal((failure as? uniffi.skwod_core.CoreException.Engine)?.detail)) refused = refused + s.channelId
+    }
+
+    /** A skwod's tile was tapped; that switch ended (or did not happen). */
+    fun switching(workspaceId: String) { homeMode = false; overview = false; railServerId = null; switchingTo = workspaceId; selection = null; ask(null) }
+    fun switchEnded(workspaceId: String) { if (switchingTo == workspaceId) { switchingTo = null; land() } }
+
+    /** Another skwod's lists are about to load. */
+    private fun resetLanding() {
+        memory = ChannelMemory(); memoryRead = false
+        listsReady = false; overview = false; switchingTo = null
+        refused = emptySet(); drafts.clear(); closedDraft = null
+        landing = landing.asked(Landing.Want(reveal = landing.want?.reveal == true))
+    }
+
+    /** The lists are read: read the memory (strictly: what could not be read is not written over) and land. */
+    private suspend fun listsRead(wid: String) {
+        val bound = model.bound?.takeIf { it.workspaceId == wid && spacesRead } ?: return
+        if (!memoryRead) try {
+            val json = bound.client.kvRead(ChannelMemory.storageKey(wid))
+            val old = bound.client.kvRead("$wid|lastChannel")   // builds before 51: one per skwod
+            if (model.bound !== bound || loadedFor != wid) return
+            memory = ChannelMemory.decode(json) ?: spaces.toList().firstOrNull { it.channelId == old }?.let { ChannelMemory().opened(it.channelId, it.serverId) } ?: ChannelMemory()
+            memoryRead = true
+        } catch (_: Exception) {}
+        withContext(Dispatchers.Main) { if (loadedFor == wid && spacesRead) { listsReady = true; land() } }
+        if (loadedFor == wid && spacesRead) recoverIfNeeded()
+    }
+
+    private fun persistMemory() {
+        val bound = model.bound ?: return
+        model.launchIO {
+            memoryLock.withLock {   // in turn, each writing what is remembered by then
+                if (!memoryRead || model.bound !== bound || bound.workspaceId != loadedFor) return@withLock
+                try { bound.client.kvWrite(ChannelMemory.storageKey(bound.workspaceId), memory.encode()) } catch (_: Exception) {}
             }
         }
+    }
     var homeMode by mutableStateOf(false)
     /** The server picked in the rail whose channels the middle column shows (follows the selection). */
     var railServerId by mutableStateOf<String?>(null)
@@ -162,6 +277,8 @@ class AppChat(private val model: AppModel) {
         private set
 
     private var loadedFor: String? = null
+    /** The skwod whose lists are shown. */
+    val spacesWorkspaceId: String? get() = loadedFor
 
     /**
      * The 1:1 and group stores of the active workspace ([ConversationStore]): the only thing
@@ -236,6 +353,8 @@ class AppChat(private val model: AppModel) {
 
     /** serverId → the one channel that server's feed and stories live in (`feedChannel`). */
     private val feedChannels = java.util.concurrent.ConcurrentHashMap<String, String>()
+    /** Build 51: every server's feed channel (for the app-wide catch-up). */
+    fun feedChannelIds(): List<String> = feedChannels.values.toList()
 
     /** The feed channel of [serverId], asked from the core once and then remembered. */
     suspend fun feedChannel(serverId: String): String? {
@@ -294,24 +413,28 @@ class AppChat(private val model: AppModel) {
      *  one, else the first. Drives the "servers in the rail" layout. */
     fun currentServer(): ServerGroup? {
         val groups = serverGroups()
-        val sid = (selection as? SidebarItem.Space)?.space?.serverId ?: railServerId
+        val sid = railServerId ?: (selection as? SidebarItem.Space)?.space?.serverId
         return groups.firstOrNull { it.serverId == sid } ?: groups.firstOrNull()
     }
 
     /** True when `g` is the server the middle column shows (for the rail's selection pill). */
     fun isServerActive(g: ServerGroup): Boolean {
         if (homeMode || selection is SidebarItem.Feed) return false
-        (selection as? SidebarItem.Space)?.let { return it.space.serverId == g.serverId }
         return railServerId == g.serverId
     }
 
-    /** Open a server from the rail: show its CHANNEL LIST with the first channel highlighted, but
-     *  stay on the list — do NOT slide into the chat. The user taps a channel to open it. */
+    /** The user picked a server: its CHANNEL LIST stays in front (no slide into the chat); behind
+     *  it, the channel they last had open there, or the first ([Landing]). */
     fun openServer(g: ServerGroup) {
         homeMode = false
+        overview = false
         railServerId = g.serverId
-        selection = null                                   // stay on the list page (no chat nav)
-        highlightedChannelId = g.channels.firstOrNull()?.channelId
+        memory = memory.copy(server = g.serverId)
+        persistMemory()
+        val open = (selection as? SidebarItem.Space)?.space?.takeIf { it.serverId == g.serverId }
+        highlightedChannelId = open?.channelId
+        if (open == null) { put(null); ask(g.serverId) }
+        requestPage(0)
         touched()
     }
 
@@ -335,37 +458,41 @@ class AppChat(private val model: AppModel) {
         }
     }
 
-    /** Show the skwod overview (the server list); no channel open. Passing null returns to the
-     *  server list itself (clears the picked server + highlight). */
-    fun showServerBoxes(serverId: String?) {
+    /** The skwod's list of servers. A channel stays open on the page behind it. */
+    fun showServers() {
         homeMode = false
-        railServerId = serverId
-        if (serverId == null) highlightedChannelId = null
-        selection = null
+        overview = true
+        railServerId = null
+        highlightedChannelId = null
+        if (selection is SidebarItem.Space) requestPage(0) else { selection = null; ask(null) }
         touched()
     }
 
     /** True when a server is picked so the list shows ITS channels (with a back arrow) — whether or
      *  not a channel's chat is open. Driven by railServerId, not selection, so opening a server
      *  shows its channel list without navigating into a conversation. */
-    val inChannelsMode: Boolean get() = railServerId != null || selection is SidebarItem.Space
+    val inChannelsMode: Boolean get() = railServerId != null
 
     /** Load the persisted lists for the active workspace (call when it changes). `openLastChannel`
-     *  restores the last-viewed channel (app launch); otherwise land on the overview (skwod switch). */
+     *  (app launch) also slides to the channel it lands in. */
     suspend fun loadIfNeeded(openLastChannel: Boolean = false) {
         val wid = model.current?.id ?: return
+        if (openLastChannel && selection == null && !homeMode) landing = landing.asked(Landing.Want(reveal = true))
         if (loadedFor == wid) {
             // Already loaded — except what could not be READ then: that is read again, never
             // taken for empty (and never written until it has been read).
             if (!spacesRead) readSpaces()
             if (!model.contacts.loaded) model.contacts.load()
+            listsRead(wid)   // (the screen's own call usually comes before the client is up)
             return
         }
+        stopRecovery()
         loadedFor = wid
         selection = null
         railServerId = null
         spacesRead = false
         spaces.clear()
+        resetLanding()
         readSpaces()
         // BOTH conversation stores — the 1:1 list and the groups this device accepted, with
         // the member sets it fixed for them — are read before anything is asked of the server.
@@ -376,26 +503,14 @@ class AppChat(private val model: AppModel) {
         // The contact book is separate from this list. On its first run it is seeded from it:
         // chats the user started here are KNOWN, everything else UNVERIFIED.
         if (model.contacts.load()) {
-            model.contacts.migrate(loadedDms.map { ContactTrust.Legacy(it.peerUserId, it.name, it.origin == DMConversation.ORIGIN_LOCAL) })
+            model.contacts.migrate(model.bound?.workspaceId ?: "", loadedDms.map { ContactTrust.Legacy(it.peerUserId, it.name, it.origin == DMConversation.ORIGIN_LOCAL) })
         }
         touched()
-        if (openLastChannel) restoreLastChannel()
-    }
-
-    /** Open the last channel viewed on this skwod (kv-synced across devices), else the first — so a
-     *  skwod always lands on a conversation, never a blank overview. No-op if there are no channels. */
-    suspend fun restoreLastChannel() {
-        val last = try { model.client?.kvGet("${model.current?.id}|lastChannel") } catch (_: Exception) { null }
-        val target = spaces.firstOrNull { it.channelId == last } ?: spaces.firstOrNull() ?: return
-        loadingSelection = true
-        railServerId = target.serverId
-        highlightedChannelId = target.channelId
-        selection = SidebarItem.Space(target)
-        loadingSelection = false
+        listsRead(wid)
     }
 
     /** Forget in-memory lists when the workspace switches so the next load re-reads its cache. */
-    fun reset() { synchronized(storeLock) { park(); storeRef = null }; tombstones.clear(); loadedFor = null; spacesRead = false; feedChannels.clear(); spaces.clear(); dms.clear(); selection = null; homeMode = false; touched() }
+    fun reset() { synchronized(storeLock) { park(); storeRef = null }; tombstones.clear(); stopRecovery(); loadedFor = null; spacesRead = false; feedChannels.clear(); spaces.clear(); dms.clear(); resetLanding(); selection = null; railServerId = null; homeMode = false; touched() }
 
     fun addSpace(s: RealSpace) {
         if (tombstones.hides(s.serverId)) return
@@ -406,15 +521,9 @@ class AppChat(private val model: AppModel) {
         persistSpaces()
     }
 
-    private fun addSpaceQuietly(s: RealSpace) {
+    private fun addSpaceQuietly(s: RealSpace, at: Int) {
         if (spaces.any { it.channelId == s.channelId } || tombstones.hides(s.serverId)) return
-        val wasEmpty = spaces.isEmpty()
-        spaces.add(s); touched(); persistSpaces()
-        // First channels to arrive after an empty load (re-login recovery) — open one so the skwod
-        // lands on a conversation, not the blank overview.
-        if (wasEmpty && selection == null && !homeMode) {
-            model.launchIO { restoreLastChannel() }
-        }
+        spaces.add(at, s); touched(); persistSpaces()
     }
 
     /**
@@ -442,19 +551,22 @@ class AppChat(private val model: AppModel) {
     /** A server the user left or deleted: every channel of it goes from the list, for good. */
     fun removeServer(serverId: String) {
         tombstones.dropped(listOf(serverId))
+        memory = memory.forget(serverId)
+        persistMemory()
         hideServer(serverId)
     }
 
     private fun hideServer(serverId: String) {
         spaces.removeAll { it.serverId == serverId }
-        if ((selection as? SidebarItem.Space)?.space?.serverId == serverId) selection = null
+        (selection as? SidebarItem.Space)?.space?.takeIf { it.serverId == serverId }?.let { closeOpen(it) }
         if (railServerId == serverId) railServerId = null
         touched(); persistSpaces()
     }
 
     fun removeSpace(s: RealSpace) {
         spaces.removeAll { it.channelId == s.channelId }
-        if ((selection as? SidebarItem.Space)?.space?.channelId == s.channelId) selection = null
+        if (s.serverId !in shownServers()) removedByHand.add(s.serverId)
+        if ((selection as? SidebarItem.Space)?.space?.channelId == s.channelId) closeOpen(s)
         touched(); persistSpaces()
     }
 
@@ -484,7 +596,7 @@ class AppChat(private val model: AppModel) {
                 is ConversationStore.Opened.Added -> opened.entry to false
             }
             // The lookup the dialog just made returned exactly this account for this name.
-            model.contacts.dmOpened(d.peerUserId, d.name, alreadyListed = existed, lookup = WaitingTrust.Lookup.Found(d.peerUserId))
+            model.contacts.dmOpened(model.bound?.workspaceId ?: "", d.peerUserId, d.name, alreadyListed = existed, lookup = WaitingTrust.Lookup.Found(d.peerUserId))
             selection = SidebarItem.Dm(entry)
             OpenedDm.OPENED
         } ?: OpenedDm.SWITCHED
@@ -528,10 +640,10 @@ class AppChat(private val model: AppModel) {
     /** What a server-driven change to the list means outside it: a claim noted, the open chat kept open. */
     fun delivered(result: ConversationStore.Delivery): Boolean = when (result) {
         is ConversationStore.Delivery.None, is ConversationStore.Delivery.Refused -> false
-        is ConversationStore.Delivery.Added -> { model.contacts.claim(result.entry.peerUserId, result.claimedName); true }
+        is ConversationStore.Delivery.Added -> { model.contacts.claim(model.bound?.workspaceId ?: "", result.entry.peerUserId, result.claimedName); true }
         is ConversationStore.Delivery.Bound -> {
             if ((selection as? SidebarItem.Dm)?.dm?.key == result.old.key) selection = SidebarItem.Dm(result.entry)
-            model.contacts.claim(result.entry.peerUserId, result.claimedName); true
+            model.contacts.claim(model.bound?.workspaceId ?: "", result.entry.peerUserId, result.claimedName); true
         }
     }
 
@@ -565,7 +677,7 @@ class AppChat(private val model: AppModel) {
     /** Write what the conversation stores still have to write (before their client goes, or once it is back). */
     suspend fun flushStore() { storeRef?.flush() }
 
-    fun showHome() { homeMode = true; selection = null }
+    fun showHome() { homeMode = true; overview = false; landing = landing.left(); selection = null }
 
     /**
      * Join a server with only an invite code. Token/username invites join at once; code invites
@@ -616,22 +728,116 @@ class AppChat(private val model: AppModel) {
         return servers.map { it.optString("server_id", "") }.filter { it.isNotEmpty() }.toSet()
     }
 
+    // ---- servers this device does not show yet ([ServerRecovery]) ----
+
+    var recovery by mutableStateOf(ServerRecovery())
+        private set
+    @Volatile private var recoveryJob: kotlinx.coroutines.Job? = null
+    private val recoveryPass = Mutex()
+    /** Moves to make it look now. */
+    private val recoveryKick = kotlinx.coroutines.channels.Channel<Unit>(kotlinx.coroutines.channels.Channel.CONFLATED)
+    /** Servers whose last channel the user removed from the list by hand (this launch). */
+    private val removedByHand = java.util.concurrent.ConcurrentHashMap.newKeySet<String>()
+
+    private fun shownServers(): Set<String> = spaces.toList().map { it.serverId }.toSet()
+    private fun hiddenServers(): Set<String> =
+        (recovery.servers ?: emptySet()).filter { tombstones.hides(it) || it in removedByHand || model.joins.isWatching(it) }.toSet()
+    private fun settled() = recovery.settled(shownServers(), hiddenServers())
+
+    /** What the empty server list says. */
+    fun serversState(): ServerRecovery.State = recovery.state(model.deviceId != null, shownServers(), hiddenServers())
+
     /**
-     * After a re-login/reinstall the sidebar cache + device keys are gone but memberships survive
-     * server-side. Rediscover every server we belong to and ask a member (prefer the owner) to
-     * re-provision this device — channels/keys reappear once their inbox sync answers.
+     * After a link, a restore, a re-login or a reinstall the list is empty, but memberships survive
+     * on the skwod: ask it which servers this account is in, show each as soon as its keys are
+     * here, and ask the account's other devices and a member for the ones that are not — again
+     * and again, backing off, until every one is shown. Something gave reason to look again: one
+     * pass now, the rest in the background.
      */
     suspend fun recoverMemberships() {
-        val e = model.endpoint() ?: return
-        val asked = model.bound ?: return
-        val servers = fetchServerList(e.base, e.token) ?: return
-        for (srv in servers) {
-            // The list is the workspace's that was asked: stop once another one is in use.
-            if (model.bound !== asked) return
-            val sid = srv.optString("server_id", ""); if (sid.isEmpty()) continue
-            if (spaces.any { it.serverId == sid } || tombstones.hides(sid)) continue
-            val asked = askForKeys(sid, srv.optString("owner_id", ""))
-            discover(sid, asked.peerUserId, asked.peerDeviceId, quiet = true)
+        recovery = recovery.nudged()
+        recoverOnce()
+        startRecovery()
+    }
+
+    /** The same, unless everything the account is in is already here. */
+    fun recoverIfNeeded() {
+        if (settled() && spaces.isNotEmpty()) return
+        recovery = recovery.nudged()
+        recoveryKick.trySend(Unit)
+        startRecovery()
+    }
+
+    /** The skwod's list was just read by someone else ([AppModel.refreshServerList]). */
+    fun serversListed(ids: Set<String>) {
+        recovery = recovery.answered(ids)
+        if (!settled()) startRecovery()
+    }
+
+    /** The mailbox was just synced: keys may have arrived. */
+    fun mailboxSynced() { recoveryKick.trySend(Unit) }
+
+    @Synchronized
+    private fun startRecovery() {
+        if (recoveryJob?.isActive == true || settled()) return
+        val origin = model.current?.id ?: return
+        recoveryJob = model.launchJob {
+            while (model.current?.id == origin && loadedFor == origin && !settled()) {
+                recovery = recovery.passed()
+                recoveryKick.tryReceive()
+                val wait = recovery.delay(model.appForeground)
+                delay(ServerRecovery.SPACING_MS)
+                kotlinx.coroutines.withTimeoutOrNull(wait - ServerRecovery.SPACING_MS) { recoveryKick.receive() }
+                if (model.current?.id == origin) recoverOnce()
+            }
+        }
+    }
+
+    @Synchronized
+    private fun stopRecovery() { recoveryJob?.cancel(); recoveryJob = null; recovery = ServerRecovery(); removedByHand.clear() }
+
+    private suspend fun recoverOnce() = recoveryPass.withLock {
+        // Only through this skwod's own client, as a device of the account, with its list read.
+        val e = model.endpoint()
+        val asked = model.bound
+        val me = model.current?.userId
+        if (e == null || asked == null || me == null || model.deviceId == null || !spacesRead || loadedFor != asked.workspaceId) {
+            recovery = recovery.answered(null)
+            return@withLock
+        }
+        val servers = fetchServerList(e.base, e.token)
+        // The list is the workspace's that was asked.
+        if (model.bound !== asked) return@withLock
+        val owners = servers?.associate { it.optString("server_id", "") to it.optString("owner_id", "") }?.takeIf { "" !in it.keys }
+        recovery = recovery.answered(owners?.keys)
+        if (owners == null || recovery.missing(shownServers(), hiddenServers()).isEmpty()) return@withLock
+        // (The keys may be in the mailbox.)
+        model.syncDmsNow()
+        try { asked.client.processControlInbox(me) } catch (x: kotlinx.coroutines.CancellationException) { throw x } catch (_: Exception) {}
+        var revealed = false
+        for (sid in recovery.missing(shownServers(), hiddenServers()).sorted()) {
+            if (model.bound !== asked) return@withLock
+            val named = (try { asked.client.listChannels(sid) } catch (_: Exception) { emptyList() }).filter { it.name != null && it.kind != "voice" }
+            val name = try { asked.client.serverName(sid) } catch (_: Exception) { null }
+            if (model.bound !== asked) return@withLock
+            if (sid in hiddenServers()) continue
+            if (named.isNotEmpty()) {
+                withContext(Dispatchers.Main) {
+                    if (model.bound === asked) for (ch in named) addSpaceQuietly(RealSpace(name ?: "Server", ch.name ?: "channel", sid, ch.channelId), spaces.size)
+                }
+                revealed = true
+                continue
+            }
+            recovery = recovery.found(sid, name != null)
+            val now = android.os.SystemClock.elapsedRealtime()
+            if (name != null || !recovery.mayAsk(sid, now)) continue
+            recovery = recovery.didAsk(sid, now)
+            askForKeys(sid, owners[sid] ?: "")
+        }
+        if (revealed && model.bound === asked) {
+            withContext(Dispatchers.Main) { land() }
+            model.drainDmEvents()
+            model.refreshRoster()
         }
     }
 
@@ -659,7 +865,7 @@ class AppChat(private val model: AppModel) {
     }
 
     /** Poll the host DM for the provision bundle, then reveal channels once their names decrypt. */
-    suspend fun discover(serverId: String, hostUserId: String?, hostDeviceId: String?, quiet: Boolean, rounds: Int = 40): Boolean {
+    suspend fun discover(serverId: String, hostUserId: String?, hostDeviceId: String?, joining: Boolean = false, startedHere: Boolean = false, rounds: Int = 40): Boolean {
         val asked = model.bound ?: return false
         val client = asked.client
         val me = model.current?.userId ?: return false
@@ -680,11 +886,15 @@ class AppChat(private val model: AppModel) {
                 if (model.bound !== asked) return false
                 // Left or deleted while this was being watched: it stays out.
                 if (tombstones.hides(serverId)) return false
-                for (ch in named) {
-                    val space = RealSpace(spaceName, ch.name ?: "channel", serverId, ch.channelId)
-                    if (quiet) addSpaceQuietly(space) else addSpace(space)
+                return withContext(Dispatchers.Main) {
+                    if (model.bound !== asked) return@withContext false
+                    // (A joined server goes to the front, in the order it lists its channels.)
+                    for (ch in if (joining) named.reversed() else named)
+                        addSpaceQuietly(RealSpace(spaceName, ch.name ?: "channel", serverId, ch.channelId), if (joining) 0 else spaces.size)
+                    if (joining) landing = landing.joined(serverId, startedHere, open = selection != null || homeMode)
+                    land()
+                    true
                 }
-                return true
             }
             delay(3000)
             if (model.bound !== asked) return false

@@ -776,6 +776,13 @@ pub enum PairPoll {
 }
 
 /// The E2EE engine for one device.
+/// The engine's way to its host, saved ([`Engine::saved_api`]).
+pub struct SavedApi {
+    api: ApiClient,
+    sealed_api: ApiClient,
+    bound: bool,
+}
+
 pub struct Engine {
     api: ApiClient,
     /// Credential-less client used ONLY for sealed-sender deposits.
@@ -1040,6 +1047,26 @@ impl Engine {
         self.event_sink = sink;
         self.state_sink = state_sink;
         self.sent = sent;
+    }
+
+    /// Another way to the same host (see `SkwodClient::go_online`): the session is bound again.
+    pub fn set_api(&mut self, api: ApiClient) {
+        self.sealed_api = api.anonymous();
+        self.api = api;
+        self.bound = false;
+    }
+
+    /// The way to the host as it is now, to put back with [`Self::restore_api`] when a new one
+    /// set with [`Self::set_api`] turns out not to work.
+    pub fn saved_api(&self) -> SavedApi {
+        SavedApi { api: self.api.clone(), sealed_api: self.sealed_api.clone(), bound: self.bound }
+    }
+
+    /// Put back what [`Self::saved_api`] returned.
+    pub fn restore_api(&mut self, saved: SavedApi) {
+        self.api = saved.api;
+        self.sealed_api = saved.sealed_api;
+        self.bound = saved.bound;
     }
 
     pub fn device_id(&self) -> Option<&str> {
@@ -1692,6 +1719,14 @@ impl Engine {
             // Device-signed over exactly the uploaded keys (a session token alone is refused).
             let payload = skwod_crypto::link::op_payload(&[&Self::keys_blob(ec.iter().map(|k| &k.public)), &Self::keys_blob(kyber.iter().map(|k| &k.public))]);
             let proof = self.device_proof("replenish", &device_id, &payload)?;
+            // On disk before anyone can be handed a public half: the app may lose its cache (it
+            // went to the background) while the answer is on its way.
+            if let Err(e) = self.checkpoint(None) {
+                if let Ok(store) = SignalStore::from_bytes(&snapshot) {
+                    self.store = store;
+                }
+                return Err(e);
+            }
             let uploaded = self
                 .api
                 .signed(
@@ -1728,6 +1763,12 @@ impl Engine {
             let last_resort = self.store.generate_last_resort_kyber()?;
             let payload = skwod_crypto::link::op_payload(&[&signed.public, &last_resort.public]);
             let proof = self.device_proof("spk-rotate", &device_id, &payload)?;
+            if let Err(e) = self.checkpoint(None) {
+                if let Ok(store) = SignalStore::from_bytes(&snapshot) {
+                    self.store = store;
+                }
+                return Err(e);
+            }
             let rotated = self
                 .api
                 .signed(
@@ -1906,7 +1947,8 @@ impl Engine {
         if session_user != user_id {
             return Err(EngineError::Protocol("pair approval is for another account"));
         }
-        self.api = self.api.anonymous().with_token(token.to_string());
+        // An explicit sign-in: on a front the token is kept by the core, the client gets a credential.
+        self.api = self.api.anonymous().signed_in(token);
         self.pending_pair = None;
         let device_id = self.finish_link(&code, &user_id, &v).await?;
         Ok(PairPoll::Paired(session, device_id))

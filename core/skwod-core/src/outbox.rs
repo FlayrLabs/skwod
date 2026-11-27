@@ -180,7 +180,7 @@ fn server_sentence(body: &str) -> Option<String> {
 
 pub(crate) fn judge(kind: &str, e: &EngineError) -> Verdict {
     match e {
-        EngineError::Client(ClientError::Transport(_)) => Verdict::Wait,
+        EngineError::Client(ClientError::Transport(_) | ClientError::StaleCredential) => Verdict::Wait,
         EngineError::Client(ClientError::Status { status, body }) => match *status {
             // Not signed in right now, rate-limited, or the server is having a moment.
             // The host's disk is full: that will not clear by retrying in a minute.
@@ -351,6 +351,7 @@ impl SkwodClient {
         blob_ids: Vec<String>,
         upload_ids: Vec<String>,
     ) -> Result<String, CoreError> {
+        let _whole = self.cache_use.critical();   // the entry and the row, or neither
         if text.len() > skwod_sync::MAX_TEXT {
             return Err(CoreError::Invalid { detail: "That message is too big to send. Shorten it, or send the photo or file as an attachment.".into() });
         }
@@ -366,6 +367,7 @@ impl SkwodClient {
 
     /// Queue an edit of a channel message this account wrote (shown at once).
     pub async fn queue_channel_edit(&self, channel_id: String, message_id: String, text: String) -> Result<(), CoreError> {
+        let _whole = self.cache_use.critical();   // the entry and the row, or neither
         if text.len() > skwod_sync::MAX_TEXT {
             return Err(CoreError::Invalid { detail: "That message is too big to send.".into() });
         }
@@ -389,6 +391,7 @@ impl SkwodClient {
     /// Queue the deletion of a channel message (a chat line, a post, a story, a comment) this
     /// account wrote; it is shown as removed at once.
     pub async fn queue_channel_delete(&self, channel_id: String, message_id: String) -> Result<(), CoreError> {
+        let _whole = self.cache_use.critical();   // the entry and the row, or neither
         let scope = format!("channel:{channel_id}");
         // Never sent: just take it back.
         let queued: Vec<Entry> = self.outbox_all().into_iter().filter(|e| e.message_id == message_id && e.scope == scope).collect();
@@ -423,6 +426,7 @@ impl SkwodClient {
         reply_to_id: Option<String>,
         upload_ids: Vec<String>,
     ) -> Result<String, CoreError> {
+        let _whole = self.cache_use.critical();   // the entry and the row, or neither
         if text.len() > skwod_sync::MAX_TEXT {
             return Err(CoreError::Invalid { detail: "That message is too big to send. Shorten it, or send the photo or file as an attachment.".into() });
         }
@@ -438,6 +442,7 @@ impl SkwodClient {
 
     /// Queue an edit of a DM this account sent.
     pub async fn queue_dm_edit(&self, conversation_id: String, peer_user_ids: Vec<String>, message_id: String, text: String) -> Result<(), CoreError> {
+        let _whole = self.cache_use.critical();   // the entry and the row, or neither
         if !self.own_dm(&conversation_id, &message_id) {
             return Err(CoreError::Invalid { detail: "You can only edit your own messages.".into() });
         }
@@ -448,6 +453,7 @@ impl SkwodClient {
 
     /// Queue deleting, for everyone, a DM this account sent.
     pub async fn queue_dm_delete(&self, conversation_id: String, peer_user_ids: Vec<String>, message_id: String) -> Result<(), CoreError> {
+        let _whole = self.cache_use.critical();   // the entry and the row, or neither
         if !self.own_dm(&conversation_id, &message_id) {
             return Err(CoreError::Invalid { detail: "You can only delete your own messages.".into() });
         }

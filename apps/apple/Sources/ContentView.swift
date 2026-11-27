@@ -476,7 +476,11 @@ struct AuthView: View {
                             .fixedSize(horizontal: false, vertical: true)
                         Button("Use a relay when needed, and try again") {
                             P2PManager.publicFallback = true
-                            Task { await authenticate() }
+                            NotificationState.publicFallback = true
+                            Task {
+                                _ = await P2PManager.shared.applyRelaySetting()
+                                await authenticate()
+                            }
                         }
                         .font(.caption.weight(.semibold)).buttonStyle(.glass).tint(.skAccent)
                         .accessibilityIdentifier("auth.enableRelays")

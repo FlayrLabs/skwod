@@ -101,8 +101,10 @@ struct MainView: View {
                 VStack(spacing: 6) {
                     UpdateBanner()
                     HostNewerBanner()
-                    ConnectionBanner()
                     JoinStatusBanner(chat: chat)
+                    // Below the screen's header: it stays up for a whole outage, and the way back
+                    // (and the title) must not be under it.
+                    ConnectionBanner().padding(.top, ConnectionBanner.headerHeight)
                 }
             }
             .task { await setup() }
@@ -133,7 +135,7 @@ struct MainView: View {
     private func runPendingJoin() async {
         guard let code = app.pendingJoinCode else { return }
         app.pendingJoinCode = nil
-        for _ in 0..<60 where app.client == nil {
+        for _ in 0..<60 where !app.clientIsOnline {
             try? await Task.sleep(for: .milliseconds(250))
         }
         _ = await chat.joinByCode(code, afterSignup: true)
@@ -142,7 +144,7 @@ struct MainView: View {
     /// A join that was started earlier and never finished — the app was closed between sign-up
     /// and joining, or before the host let us in. The code was kept; carry on from where it was.
     private func resumeJoin() async {
-        for _ in 0..<60 where app.client == nil {
+        for _ in 0..<60 where !app.clientIsOnline {
             try? await Task.sleep(for: .milliseconds(250))
         }
         await chat.resumePendingJoin()
@@ -162,15 +164,7 @@ struct MainView: View {
         // (the silent race here is exactly what left joiners with an empty sidebar).
         await runPendingJoin()
         await resumeJoin()
-        // Returning member with an empty sidebar (re-login / reinstall): recover memberships —
-        // no invite code needed, the host just re-provisions this device. Same client-attach race
-        // as the join path above: recovery needs the E2EE client, so wait for it first.
-        if chat.spaces.isEmpty {
-            for _ in 0..<60 where app.client == nil {
-                try? await Task.sleep(for: .milliseconds(250))
-            }
-            await chat.recoverMemberships()
-        }
+        // (A returning member's servers: `ChatModel.recoverIfNeeded`, once the lists are read.)
         // Keep discovering channels the host adds to our servers after we joined.
         // Screenshot/demo aid: seed a space so the drawer has a channel to show. The short wait lets
         // the mock workspace's loadIfNeeded settle first (it resets the lists on activate).
@@ -374,13 +368,14 @@ private struct DetailPane: View {
             switch chat.selection {
             case .home: DMHomeView()
             case .feed: FeedView().environmentObject(chat)
-            case .space(let s): SpaceChannelView(space: s)
-            case .dm(let d): DMChatView(convo: d)
-        case .group(let g): GroupChatView(group: g)
-            case .group(let g): GroupChatView(group: g)
+            case .space(let s): SpaceChannelView(space: s).id(chat.conversationKey(s))
+            case .dm(let d): DMChatView(convo: d).id(chat.directKey(d.conversationId))
+            case .group(let g): GroupChatView(group: g).id(chat.directKey(g.conversationId))
             case .none:
-                // Home → DMs; in a skwod → the overview (channel boxes for the selected server / all).
-                if chat.homeMode { DMHomeView() } else { ChannelBoxesView() }
+                // Home → DMs; the overview → every server's channels as boxes.
+                if chat.homeMode { DMHomeView() }
+                else if chat.overview || chat.place == .noServers { ChannelBoxesView() }
+                else { LandingPane() }
             }
         }
     }
@@ -427,10 +422,11 @@ private struct ChannelBoxesView: View {
     private var emptyState: some View {
         VStack(spacing: 14) {
             Image(systemName: "square.grid.2x2").font(.system(size: 42)).foregroundStyle(.white.opacity(0.5))
-            Text("No servers yet").font(.title2.bold()).foregroundStyle(.white)
-            Text("Create your first server to add channels your friends can join.")
+            let state = chat.serversState
+            Text(state.title).font(.title2.bold()).foregroundStyle(.white).multilineTextAlignment(.center)
+            Text(state == .none ? "Create your first server to add channels your friends can join." : state.detail)
                 .font(.subheadline).foregroundStyle(.white.opacity(0.6)).multilineTextAlignment(.center)
-            if app.canCreateServers {
+            if state == .none, app.canCreateServers {
                 Button { showCreate = true } label: {
                     Label("Create a server", systemImage: "plus").padding(.horizontal, 8).padding(.vertical, 2)
                 }
@@ -438,6 +434,31 @@ private struct ChannelBoxesView: View {
             }
         }
         .padding(40).frame(maxWidth: 360)
+    }
+}
+
+/// What an empty server list says, and why (`ServerRecovery.State`).
+struct ServersEmptyNote: View {
+    @EnvironmentObject private var app: AppState
+    @ObservedObject var chat: ChatModel
+    var centered = false
+    /// "Restore from key backup": a way round waiting for someone to come online, no more.
+    let restore: () -> Void
+
+    var body: some View {
+        let state = chat.serversState
+        VStack(alignment: centered ? .center : .leading, spacing: 6) {
+            HStack(spacing: 8) {
+                if state == .loading || state == .waitingForKeys { ProgressView().controlSize(.small) }
+                Text(state.title).fixedSize(horizontal: false, vertical: true)
+            }
+            if !state.detail.isEmpty { Text(state.detail).foregroundStyle(.tertiary).fixedSize(horizontal: false, vertical: true) }
+            if state == .failed { Button("Retry") { chat.recoverMemberships() }.controlSize(.small) }
+            if state == .waitingForKeys { Button("Restore from key backup", action: restore).buttonStyle(.plain).underline() }
+        }
+        .font(.caption).foregroundStyle(.secondary).multilineTextAlignment(centered ? .center : .leading)
+        .padding(.horizontal, 12).padding(.vertical, 6)
+        .accessibilityIdentifier("servers.empty")
     }
 }
 
@@ -528,7 +549,7 @@ private struct DMHomeView: View {
                                         Circle().fill(.black.opacity(0.4)).frame(width: 54, height: 54)
                                         ProgressView().tint(.white)
                                     }
-                                    Circle().fill(PresenceStyle.color(app.realtime.status(userId: m.userId)))
+                                    Circle().fill(PresenceStyle.color(app.realtime.dot(userId: m.userId)))
                                         .frame(width: 14, height: 14)
                                         .overlay(Circle().strokeBorder(.black.opacity(0.7), lineWidth: 2))
                                         .offset(x: -1, y: -1)
@@ -617,7 +638,7 @@ private struct DMHomeRow: View {
     @State private var presenceTick = 0
 
     var body: some View {
-        let status = app.realtime.status(userId: dm.peerUserId)
+        let status = app.realtime.dot(userId: dm.peerUserId)
         // The name as this device may show it: plain for a known contact, marked otherwise.
         let shown = app.contacts.display(dm.peerUserId, claimedName: dm.name)
         HStack(spacing: 12) {
@@ -630,11 +651,11 @@ private struct DMHomeRow: View {
             VStack(alignment: .leading, spacing: 2) {
                 HStack(spacing: 6) {
                     Text(shown.text).font(.system(size: 15, weight: .semibold)).foregroundStyle(.white).lineLimit(1)
-                    TrustBadge(badge: shown.badge)
+                    TrustBadge(badge: shown.badge, compact: true)
                 }
-                Text(status == "offline" ? "end-to-end encrypted" : PresenceStyle.label(status))
+                Text(["offline", "unknown"].contains(status) ? "end-to-end encrypted" : PresenceStyle.label(status))
                     .font(.caption)
-                    .foregroundStyle(status == "offline" ? .white.opacity(0.4) : PresenceStyle.color(status).opacity(0.9))
+                    .foregroundStyle(["offline", "unknown"].contains(status) ? .white.opacity(0.4) : PresenceStyle.color(status).opacity(0.9))
             }
             Spacer()
             Image(systemName: "chevron.right").font(.caption).foregroundStyle(.white.opacity(0.25))
@@ -645,19 +666,51 @@ private struct DMHomeRow: View {
     }
 }
 
-/// Shown in the detail pane before anything is selected.
-private struct EmptyChatState: View {
+/// The chat area while no channel is open (`Landing.Place`).
+private struct LandingPane: View {
+    @EnvironmentObject private var chat: ChatModel
+    @State private var newChannelTarget: ServerRef?
+
     var body: some View {
         ZStack {
             DetailGlass()
             VStack(spacing: 14) {
-                Image(systemName: "bubble.left.and.bubble.right")
-                    .font(.system(size: 54)).foregroundStyle(.white.opacity(0.25))
-                Text("Pick a channel or DM").font(.title3.weight(.semibold)).foregroundStyle(.white.opacity(0.7))
-                Text("Your conversations are end-to-end encrypted.")
-                    .font(.subheadline).foregroundStyle(.white.opacity(0.4))
+                switch chat.place {
+                case .empty(let id):
+                    let mayCreate = chat.channelCreators.contains(id)
+                    notice("No channel to open", mayCreate ? "Create a text channel to start the conversation."
+                                                           : "There is no text channel here that you can read.")
+                    if mayCreate {
+                        button("Create channel") { newChannelTarget = ServerRef(serverId: id, name: chat.serverGroups.first { $0.serverId == id }?.name ?? "Server") }
+                    }
+                case .noServers:
+                    let state = chat.serversState
+                    notice(state.title, state == .none ? "Join one with an invite code from a friend who hosts a Skwod." : state.detail)
+                case .closed:
+                    let draft = chat.closedDraft ?? ""
+                    notice(chat.closedDraft == nil ? "No channel is open" : "This channel isn't available any more", draft.isEmpty ? "" : "You were writing:")
+                    if !draft.isEmpty { Text(draft).font(.subheadline).foregroundStyle(.white.opacity(0.7)).textSelection(.enabled) }
+                    if !chat.spaces.isEmpty { button("Open a channel") { chat.openAnother() } }
+                case .open, .loading, .channel:
+                    ProgressView().controlSize(.small).tint(.white)
+                    Text("Loading channels…").font(.subheadline).foregroundStyle(.white.opacity(0.4))
+                }
             }
+            .padding(40)
         }
+        .task(id: chat.place) { chat.land() }   // what was asked for arrived
+        .sheet(item: $newChannelTarget) { srv in NewChannelSheet(server: srv, chat: chat) }
+    }
+
+    @ViewBuilder private func notice(_ title: String, _ detail: String) -> some View {
+        Image(systemName: "bubble.left.and.bubble.right")
+            .font(.system(size: 54)).foregroundStyle(.white.opacity(0.25))
+        Text(title).font(.title3.weight(.semibold)).foregroundStyle(.white.opacity(0.7))
+        Text(detail).font(.subheadline).foregroundStyle(.white.opacity(0.4)).multilineTextAlignment(.center)
+    }
+
+    private func button(_ title: String, action: @escaping () -> Void) -> some View {
+        Button(title, action: action).controlSize(.large).buttonStyle(.glassProminent).tint(.skAccent).foregroundStyle(.black)
     }
 }
 
@@ -702,10 +755,10 @@ private struct DrawerPager: View {
         }
         .scrollTargetBehavior(.paging)
         .scrollPosition(id: $page)
-        // Every assignment, not only a change: tapping the conversation that is already selected
+        // Everything the user opens, not only a change: tapping the conversation that is already selected
         // (after swiping back to the list) must slide to it again.
-        .onReceive(chat.$selection.dropFirst()) { sel in
-            withAnimation(.snappy(duration: 0.28)) { page = sel == nil ? .list : .chat }
+        .onReceive(chat.reveal) { toChat in
+            withAnimation(.snappy(duration: 0.28)) { page = toChat ? .chat : .list }
         }
         #if DEBUG
         // Screenshots of the chat page inside the real pager (no server needed).
@@ -834,10 +887,11 @@ private struct DrawerChat: View {
         switch chat.selection {
         case .home: DMHomeView().environmentObject(chat)
         case .feed: FeedView().environmentObject(chat)
-        case .space(let s): SpaceChannelView(space: s)
-        case .dm(let d): DMChatView(convo: d)
-        case .group(let g): GroupChatView(group: g)
-        case .none: EmptyChatState()
+        case .space(let s): SpaceChannelView(space: s).id(chat.conversationKey(s))
+        case .dm(let d): DMChatView(convo: d).id(chat.directKey(d.conversationId))
+        case .group(let g): GroupChatView(group: g).id(chat.directKey(g.conversationId))
+        case .none:
+            if chat.homeMode { DMHomeView() } else { LandingPane() }
         }
     }
 }
@@ -899,7 +953,7 @@ private struct DrawerList: View {
                 // above the scroll on the same frosted glass as the panel — no separate color band.
                 HStack(spacing: 8) {
                     if chat.inChannelsMode {
-                        Button { chat.showServerBoxes(nil) } label: {
+                        Button { chat.showServers() } label: {
                             Image(systemName: "chevron.left").font(.system(size: 16, weight: .bold))
                                 .foregroundStyle(.white.opacity(0.85))
                         }.buttonStyle(.plain)
@@ -974,25 +1028,19 @@ private struct DrawerList: View {
                             Button { showRestoreBackup = true } label: {
                                 Label("Restore from key backup", systemImage: "key.horizontal.fill").font(.caption)
                             }
-                            .buttonStyle(.plain).foregroundStyle(.skAccent)
+                            .buttonStyle(.plain).foregroundStyle(.secondary)
                             .padding(.horizontal, 12).padding(.vertical, 2)
                         } else {
-                            // No servers yet: a clear call-to-action, not a buried "+".
                             VStack(spacing: 12) {
                                 Image(systemName: "person.3.fill").font(.system(size: 36)).foregroundStyle(.white.opacity(0.4))
-                                Text("No servers yet").font(.title3.bold()).foregroundStyle(.white)
-                                Text("Join one with an invite code from a friend who hosts a Skwod.")
-                                    .font(.caption).foregroundStyle(.white.opacity(0.55)).multilineTextAlignment(.center)
-                                Button { showJoin = true } label: {
-                                    Label("Join with a code", systemImage: "ticket").padding(.horizontal, 6).padding(.vertical, 2)
+                                ServersEmptyNote(chat: chat, centered: true) { showRestoreBackup = true }
+                                // Not in any server: a clear call-to-action, not a buried "+".
+                                if chat.serversState == .none {
+                                    Button { showJoin = true } label: {
+                                        Label("Join with a code", systemImage: "ticket").padding(.horizontal, 6).padding(.vertical, 2)
+                                    }
+                                    .buttonStyle(.glassProminent).tint(.white).foregroundStyle(.black)
                                 }
-                                .buttonStyle(.glassProminent).tint(.white).foregroundStyle(.black)
-                                // Kept in the settled empty state too: the provisioning wait times
-                                // out, and a returning member must still be able to restore.
-                                Button { showRestoreBackup = true } label: {
-                                    Label("Restore from key backup", systemImage: "key.horizontal.fill").font(.caption)
-                                }
-                                .buttonStyle(.plain).foregroundStyle(.skAccent)
                             }
                             .frame(maxWidth: .infinity).padding(.horizontal, 16).padding(.vertical, 24)
                         }
@@ -1137,13 +1185,16 @@ private struct MobileVoiceSection: View {
 
     /// The same route as the Mac sidebar's voice row: set up → the call; otherwise a note.
     private func join() async {
-        guard let client = app.client, !checking else { return }
+        guard let client = app.client, let asked = app.bindTicket(), !checking else { return }
         checking = true
         defer { checking = false }
-        if (try? await client.voiceConfig())?.configured == true {
-            app.activeCall = CallTarget(serverId: serverId)
-        } else {
-            note = "Voice & video isn't set up on this Skwod yet. Ask the host to turn it on."
+        let cfg: VoiceConfig
+        do { cfg = try await client.voiceConfig() } catch { note = VoiceFailure(error).message; return }
+        guard app.holds(asked) else { return }   // (another skwod meanwhile)
+        switch VoiceGate.decide(configured: cfg.configured, status: cfg.status, bundled: cfg.bundled, owner: false) {
+        case .join: app.activeCall = CallTarget(serverId: serverId)
+        case .setUp: note = VoiceGate.notSetUp
+        case .say(let text): note = text
         }
     }
 }
@@ -1198,7 +1249,7 @@ private struct DMListPage: View {
                     GroupInvitations()
                     ForEach(chat.groups) { g in
                         NavigationLink {
-                            GroupChatView(group: g).toolbar(.hidden, for: .navigationBar)
+                            GroupChatView(group: g).id(chat.directKey(g.conversationId)).toolbar(.hidden, for: .navigationBar)
                         } label: { GroupRow(group: g) }
                             .buttonStyle(.plain)
                             .muteMenu(scope: "dm:\(g.conversationId)")
@@ -1211,7 +1262,7 @@ private struct DMListPage: View {
                             // The chat brings its own header (with back), so the
                             // system navigation bar stays hidden on the pushed screen.
                             NavigationLink {
-                                DMChatView(convo: dm).toolbar(.hidden, for: .navigationBar)
+                                DMChatView(convo: dm).id(chat.directKey(dm.conversationId)).toolbar(.hidden, for: .navigationBar)
                             } label: { DMHomeRow(dm: dm) }
                                 .buttonStyle(.plain)
                                 .muteMenu(scope: "dm:\(dm.conversationId)")
@@ -1261,12 +1312,14 @@ struct SkwodScreen<Content: View>: View {
 
 /// Presence palette + labels shared by the user panels and status menus.
 enum PresenceStyle {
-    /// Green = available, yellow = away, red = DND **and** offline (the dot is always shown).
+    /// Green = available, yellow = away, red = Do Not Disturb only; grey = offline, or not known
+    /// now (the dot is always shown).
     static func color(_ status: String) -> Color {
         switch status {
         case "online": return .green
         case "idle": return .yellow
-        default: return .red
+        case "dnd": return .red
+        default: return .gray
         }
     }
     static func label(_ status: String) -> String {

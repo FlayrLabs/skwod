@@ -46,8 +46,9 @@ class RtEvent(val topic: String, val event: String, val payload: JSONObject)
  */
 class Realtime(private val model: AppModel) {
 
-    /** userId → (status, learnedAtMs); live events override polled presence for 3 minutes. */
-    val presence = mutableStateOf<Map<String, Pair<String, Long>>>(emptyMap())
+    /** Who is online, from live events and polled member lists: the newest word wins ([PresenceBook]). */
+    val presence = mutableStateOf(PresenceBook())
+    private fun clock() = android.os.SystemClock.elapsedRealtime()
     /** Who is in each server's voice room (build 47; [VoiceRoster], fed by `voice_state`). */
     val voiceRoster = mutableStateOf(VoiceRoster())
 
@@ -65,7 +66,9 @@ class Realtime(private val model: AppModel) {
     @Volatile private var wanted: Set<String> = emptySet()
     @Volatile private var closedByUs = true
     @Volatile private var myUserId = ""
-    @Volatile private var myStatus = "online"
+    /** The status this device announces; null while the app is away ([PresenceAnnounce]). */
+    @Volatile private var announced: String? = null
+    @Volatile private var announcedAt: Long? = null
     @Volatile private var baseUrl = ""
     @Volatile private var token = ""
     @Volatile private var reconnectDelayMs = 1000L
@@ -82,11 +85,16 @@ class Realtime(private val model: AppModel) {
      * reconnects, and on a slow safety timer ([safetyMs], never less than 30 s) — instead of
      * polling. Bursts collapse into one run. Never returns; cancel the calling coroutine.
      */
+    /** Build 51: "catch up now" (`AppModel.catchUp`): every [refreshLoop] runs its block. */
+    val catchUps = kotlinx.coroutines.flow.MutableSharedFlow<Unit>(extraBufferCapacity = 1, onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST)
+
     suspend fun refreshLoop(safetyMs: Long = 30_000, match: (RtEvent) -> Boolean, block: suspend () -> Unit) {
         coroutineScope {
             val poke = Channel<Unit>(Channel.CONFLATED)
             launch { events.collect { if (match(it)) poke.trySend(Unit) } }
             launch { connectEpoch.drop(1).collect { poke.trySend(Unit) } }
+            // Build 51: an app-wide catch-up (back in front, network back) runs every loop now.
+            launch { catchUps.collect { poke.trySend(Unit) } }
             while (true) {
                 try { block() } catch (e: CancellationException) { throw e } catch (_: Exception) {}
                 withTimeoutOrNull(safetyMs.coerceAtLeast(30_000)) { poke.receive() }
@@ -94,40 +102,35 @@ class Realtime(private val model: AppModel) {
         }
     }
 
-    /** The freshest status for a member: a live event within the stale window wins over the poll. */
-    fun liveStatus(userId: String, polled: String): String {
-        val seen = presence.value[userId] ?: return polled
-        return if (System.currentTimeMillis() - seen.second < 180_000) seen.first else polled
-    }
+    /** The status to list someone under (online / offline sections), and the one their dot shows:
+     *  "unknown" while this device cannot tell. */
+    fun status(userId: String): String = presence.value.view(userId, clock()).status
+    fun dot(userId: String): String = PresenceRoster.dot(presence.value.view(userId, clock()).dot, connected.value)
 
-    /** Status with no accompanying poll (DM rows): freshest known, staled offline after 3 min. */
-    fun status(userId: String): String {
-        val seen = presence.value[userId] ?: return "offline"
-        return if (System.currentTimeMillis() - seen.second < 180_000) seen.first else "offline"
-    }
+    /** The clock of [PresenceBook], for a list that is about to be asked for. */
+    fun presenceClock(): Long = clock()
 
-    /** Merge a polled snapshot; a poll never clobbers a live event that arrived moments ago. */
-    fun seedPresence(statuses: Map<String, String>) {
-        val now = System.currentTimeMillis()
-        val merged = presence.value.toMutableMap()
-        for ((uid, status) in statuses) {
-            val existing = merged[uid]
-            if (existing != null && now - existing.second < 5_000) continue
-            merged[uid] = status to now
-        }
-        presence.value = merged
-    }
+    /** A member list that was asked for at [askedAt]. */
+    @Synchronized
+    fun seedPresence(statuses: Map<String, String>, askedAt: Long) { presence.value = presence.value.polled(statuses, askedAt) }
+
+    @Synchronized
+    private fun seenPresence(userId: String, status: String, now: Long) { presence.value = presence.value.event(userId, status, now) }
+
+    /** Moves when a poll brought nothing: what is shown may have become "unknown". */
+    val unheard = mutableStateOf(0)
 
     /** Server ids parsed from the subscribed topics — the app-level presence poll walks these. */
     fun subscribedServerIds(): Set<String> =
         wanted.filter { it.startsWith("server:") }.map { it.removePrefix("server:") }.toSet()
 
     /** (Re)bind to a workspace and connect. Safe to call on every workspace switch. */
-    fun configure(baseUrl: String, token: String, userId: String, status: String) {
-        this.baseUrl = baseUrl; this.token = token; this.myUserId = userId; this.myStatus = status
+    fun configure(baseUrl: String, token: String, userId: String, status: String?) {
+        // (Another account's people are not this one's.)
+        if (myUserId != userId) presence.value = PresenceBook()
+        this.baseUrl = baseUrl; this.token = token; this.myUserId = userId; this.announced = status
         // Exactly one user topic: ours on THIS skwod (each skwod is a separate account).
         wanted = wanted.filterNot { it.startsWith("user:") }.toSet() + (if (userId.isNotEmpty()) setOf("user:$userId") else emptySet())
-        presence.value = emptyMap()
         closedByUs = false
         reconnectDelayMs = 1000
         open()
@@ -153,8 +156,16 @@ class Realtime(private val model: AppModel) {
 
     /** Push a status change through the socket (instant fan-out). */
     fun sendPresence(status: String) {
-        myStatus = status
+        announced = status
+        announcedAt = clock()
         ws?.send(JSONObject().put("type", "presence").put("status", status).toString())
+    }
+
+    /** Not in front any more. The socket stays, so the host is told — once: it is the whole
+     *  account's status, and another device of it may be in use. Nothing repeats it. */
+    fun away() {
+        if (announced != null && announced != "offline") sendPresence("offline")
+        announced = null
     }
 
     /** The network changed or the app came back: don't wait out the backoff. */
@@ -164,11 +175,12 @@ class Realtime(private val model: AppModel) {
         if (ws == null) open()
     }
 
-    fun disconnect() {
+    /** [keepPresence]: the same skwod, out of reach for now — what was last seen stays. */
+    fun disconnect(keepPresence: Boolean = false) {
         closedByUs = true
         ws?.close(1000, "bye"); ws = null
         connected.value = false
-        presence.value = emptyMap()
+        if (!keepPresence) presence.value = PresenceBook()
     }
 
     /**
@@ -183,6 +195,8 @@ class Realtime(private val model: AppModel) {
 
     private fun open() {
         ws?.close(1000, "rebind")
+        // (`RawSink`: never to a retired or SUSPECT front.)
+        if (!RawSink.allows(baseUrl)) return
         val url = baseUrl.trimEnd('/')
             .replaceFirst("http://", "ws://").replaceFirst("https://", "wss://") + "/api/ws"
         // Token in the Authorization header, NOT ?token= — query strings leak into proxy/server
@@ -200,7 +214,15 @@ class Realtime(private val model: AppModel) {
                 model.onRealtimeConnected()
                 // The rosters come again with the subscriptions; nothing from before the gap is kept.
                 voiceRoster.value = VoiceRoster()
-                webSocket.send(JSONObject().put("type", "presence").put("status", myStatus).toString())
+                announced?.let { announcedAt = clock(); webSocket.send(JSONObject().put("type", "presence").put("status", it).toString()) }
+                // The minute's heartbeat, here and not in the sync loop, where one slow pass could
+                // outlast the host's 3-minute window and show a person in use offline.
+                model.launchIO {
+                    while (ws === webSocket) {
+                        kotlinx.coroutines.delay(60_000)
+                        if (ws === webSocket) announced?.takeIf { it != "offline" }?.let { sendPresence(it) }
+                    }
+                }
                 wanted.forEach { webSocket.send(JSONObject().put("type", "subscribe").put("topic", it).toString()) }
             }
 
@@ -245,7 +267,10 @@ class Realtime(private val model: AppModel) {
                 val uid = payload.optString("user_id"); val status = payload.optString("status")
                 // Not for someone this account blocked.
                 if (uid.isNotEmpty() && status.isNotEmpty() && !BlockList.contains(uid)) {
-                    presence.value = presence.value + (uid to (status to System.currentTimeMillis()))
+                    val now = clock()
+                    seenPresence(uid, status, now)
+                    val mine = announced
+                    if (mine != null && PresenceAnnounce.corrects(uid, status, myUserId, mine, announcedAt, now)) sendPresence(mine)
                 }
             }
             // A channel message of ANY kind (chat, like, comment, avatar, game move — the server

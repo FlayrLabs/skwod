@@ -245,7 +245,8 @@ struct VoiceGate {
     rooms: Mutex<HashSet<(String, String)>>,
     /// Bumped on every revocation; live LiveKit streams watch it and stop.
     revoked: tokio::sync::watch::Sender<u64>,
-    forwarder: Mutex<Option<tokio::task::AbortHandle>>,
+    /// The media forwarder and the LiveKit port it was started for.
+    forwarder: Mutex<Option<(SocketAddr, tokio::task::AbortHandle)>>,
     recheck: Mutex<Option<tokio::task::AbortHandle>>,
 }
 
@@ -268,10 +269,11 @@ impl VoiceGate {
     fn revoke(&self) {
         *self.token.lock().unwrap_or_else(|e| e.into_inner()) = None;
         self.rooms.lock().unwrap_or_else(|e| e.into_inner()).clear();
-        for slot in [&self.forwarder, &self.recheck] {
-            if let Some(task) = slot.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                task.abort();
-            }
+        if let Some((_, task)) = self.forwarder.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            task.abort();
+        }
+        if let Some(task) = self.recheck.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            task.abort();
         }
         self.revoked.send_modify(|generation| *generation += 1);
     }
@@ -914,7 +916,7 @@ async fn accept_loop(endpoint: Endpoint, backend: Arc<dyn HostBackend>, slots: S
 async fn serve_connection(conn: Connection, relayed: bool, backend: Arc<dyn HostBackend>, id: u64, slots: Slots, mut authenticated: bool, proofs: ([u8; 32], Arc<SpentProofs>)) {
     let peer = conn.remote_id();
     let voice = VoiceGate::new();
-    let watcher = tokio::spawn(crate::member::log_path_changes(conn.clone(), "member"));
+    let watcher = tokio::spawn(crate::member::log_path_changes(conn.clone(), "member", None));
     let mut streams = tokio::task::JoinSet::new();
     let (mut window_start, mut opened) = (Instant::now(), 0u32);
     let born = tokio::time::Instant::now();
@@ -1111,8 +1113,17 @@ async fn voice_hello(
         Some(t) => {
             *voice.token.lock().unwrap_or_else(|e| e.into_inner()) = Some(token);
             let mut forwarder = voice.forwarder.lock().unwrap_or_else(|e| e.into_inner());
-            if forwarder.as_ref().is_none_or(|f| f.is_finished()) {
-                *forwarder = Some(tokio::spawn(crate::voice::run_host(conn.clone(), t.udp)).abort_handle());
+            // Alive, but for another port: LiveKit was restarted there. The old forwarder would
+            // keep sending this connection's media to a port nobody (or somebody else) holds.
+            let running = forwarder.as_ref().filter(|(_, f)| !f.is_finished()).map(|(to, _)| *to);
+            if running != Some(t.udp) {
+                if let Some((_, old)) = forwarder.take() {
+                    old.abort();
+                }
+                *forwarder = Some((t.udp, tokio::spawn(crate::voice::run_host(conn.clone(), t.udp)).abort_handle()));
+            }
+            let mut recheck_slot = voice.recheck.lock().unwrap_or_else(|e| e.into_inner());
+            if recheck_slot.as_ref().is_none_or(|r| r.is_finished()) {
                 // Media has no per-packet auth, so the grant is re-validated on a timer for as
                 // long as the forwarder lives; a failed check revokes (which aborts both tasks).
                 let (backend2, gate, every) = (backend.clone(), voice.clone(), backend.voice_recheck_interval());
@@ -1124,7 +1135,7 @@ async fn voice_hello(
                         }
                     }
                 });
-                *voice.recheck.lock().unwrap_or_else(|e| e.into_inner()) = Some(recheck.abort_handle());
+                *recheck_slot = Some(recheck.abort_handle());
             }
             serde_json::json!({ "ok": true, "udp_port": t.advertised_udp_port })
         }

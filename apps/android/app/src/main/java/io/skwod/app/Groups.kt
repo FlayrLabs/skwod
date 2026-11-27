@@ -61,7 +61,7 @@ class GroupDms(private val model: AppModel) {
         if (!touched) return
         revision.intValue++
         // The open group shows the "server disagrees" flag as soon as it is known.
-        (model.chat.selection as? SidebarItem.Group)?.let { sel -> groups.firstOrNull { it.conversationId == sel.group.conversationId }?.let { if (it != sel.group) model.chat.selection = SidebarItem.Group(it) } }
+        (model.chat.selection as? SidebarItem.Group)?.let { sel -> groups.firstOrNull { it.conversationId == sel.group.conversationId }?.let { if (it != sel.group) model.chat.put(SidebarItem.Group(it)) } }
     }
 
     /**

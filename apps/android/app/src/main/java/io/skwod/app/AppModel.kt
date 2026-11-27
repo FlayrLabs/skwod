@@ -76,6 +76,9 @@ data class Workspace(
      * did not record it. A token about a week old is swapped for a fresh one at launch.
      */
     val tokenIssuedAt: Long = 0,
+    /** The key a rotation of [token] was (or is about to be) asked with — stored BEFORE the request,
+     *  dropped with the old token: with it a rotation whose answer was lost can be asked again. */
+    val rotationKey: String? = null,
     /**
      * The USER signed out of this skwod on this device (as opposed to the server ending the
      * session). Its cache, cache key and this record stay — signing in again is the same device —
@@ -256,15 +259,19 @@ class AppModel private constructor(private val ctx: Context) {
     /** One of the app's own sounds ([Sounds]); whether to is the caller's decision ([AlertPolicy]). */
     fun playSound(which: Int) = Sounds.play(ctx, which)
 
-    var workspaces: List<Workspace> = emptyList()
-        private set
+    /** Changed only through [RecordBox]: one lock, on the list as it is. */
+    private val records = RecordBox<Workspace>({ it.localId }, { SkwodName.revalidate(it) }, { list, durable -> writeWorkspaces(list, durable) })
+    val workspaces: List<Workspace> get() = records.list
+    /** Change fields of one record as it is now ([current] follows). */
+    private fun patch(localId: String, durable: Boolean = false, only: (Workspace) -> Boolean = { true }, change: (Workspace) -> Workspace): Workspace? =
+        records.patch(localId, durable, only, change)?.also { r -> if (current?.localId == localId) current = r }
 
     /**
      * The URL to talk to the active skwod on RIGHT NOW: the https address of a classic server, or
      * the loopback proxy of the live p2p session. null while a p2p host has not been reached yet
      * this launch. Never persisted, shown or logged.
      */
-    val baseUrl: String? get() = endpoints.of(current?.id)?.base
+    val baseUrl: String? get() = endpoint()?.base
 
     /**
      * [baseUrl] together with the session token to present there, as ONE value that names its
@@ -275,7 +282,11 @@ class AppModel private constructor(private val ctx: Context) {
     private val endpoints = EndpointSlot()
 
     /** The active workspace's live URL and its token, read together — what every request is built from. */
-    fun endpoint(): Endpoint? = endpoints.of(current?.id)
+    fun endpoint(): Endpoint? = endpoints.of(current?.id)?.takeIf {
+        // Build 51: the one sink — never a retired front, never one SUSPECT (back from the
+        // background, not yet proved ours).
+        RawSink.allows(it.base)
+    }
 
     /** How the active skwod is being reached, for the indicator. */
     val connection: ConnectionQuality
@@ -285,7 +296,7 @@ class AppModel private constructor(private val ctx: Context) {
             // would be a lie even though the transport still remembers its last path.
             if (!P2PManager.networkAvailable.value) return ConnectionQuality.NoNetwork
             val node = w.nodeId ?: return if (syncFailures.intValue >= 2) ConnectionQuality.Reconnecting else ConnectionQuality.Server
-            val q = P2PManager.quality.value[node] ?: ConnectionQuality.Connecting
+            val q = P2PManager.quality.value[w.id] ?: ConnectionQuality.Connecting
             return if (q.isUsable && syncFailures.intValue >= 2) ConnectionQuality.Reconnecting else q
         }
 
@@ -396,7 +407,17 @@ class AppModel private constructor(private val ctx: Context) {
      */
     val bound: BoundClient<SkwodClient>? get() = binding.bound
     /** Where the client is put up ([bind], by turn) and taken down ([dropClient]). */
-    private val binding = ClientBinding<SkwodClient>()
+    private val binding = ClientBinding<SkwodClient>().also { b -> b.onChange = { clientTurn.intValue = b.bound?.turn ?: 0 } }
+    /**
+     * Build 51: the bind turn of the client that is up (0: none), as Compose state. An open
+     * conversation is keyed on it: it reloads from (and catches up through) every new client —
+     * one put up after it was opened (launch), or after a re-bind (a replaced p2p session).
+     */
+    val clientTurn = androidx.compose.runtime.mutableIntStateOf(0)
+    /** Build 51: coalesces become-active / network-back / reconnected catch-ups ([CatchUpGate]). */
+    private val catchUpGate = CatchUpGate()
+    @Volatile private var lastChannelSweep: Long? = null
+    @Volatile private var socketCameUpSinceSweep = true
     /** Close and forget the client; any [bind] still in flight is over and will assign nothing. */
     private fun dropClient() { binding.clear()?.let { try { it.close() } catch (_: Exception) {} } }
     var deviceId: String? = null
@@ -549,7 +570,13 @@ class AppModel private constructor(private val ctx: Context) {
      * Returns false when a later bind (or a teardown) superseded this one while it was working:
      * its client was closed, nothing was assigned, and the caller stops too.
      */
-    private suspend fun bind(w: Workspace, base: String?): Boolean {
+    /**
+     * [credential]: through a p2p front, what `sign_in` handed out — the client and every raw
+     * request present ONLY that; the token never crosses loopback (nothing at all without one).
+     */
+    private suspend fun bind(w: Workspace, base: String?, credential: String? = null): Boolean {
+        // Nothing at all to the offline base (nothing reachable is there to be told anything).
+        val wire = if (base == null) "" else WireRule.of(isFront(base), credential, w.token) ?: ""
         dropClient()
         // This bind's turn: what it puts up is under `w.id`, the workspace THIS call was given,
         // and only if no later bind or teardown has started since.
@@ -560,7 +587,7 @@ class AppModel private constructor(private val ctx: Context) {
             return true
         }
         deviceId = null
-        endpoints.put(w.id, base, w.token)
+        endpoints.put(w.id, base, wire)
         stopped = null; recoveryWaiting = false
         // No key, no cache — and without the cache nothing may be registered or sent. A key the
         // Keystore would not give us right now is NOT replaced by a new one.
@@ -571,7 +598,7 @@ class AppModel private constructor(private val ctx: Context) {
             return true
         }
         if (!binding.isCurrent(turn)) return false
-        val c = SkwodClient(base ?: OFFLINE_BASE, w.token)
+        val c = SkwodClient(base ?: OFFLINE_BASE, wire)
         // A cache that will not open under its key is moved aside by the core (returns false).
         // One that could not be opened AT ALL (I/O, a lock) throws: then nothing may be
         // registered — a device made now would be forgotten at the next launch.
@@ -763,6 +790,11 @@ class AppModel private constructor(private val ctx: Context) {
      * start syncing again if that had stopped, and rebuild the sidebar from what came back.
      */
     suspend fun deviceBecameActive() {
+        // The screen this is called from goes away in the middle of it (and its scope with it).
+        launchJob { takeUpDevice() }.join()
+    }
+
+    private suspend fun takeUpDevice() {
         // Linking and restoring bind the session themselves; asking again is free and makes sure.
         ensureSessionBound()
         routeDeviceState()
@@ -773,7 +805,8 @@ class AppModel private constructor(private val ctx: Context) {
         val w = current ?: return
         if (syncJob == null && !w.isSignedOut) {
             startBackgroundSync()
-            baseUrl?.let { goLive(w, it) }
+            // Exactly this workspace's bound wire (never another's, never the token to a front).
+            baseUrl?.let { b -> endpoints.of(w.id)?.takeIf { it.base == b }?.let { goLive(w, b, it.token) } }
         }
         // Only now can this device be handed keys: ask the account's other devices (and the
         // servers' owners) to provision it, so its servers and channels appear without a relaunch.
@@ -820,17 +853,26 @@ class AppModel private constructor(private val ctx: Context) {
         }
     }
 
+    /** What was asked of our other devices this launch: how often, and when last. */
+    private val siblingRequests = java.util.concurrent.ConcurrentHashMap<String, Pair<Int, Long>>()
+
     /** Build 49: take what our other devices handed over — into the skwod it was taken for; a
-     *  newly linked device asks once. */
+     *  newly linked device asks until it has it ([SiblingRules.mayRequest]). */
     private suspend fun drainSiblings() {
         val asked = bound ?: return
         val c = asked.client
         val wid = asked.workspaceId
         fun still() = Asked.holds(asked, bound) && client === c && current?.id == wid
         val prefs = ctx.getSharedPreferences("skwod-b49", Context.MODE_PRIVATE)
-        if (!prefs.getBoolean("asked-$wid", false)) {
-            val sent = try { withContext(Dispatchers.IO) { c.requestSiblingState() } } catch (_: Exception) { 0u }
-            if (sent > 0u && still()) prefs.edit().putBoolean("asked-$wid", true).apply()
+        // (For THIS device of the account: one linked again starts over.)
+        val answered = deviceId?.let { "answered-$wid-$it" }
+        if (answered != null) {
+            val now = android.os.SystemClock.elapsedRealtime()
+            val before = siblingRequests[answered]
+            if (SiblingRules.mayRequest(prefs.getBoolean(answered, false), before?.first ?: 0, before?.second, now)) {
+                val sent = try { withContext(Dispatchers.IO) { c.requestSiblingState() } } catch (_: Exception) { 0u }
+                if (sent > 0u && still()) siblingRequests[answered] = ((before?.first ?: 0) + 1) to now
+            }
         }
         // This skwod's stores first: payloads are taken only once they can be merged.
         contacts.load()
@@ -848,6 +890,7 @@ class AppModel private constructor(private val ctx: Context) {
                 "contacts.v1" -> {
                     val book = SiblingBook.decode(String(p.body))
                     if (!contacts.mergeFromSibling(book, wid, vouched, mismatched)) continue
+                    if (answered != null && SiblingRules.answers(book, p.vouchedUsers)) prefs.edit().putBoolean(answered, true).apply()
                     for (uid in book.filter { it.value.level == TrustLevel.VERIFIED && it.key in vouched && it.key !in mismatched }.keys.take(500)) {
                         val st = try { withContext(Dispatchers.IO) { c.contactStatus(uid) } } catch (_: Exception) { null } ?: continue
                         if (!still()) return
@@ -855,7 +898,7 @@ class AppModel private constructor(private val ctx: Context) {
                         // Read again: an un-verify that happened meanwhile wins.
                         val again = try { withContext(Dispatchers.IO) { c.contactStatus(uid) } } catch (_: Exception) { null } ?: continue
                         if (!still()) return
-                        contacts.noteStatusRead(uid, again.verified)
+                        contacts.noteStatusRead(wid, uid, again.verified)
                     }
                 }
                 "avatars.v1" -> {
@@ -961,10 +1004,10 @@ class AppModel private constructor(private val ctx: Context) {
         // pinned key are what a host SAID when first pinned, and must never merge or drop a
         // record (security review, build 46).
         val merged = WorkspaceDedupe.merge(loaded, crossAddress = false)
-        workspaces = SkwodName.revalidate(merged.kept); workspacesLoaded = true
+        records.load(merged.kept); workspacesLoaded = true
         if (merged.dropped.isNotEmpty()) {
             prefs.getString("current", null)?.let { cur -> merged.replacedBy[cur]?.let { prefs.edit().putString("current", it).apply() } }
-            saveWorkspaces()
+            records.edit { it }
         }
         // "Block screenshots" is on for a NEW install (no preference, no skwod yet) only.
         settings.decideScreenSecurity(hasWorkspace = workspaces.isNotEmpty())
@@ -980,18 +1023,27 @@ class AppModel private constructor(private val ctx: Context) {
     /** Resolve the URL for `w` right now: dial a p2p host by its key, or use the https address. */
     private suspend fun resolveBase(w: Workspace): String? {
         val node = w.nodeId ?: return w.server
-        P2PManager.liveBase(node)?.let { return it }
+        // The front dialed by the log-in screen becomes this workspace's (one per host+account).
+        P2PManager.adopt(node, w.id)
+        P2PManager.liveBase(w.id, node)?.let { live ->
+            // SUSPECT (back from the background): proved ours — or moved — first; still suspect: none.
+            if (!(try { uniffi.skwod_core.isFrontSuspect(live) } catch (_: Throwable) { true })) return live
+            P2PManager.ensureFront(w.id, CallState.active.value)
+            val again = P2PManager.liveBase(w.id, node) ?: return null
+            return if (try { uniffi.skwod_core.isFrontSuspect(again) } catch (_: Throwable) { true }) null else again
+        }
         // Opening the app must not wait on the host: give the dial a few seconds (the usual case
         // is well under that), then open on the local cache and let the dial finish in the
         // background — reconnectIfNeeded() binds the engine to the session once it is up.
-        val dial = ioScope.async { try { P2PManager.connect(ctx, node) } catch (_: Exception) { null } }
+        val dial = ioScope.async { try { P2PManager.connect(ctx, node, key = w.id) } catch (_: Exception) { null } }
         return kotlinx.coroutines.withTimeoutOrNull(LAUNCH_DIAL_WAIT_MS) { dial.await() }
     }
 
     /** `openLastChannel` = restore the last-viewed channel (app launch); false = land on the skwod
      *  overview (tapping a skwod tile to switch — the user explicitly wants the server list). */
     suspend fun activate(target: Workspace, openLastChannel: Boolean = false) {
-        var w = target
+        // (The stored record, never a copy from before something changed it.)
+        var w = workspaces.firstOrNull { it.localId == target.localId } ?: target
         // The previous workspace's client goes BEFORE `current` changes: between here and
         // [bind] there is no client at all, rather than workspace A's client under B's name.
         if (current?.id != w.id) {
@@ -1030,10 +1082,23 @@ class AppModel private constructor(private val ctx: Context) {
             ConnectionService.sync(ctx)
             return
         }
-        val base = resolveBase(w)
+        var base = resolveBase(w)
+        if (current?.id != w.id) return
+        // Build 51: through a p2p front the stored token is SIGNED IN at every bind (also the
+        // first bind after updating from 0.50: no new log-in); without a credential nothing is
+        // bound to the front (offline; the sync loop dials again) — never the token itself.
         // A token about a week old is swapped for a fresh one BEFORE the engine is built on it.
-        if (base != null) w = rotateIfDue(w, base)
-        if (!bind(w, base)) return
+        val armed = base?.let { arm(w.id, it) }
+        if (current?.id != w.id) return
+        if (armed != null) w = armed.workspace
+        else {
+            // Signed out or removed meanwhile; or no sign-in right now: offline.
+            w = workspaces.firstOrNull { it.localId == w.localId && !it.isSignedOut } ?: return
+            base = null
+        }
+        val credential = armed?.credential
+        if (!bind(w, base, credential)) return
+        val mine = binding.bound?.takeIf { it.workspaceId == w.id }
         canCreateServers = true; isInstanceOwner = false
         if (pinFailed || stopped != null) {
             // Stopped in bind(): no engine. Don't load, sync, dial or open the relay for this
@@ -1046,28 +1111,61 @@ class AppModel private constructor(private val ctx: Context) {
         chat.loadIfNeeded(openLastChannel)
         startBackgroundSync()
         startNetworkMonitoring()
-        if (base != null) goLive(w, base)
+        // Still this workspace and still this bind (no newer bind or sign-out since).
+        if (base != null && current?.id == w.id && mine != null && binding.bound === mine)
+            goLive(w, base, WireRule.of(isFront(base), credential, w.token))
         ConnectionService.sync(ctx)
         ConnectionService.updateStatus(ctx, connection.title)
         if (base != null) launchIO { account.maybePromptForRecoveryKey() }
     }
 
     /**
-     * Swap the stored session token for a fresh one when it is about a week old
-     * ([SessionPolicy]). Must run before `SkwodClient` is built: the old token keeps working for
+     * (Only under [arm]'s lock.) Swap the stored session token for a fresh one when it is about a
+     * week old ([SessionPolicy]); null: not done. Must run before `SkwodClient` is built: the old token keeps working for
      * only a few minutes afterwards. Any failure leaves the token as it is — if the session is
      * really over, the sync loop finds out from `sessionState()` and asks for a new login.
      */
-    private suspend fun rotateIfDue(w: Workspace, base: String): Workspace {
+    private suspend fun rotateIfDue(w: Workspace, base: String, credential: String?): Workspace? {
         val now = System.currentTimeMillis()
-        if (w.isSignedOut || !SessionPolicy.shouldRotate(w.tokenIssuedAt, now)) return w
-        val fresh = try { uniffi.skwod_core.rotateSession(base, w.token) } catch (_: Exception) { return w }
-        if (fresh.userId != w.userId || fresh.token.isEmpty()) return w
-        val rotated = w.copy(token = fresh.token, expiresAt = fresh.expiresAt, tokenIssuedAt = now)
-        workspaces = workspaces.map { if (it.localId == w.localId) rotated else it }
-        saveWorkspaces()
-        if (current?.localId == w.localId) current = rotated
-        return rotated
+        if (w.isSignedOut || !SessionPolicy.shouldRotate(w.tokenIssuedAt, now)) return null
+        // Through a front: rotated with the credential (the front injects the token).
+        val presenting = WireRule.of(isFront(base), credential, w.token) ?: return null
+        val same = { r: Workspace -> LiveRecordRule.stillValid(r.localId, r.isSignedOut, r.token, w.localId, w.token) }
+        val flow = RotationFlow<Workspace, uniffi.skwod_core.AuthSession>(
+            storeKey = {
+                val key = liveRecord(w)?.rotationKey ?: uniffi.skwod_core.newRotationKey()
+                patch(w.localId, durable = true, only = same) { it.copy(rotationKey = key) }?.rotationKey
+            },
+            ask = { key ->
+                try { uniffi.skwod_core.rotateSession(base, presenting, key).takeIf { it.userId == w.userId && it.token.isNotEmpty() } }
+                catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { null }
+            },
+            // Signed out (or another token stored) meanwhile: never overwritten with this one.
+            persist = { fresh -> patch(w.localId, durable = true, only = same) { it.copy(token = fresh.token, expiresAt = fresh.expiresAt, tokenIssuedAt = now, rotationKey = null) } },
+            // Told with it: a cancelled bind must not leave the front on the old token.
+            then = { r -> if (credential != null) try { P2PManager.session(w.id, w.nodeId)?.rotateToken(credential, r.token) } catch (_: Exception) {} },
+        )
+        return when (val out = flow.run()) {
+            is RotationFlow.Outcome.Rotated -> { rotationRetries.remove(w.localId); out.record }
+            RotationFlow.Outcome.NotDue -> null
+            RotationFlow.Outcome.Again -> { rotateAgain(w.localId, w.id, base); null }
+        }
+    }
+    private val rotationRetries = java.util.concurrent.ConcurrentHashMap<String, Int>()
+
+    /** A rotation that did not come to its end is asked again, while the old token's grace runs. */
+    private fun rotateAgain(localId: String, id: String, base: String) {
+        val waits = longArrayOf(10_000, 30_000, 60_000)
+        val n = rotationRetries[localId] ?: 0
+        if (n >= waits.size) return
+        rotationRetries[localId] = n + 1
+        launchIO {
+            kotlinx.coroutines.delay(waits[n])
+            val before = workspaces.firstOrNull { it.localId == localId && it.rotationKey != null } ?: return@launchIO
+            val armed = arm(id, base) ?: return@launchIO
+            // (Through a front the credential stays; an https client holds the token itself.)
+            if (armed.workspace.token != before.token && armed.credential == null && current?.localId == localId) activate(armed.workspace)
+        }
     }
 
     /** Set while the active workspace's session is over and the user has not logged in again. */
@@ -1097,12 +1195,13 @@ class AppModel private constructor(private val ctx: Context) {
 
     private fun handleSignedOut(w: Workspace) {
         if (current?.localId != w.localId || w.isSignedOut) return
+        // (Only the session it was about: a token stored since is kept.)
+        val cleared = patch(w.localId, only = { it.token == w.token && !it.isSignedOut }) { it.copy(token = "", expiresAt = 0, tokenIssuedAt = 0, rotationKey = null) } ?: return
         stopBackgroundSync()
         realtime.disconnect()
-        val cleared = w.copy(token = "", expiresAt = 0, tokenIssuedAt = 0)
-        workspaces = workspaces.map { if (it.localId == w.localId) cleared else it }
-        saveWorkspaces()
-        current = cleared
+        secretPut(LocalData.routesName(w.id), null)
+        // Its front injects nothing any more (re-armed only by a new sign-in).
+        if (w.nodeId != null) P2PManager.session(w.id)?.let { s -> launchIO { try { s.clearSession(w.token) } catch (_: Exception) {} } }
         endpoints.clear()
         incomingCall = null; Notifications.cancelIncomingCall(ctx)
         askToLogInAgain(cleared)
@@ -1113,13 +1212,15 @@ class AppModel private constructor(private val ctx: Context) {
      * Ask the server whether our session still stands, wherever the app would otherwise conclude
      * "unreachable". Returns true when the workspace was signed out (and handled).
      */
-    private suspend fun signedOutCheck(): Boolean {
-        val w = current ?: return false
-        val c = client ?: return false
-        if (baseUrl == null || w.isSignedOut) return false
-        val state = try { c.sessionState() } catch (_: Exception) { return false }
-        if (state != uniffi.skwod_core.SessionState.SIGNED_OUT) return false
-        if (current?.localId == w.localId) handleSignedOut(w)
+    private suspend fun signedOutCheck(workspace: Workspace? = current, asked: BoundClient<SkwodClient>? = binding.bound): Boolean {
+        val w = workspace ?: return false
+        val mine = asked ?: return false
+        if (baseUrl == null || w.isSignedOut || mine.workspaceId != w.id) return false
+        val confirmed = try { mine.client.sessionState() == uniffi.skwod_core.SessionState.SIGNED_OUT }
+            catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { return false }
+        // About the session that is bound and stored NOW, or about nothing: the token is kept.
+        if (!SignOutRule.mayEnd(confirmed, binding.bound === mine && current?.localId == w.localId, liveRecord(w) != null)) return false
+        handleSignedOut(w)
         return true
     }
 
@@ -1138,14 +1239,57 @@ class AppModel private constructor(private val ctx: Context) {
             checkPendingRings()
             joins.resume()
         }
+        // Build 51: every conversation, not only the open one, catches up after a gap.
+        socketCameUpSinceSweep = true
+        catchUp()
     }
 
-    /** Everything that needs a reachable host: the live relay, avatars, permissions. */
-    private fun goLive(w: Workspace, base: String) {
+    /** What a workspace presents now: its stored record and (through a front) its credential. */
+    private class Armed(val workspace: Workspace, val credential: String?)
+    private val arming = SerialByKey()
+
+    /**
+     * Sign the STORED record of [id] in to the front at [base] (nothing to do for an https server)
+     * and, with [rotate], swap a token about a week old for a fresh one. One at a time per
+     * workspace: overlapping activates, re-binds, ring checks and rotations see each other's
+     * result. The fresh token is stored before anything else can fail. Null: signed out or
+     * removed, or no sign-in right now — never a reason to drop the stored token.
+     */
+    private suspend fun arm(id: String, base: String, rotate: Boolean = true): Armed? = arming.run(id) {
+        val front = isFront(base)
+        val session = if (!front) null else {
+            val w = workspaces.firstOrNull { it.id == id } ?: return@run null
+            P2PManager.session(w.id, w.nodeId)?.takeIf { it.baseUrl() == base } ?: return@run null
+        }
+        ArmFlow<Workspace>(
+            stored = { workspaces.firstOrNull { it.id == id && !it.isSignedOut } },
+            isStored = { liveRecord(it) != null },
+            signIn = { try { session?.signIn(it.token) } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { null } },
+            rotate = { w, c -> rotateIfDue(w, base, c) },
+            rotateToken = { c, w -> try { session?.rotateToken(c, w.token) ?: false } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { false } },
+            clear = { kotlinx.coroutines.withContext(kotlinx.coroutines.NonCancellable) { try { session?.clearCredential(it) } catch (_: Exception) {} } },
+        ).run(front, rotate)?.let { (w, c) -> Armed(w, c) }
+    }
+
+    /** A front URL (or one shaped like it: fail closed). */
+    private fun isFront(base: String): Boolean =
+        try { uniffi.skwod_core.isFrontBase(base) || uniffi.skwod_core.isFrontSuspect(base) } catch (_: Throwable) { true }
+
+    /** The live record of [w] — only if it is still signed in with the same token ([LiveRecordRule]). */
+    private fun liveRecord(w: Workspace): Workspace? {
+        val live = workspaces.firstOrNull { it.localId == w.localId }
+        return live?.takeIf { LiveRecordRule.stillValid(it.localId, it.isSignedOut, it.token, w.localId, w.token) }
+    }
+
+    /** Everything that needs a reachable host: the live relay, avatars, permissions. [wire]: exactly
+     *  what [bind] presents for [base] ([WireRule]) — none: the relay is not opened. */
+    private fun goLive(w: Workspace, base: String, wire: String?) {
         signedOutOf = null
         launchIO { avatars.loadIfNeeded() }
-        // Live relay: instant presence flips + message notifications for this workspace.
-        realtime.configure(base, w.token, w.userId, effectiveStatus())
+        // Live relay: instant presence flips + message notifications for this workspace. Through
+        // a front it presents the credential bind used, never the token; without one, nothing.
+        if (wire.isNullOrEmpty()) realtime.disconnect(keepPresence = true)
+        else realtime.configure(base, wire, w.userId, effectiveStatus())
         launchIO { refreshServerCreatePermission() }
         // Conversations of the ACCOUNT (also the ones started on another of our devices), then
         // whatever is waiting in the mailbox.
@@ -1160,44 +1304,165 @@ class AppModel private constructor(private val ctx: Context) {
      * foreground / network changes.
      */
     private val reconnectLock = kotlinx.coroutines.sync.Mutex()
-    private suspend fun reconnectIfNeeded() {
-        if (pinFailed) return
-        val w = current ?: return
-        val node = w.nodeId ?: return
-        if (baseUrl != null) { P2PManager.refresh(node); return }
-        if (!reconnectLock.tryLock()) return
+    @Volatile private var lastHealthProbeAt = 0L
+    /** What a connection check came to. */
+    private enum class Check { HEALTHY, REBOUND, BUSY_OR_FAILED }
+
+    private val proofRetry = java.util.concurrent.atomic.AtomicBoolean(false)
+
+    private suspend fun reconnectIfNeeded(urgent: Boolean = false): Check {
+        if (pinFailed) return Check.BUSY_OR_FAILED
+        val w = current ?: return Check.BUSY_OR_FAILED
+        val node = w.nodeId ?: return if (endpoint() != null) Check.HEALTHY else Check.BUSY_OR_FAILED
+        if (!reconnectLock.tryLock()) return Check.BUSY_OR_FAILED
         try {
-            val base = try { P2PManager.connect(ctx, node, retry = true) } catch (_: Exception) { null } ?: return
-            if (current?.id != w.id) return
-            if (w.isSignedOut) return
-            val live = rotateIfDue(w, base)
-            if (!bind(live, base)) return
-            if (pinFailed || stopped != null) { stopBackgroundSync(); return }
-            goLive(live, base)
+            // (The raw binding: a SUSPECT front reads as no base for requests, but it is bound.)
+            if (endpoints.of(w.id)?.base == null) { dialAndBind(w, node); return Check.REBOUND }
+            // Build 51: is the front still usable? Checked now and then while in front, at once
+            // when back in front / the network changed, and at once whatever the timer says when
+            // its listener failed. A dead connection is replaced BEHIND the front (nothing to
+            // re-bind); only a front that had to move is bound again.
+            val now = System.currentTimeMillis()
+            val proxyDead = try { P2PManager.session(w.id)?.proxyClosed() == true } catch (_: Exception) { true }
+            val suspect = endpoint() == null
+            if (!proxyDead && !suspect && !SessionHealthRule.due(lastHealthProbeAt, now, appForeground, urgent)) { P2PManager.refresh(w.id); return Check.HEALTHY }
+            lastHealthProbeAt = now
+            when (val outcome = P2PManager.checkHealth(w.id, urgent, callActive = CallState.active.value)) {
+                is P2PManager.HealthOutcome.Moved -> {
+                    return rebind(w, outcome.base)
+                }
+                P2PManager.HealthOutcome.Unchanged -> {
+                    // Moved under another check (the foreground challenge): bind again.
+                    val live = P2PManager.liveBase(w.id, node)
+                    if (live != null && live != endpoints.of(w.id)?.base) return rebind(w, live)
+                    // The front itself is gone (closed elsewhere, or another host now): dial and bind again.
+                    if (live == null) {
+                        RawSink.cancel(endpoints.of(w.id)?.base)
+                        bind(w, null); dialAndBind(w, node)
+                        return Check.REBOUND
+                    }
+                    return if (FrontProof.isHealthy(FrontProof.PROVED, endpoint() != null)) Check.HEALTHY else Check.BUSY_OR_FAILED
+                }
+                P2PManager.HealthOutcome.Unproved -> {
+                    // Asked again soon (a re-key delayed by a call, a check that was running).
+                    if (proofRetry.compareAndSet(false, true)) launchIO {
+                        kotlinx.coroutines.delay(3000)
+                        proofRetry.set(false)
+                        if (appForeground || CallState.active.value) reconnectIfNeeded(urgent = true)
+                    }
+                    return Check.BUSY_OR_FAILED
+                }
+            }
         } finally { reconnectLock.unlock() }
     }
 
-    /** The relay setting changed and every session was closed: dial the active host again. */
-    suspend fun redial() {
-        val w = current ?: return
-        if (!w.isP2P) return
-        endpoints.clear()
+    /** (Under [reconnectLock].) The front is at [base] now: everything is bound to it again. */
+    private suspend fun rebind(w: Workspace, base: String): Check {
+        if (current?.id != w.id) return Check.BUSY_OR_FAILED
+        // What is still in flight to the old URL is cut.
+        RawSink.cancel(endpoints.of(w.id)?.base)
         realtime.disconnect()
-        reconnectIfNeeded()
+        return if (armAndBind(w, base)) Check.REBOUND else Check.BUSY_OR_FAILED
+    }
+
+    private suspend fun armAndBind(w: Workspace, base: String): Boolean {
+        val armed = arm(w.id, base)
+        if (current?.id != w.id) return false
+        if (armed == null) { if (liveRecord(w) != null) bind(w, null); return false }
+        val live = armed.workspace
+        if (!bind(live, base, armed.credential)) return false
+        val mine = binding.bound?.takeIf { it.workspaceId == live.id }
+        if (pinFailed || stopped != null) { stopBackgroundSync(); return false }
+        if (current?.id != live.id || mine == null || binding.bound !== mine) return false
+        // (The sync loop ends when it asks for a re-bind: it starts again on the new client.)
+        startBackgroundSync()
+        goLive(live, base, WireRule.of(isFront(base), armed.credential, live.token))
+        return true
+    }
+
+    /** Dial the host and bind the client to the front (left on the offline base if it fails). */
+    private suspend fun dialAndBind(w: Workspace, node: String) {
+        val base = try { P2PManager.connect(ctx, node, retry = true, key = w.id) } catch (_: Exception) { null } ?: return
+        if (current?.id != w.id || current?.isSignedOut != false) return
+        armAndBind(w, base)
+    }
+
+    /** "Retry" on the "Host is offline" banner: dial now, not when the next pass would. */
+    fun retryConnection() { launchIO { if (reconnectIfNeeded(urgent = true) == Check.HEALTHY) { ensureSessionBound(); realtime.reconnectNow() } else ensureSessionBound() } }
+
+    /**
+     * The relay setting changed: every connection is replaced under the new setting BEHIND its
+     * front (turning relays off closes the relayed ones at once, in the core) — nothing is
+     * re-bound; an offline workspace is dialed under the new setting.
+     */
+    suspend fun redial() {
+        if (!P2PManager.applyRelaySetting(ctx)) {
+            // Fail closed: nothing stays connected under a setting that could not be applied.
+            realtime.disconnect()
+            endpoints.clear()
+            enqueueNotice(SecurityAlert("Disconnected",
+                "Skwod couldn't confirm that relayed connections were closed, so it disconnected from every host. Close Skwod and open it again to reconnect without a relay."))
+            return
+        }
+        if (baseUrl == null) reconnectIfNeeded(urgent = true) else realtime.reconnectNow()
+        catchUp()
     }
 
     /** Wi-Fi ↔ cellular, airplane mode off, back from the background. */
     fun onNetworkChanged() {
         launchIO {
             P2PManager.networkChanged()
-            reconnectIfNeeded()
+            val check = reconnectIfNeeded(urgent = true)
             ensureSessionBound()
-            realtime.reconnectNow()
+            // Only a healthy front gets its socket re-opened here (a re-bind opened its own).
+            if (check == Check.HEALTHY) realtime.reconnectNow()
             ConnectionService.updateStatus(ctx, connection.title)
+            catchUp()
         }
     }
 
-    private fun startNetworkMonitoring() = P2PManager.startMonitoring(ctx) { onNetworkChanged() }
+    /**
+     * Build 51: bring every conversation up to date — the open one first (its screen refreshes
+     * on [Realtime.catchUps]), then the mailbox (direct and group messages), then every other
+     * joined channel through the core's cursor-based catch-up (cheap when nothing is new). Asked
+     * for on become-active, network back and every (re)connect; coalesced ([CatchUpGate]), and
+     * it stops at the first failure rather than wait out a timeout per channel.
+     */
+    fun catchUp() {
+        if (!catchUpGate.request()) return
+        launchIO {
+            do {
+                catchUpGate.waitTurn()
+                catchUpOnce()
+            } while (catchUpGate.finished())
+        }
+    }
+
+    private suspend fun catchUpOnce() {
+        val asked = bound ?: return
+        val me = current?.userId ?: return
+        realtime.catchUps.tryEmit(Unit)
+        try { syncDmsNow() } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) {}
+        chat.recoverIfNeeded()
+        if (baseUrl == null || !connection.isUsable) return
+        val now = System.currentTimeMillis()
+        if (!CatchUpGate.sweepDue(lastChannelSweep, now, socketCameUpSinceSweep)) return
+        lastChannelSweep = now; socketCameUpSinceSweep = false
+        val open = (chat.selection as? SidebarItem.Space)?.space?.channelId?.takeIf { chat.chatPageVisible }
+        val channels = (chat.spaces.map { it.channelId } + chat.feedChannelIds()).filter { it.isNotEmpty() && it != "demo" && it != open }.distinct()
+        for (channelId in channels.take(40)) {
+            if (bound !== asked) return
+            try { withContext(Dispatchers.IO) { asked.client.fetchChannelMessages(channelId, me) } } catch (e: kotlinx.coroutines.CancellationException) { throw e } catch (_: Exception) { return }
+            drainDmEvents()
+        }
+    }
+
+    private fun startNetworkMonitoring() {
+        // Build 51: a session whose loopback proxy failed for good is replaced at once.
+        P2PManager.onProxyClosed = { key -> if (current?.id == key) launchIO { reconnectIfNeeded(urgent = true) } }
+        P2PManager.routes = P2PManager.DirectRoutes({ id -> workspaces.any { it.id == id && !it.isSignedOut } }, ::secretGet, ::secretPut)
+        P2PManager.startMonitoring(ctx) { onNetworkChanged() }
+    }
 
     /** Local, on-device message notifications (decrypted here, never by a push service). */
     val notifier: MessageNotifier by lazy { MessageNotifier(this, ctx) }
@@ -1221,17 +1486,16 @@ class AppModel private constructor(private val ctx: Context) {
         get() = normalizeStatus(prefs.getString("myStatus", "online") ?: "online")
         set(v) {
             prefs.edit().putString("myStatus", normalizeStatus(v)).apply()
-            realtime.sendPresence(effectiveStatus())   // instant fan-out over the socket
-            launchIO { heartbeatPresence() }            // REST fallback keeps last_seen fresh
+            launchIO { heartbeatPresence() }
         }
 
     private fun normalizeStatus(v: String): String =
         if (v in setOf("online", "idle", "dnd", "offline")) v else "offline"
 
     /**
-     * Whether the app is currently in the foreground. When it isn't (user closed/backgrounded the
-     * app), we present as offline immediately instead of waiting out the server's 3-minute stale
-     * window — so "I closed the app" reads as offline to everyone right away.
+     * Whether the app is currently in the foreground. When it stops being (user closed/backgrounded
+     * the app), we say offline once ([Realtime.away]) instead of waiting out the server's 3-minute
+     * stale window — so "I closed the app" reads as offline to everyone right away.
      */
     @Volatile var appForeground = false
         private set
@@ -1239,12 +1503,21 @@ class AppModel private constructor(private val ctx: Context) {
     /** Called by the process lifecycle observer when the app enters the foreground / background. */
     fun onForeground() {
         AppLock.onForeground(settings, System.currentTimeMillis())
+        // Suspect until proved ours (the health check below) — every front but the one carrying a
+        // live call, which is challenged at once all the same (and is suspect if that fails).
+        val audioLive = (ctx.getSystemService(Context.AUDIO_SERVICE) as? android.media.AudioManager)?.mode == android.media.AudioManager.MODE_IN_COMMUNICATION
+        val exempt = ForegroundRule.exempt(CallState.workspace, CallState.active.value, audioLive)
+        P2PManager.suspendAll(except = exempt)
         appForeground = true; realtime.appActive = true
-        realtime.sendPresence(effectiveStatus())
-        launchIO { heartbeatPresence() }
-        // Back in front: the network may have changed while we were away, so re-probe the path
-        // and re-dial a host that was offline.
-        onNetworkChanged()
+        connectionWatch.wake()
+        launchIO {
+            // The exempt front first: challenged before anything is sent through it.
+            if (exempt != null) P2PManager.ensureFront(exempt, callActive = true)
+            heartbeatPresence()
+            // Back in front: the network may have changed while we were away, so re-probe the path
+            // and re-dial a host that was offline.
+            onNetworkChanged()
+        }
         ConnectionService.sync(ctx)
         launchIO { AttachmentService.expireCache(ctx) }
         launchIO { Updater.autoCheck(ctx, foreground = true) }
@@ -1253,17 +1526,22 @@ class AppModel private constructor(private val ctx: Context) {
     }
     fun onBackground() {
         AppLock.onBackground(System.currentTimeMillis())
+        // Build 51: the fronts are SUSPECT until proved ours on the way back.
+        if (!CallState.active.value) P2PManager.suspendAll()
         appForeground = false; realtime.appActive = false
         notifier.markSeen()            // everything up to now was on screen or already announced
-        realtime.sendPresence(effectiveStatus())
-        launchIO { heartbeatPresence() }
+        realtime.away()
     }
 
-    /** The status others should see right now: your chosen status while active, else offline. */
-    private fun effectiveStatus(): String = if (appForeground) myStatus else "offline"
+    /** The status this device announces right now; null in the background ([PresenceAnnounce]). */
+    private fun effectiveStatus(): String? = PresenceAnnounce.status(appForeground, myStatus)
 
-    /** Push my status + liveness to the server (members lists stale silent users offline after 3 min). */
-    suspend fun heartbeatPresence() = withContext(Dispatchers.IO) {
+    /** Say my current status: over the socket, or (without one) to the server's API. [periodic]:
+     *  the once-a-minute repeat, which a live socket does by itself ([Realtime]). */
+    suspend fun heartbeatPresence(periodic: Boolean = false) = withContext(Dispatchers.IO) {
+        val status = (if (periodic) PresenceAnnounce.periodic(appForeground, myStatus) else effectiveStatus()) ?: return@withContext
+        if (!periodic) realtime.sendPresence(status)
+        if (realtime.connected.value) return@withContext
         // URL and token as one value of one workspace ([endpoint]) — never read separately.
         val e = endpoint() ?: return@withContext
         try {
@@ -1273,7 +1551,7 @@ class AppModel private constructor(private val ctx: Context) {
             c.setRequestProperty("Content-Type", "application/json")
             c.doOutput = true
             c.connectTimeout = 10000; c.readTimeout = 10000
-            c.outputStream.use { it.write(JSONObject().put("status", effectiveStatus()).toString().toByteArray()) }
+            c.outputStream.use { it.write(JSONObject().put("status", status).toString().toByteArray()) }
             c.responseCode
         } catch (_: Exception) {}
     }
@@ -1286,17 +1564,38 @@ class AppModel private constructor(private val ctx: Context) {
      * installing relayed sender keys) and every ~60s it heartbeats presence.
      */
     private var syncJob: kotlinx.coroutines.Job? = null
+    private val rebindPacer = RebindPacer()
+    private val connectionWatch = ConnectionWatch(ioScope)
+    /** Relays are off and there has been no direct way to the host for a while ([DirectOnlyRule]). */
+    var cannotReachDirectly by mutableStateOf(false)
+        private set
+    private val directOnly = DirectOnlyRule()
+    private fun noteReachability() {
+        val w = current?.takeIf { it.nodeId != null && !it.isSignedOut }
+        cannotReachDirectly = directOnly.note(w?.id, connection.isUsable, !settings.publicFallback, System.currentTimeMillis())
+    }
+
+    /** "Turn on" in that notice (asked for, and confirmed). */
+    fun useRelayWhenNeeded() {
+        settings.publicFallback = true
+        cannotReachDirectly = false
+        launchIO { redial() }
+    }
     private fun startBackgroundSync() {
         syncJob?.cancel()
+        // The indicator and the reconnect run on their own ([ConnectionWatch]).
+        connectionWatch.start({ appForeground }) { noteReachability(); if (current?.isSignedOut == false) reconnectIfNeeded() }
         syncJob = ioScope.launch {
             var tick = 0
             var failures = 0
             var lastStatus = ""
             var lastInbox = 0L
             while (true) {
-                val c = client; val me = current?.userId
-                if (c != null && me != null && current?.isSignedOut == false) {
-                    reconnectIfNeeded()
+                // One pass is one client, its bind and its workspace — taken together, here: what is
+                // asked through it is applied to nothing else.
+                val asked = binding.bound; val workspace = current?.takeIf { it.id == asked?.workspaceId }
+                val c = asked?.client; val me = workspace?.userId
+                if (c != null && me != null && !workspace.isSignedOut) {
                     // A bind that could not reach the server earlier is tried again here.
                     if (baseUrl != null && sessionBoundFor !== c) ensureSessionBound()
                     if (baseUrl != null) {
@@ -1311,11 +1610,14 @@ class AppModel private constructor(private val ctx: Context) {
                                 chat.ticket().let { t -> handleDmEvents(c.syncDms(), t) }
                                 c.processControlInbox(me)
                                 failures = 0; syncFailures.intValue = 0
+                                rebindPacer.succeeded(workspace.id)
                                 hostNewer = null
                                 surfaceSecurityNotices()
                                 drainDmEvents()
                             } catch (e: kotlinx.coroutines.CancellationException) { throw e
                             } catch (e: Exception) {
+                                // (Superseded by another bind while it ran: that one's business.)
+                                if (binding.bound !== asked && binding.bound != null) continue
                                 // A refusal is sorted BEFORE anything is called "unreachable", and
                                 // only a 401 on /api/auth/me ([signedOutCheck]) ends the session.
                                 val action = SessionRefusal.decide(coreErrorKind(e), errorText(e),
@@ -1338,8 +1640,22 @@ class AppModel private constructor(private val ctx: Context) {
                                     SessionRefusal.Action.SIGNED_OUT, SessionRefusal.Action.TRANSIENT -> {}
                                 }
                                 // Before calling this "unreachable": did the server sign us out?
-                                // (401 = clear the session and show login; anything else = keep it.)
-                                if (signedOutCheck()) return@launch
+                                // (The host's confirmed 401 about the current token; anything else
+                                // keeps the session.)
+                                val ended = signedOutCheck(workspace, asked)
+                                when (SyncFailureRule.step(ended, deviceStopped = false, signInReplaced = e is uniffi.skwod_core.CoreException.SignInReplaced)) {
+                                    SyncFailureRule.Step.SIGNED_OUT -> return@launch
+                                    // Local (nothing was sent): bind again — this workspace, if this
+                                    // client is still the one bound. Backing off, capped.
+                                    SyncFailureRule.Step.REBIND -> rebindPacer.next(workspace.id)?.let { wait ->
+                                        launchIO {
+                                            kotlinx.coroutines.delay(wait)
+                                            if (binding.bound === asked && current?.id == workspace.id) liveRecord(workspace)?.let { activate(it) }
+                                        }
+                                        return@launch
+                                    }
+                                    else -> {}
+                                }
                                 // Classic https server unreachable — likely its (quick-tunnel) address
                                 // moved. After a couple of misses, resolve the new address from the
                                 // beacon (over Tor) and follow it, fingerprint-verified. A p2p address
@@ -1349,7 +1665,7 @@ class AppModel private constructor(private val ctx: Context) {
                                 if (failures >= 2) { failures = 0; if (current?.isP2P == false) tryBeaconRecovery() }
                             }
                         }
-                        if (tick % 12 == 0) heartbeatPresence()
+                        if (tick % 12 == 0) heartbeatPresence(periodic = true)
                         if (tick % 6 == 0) refreshPrimaryChannel()
                         if (tick % 12 == 6) checkAddressRecord()
                         // Seed everyone's presence app-wide (~30s) so every surface has dots (DM rows,
@@ -1366,7 +1682,7 @@ class AppModel private constructor(private val ctx: Context) {
             }
         }
     }
-    private fun stopBackgroundSync() { syncJob?.cancel(); syncJob = null }
+    private fun stopBackgroundSync() { syncJob?.cancel(); syncJob = null; connectionWatch.stop() }
 
     /** The realtime socket says something is waiting in our sealed mailbox: fetch it now. */
     fun syncInboxNow() {
@@ -1379,6 +1695,7 @@ class AppModel private constructor(private val ctx: Context) {
                 c.processControlInbox(me)
                 surfaceSecurityNotices()
                 drainDmEvents()
+                chat.mailboxSynced()
             } catch (e: Exception) { routeIfDeviceError(e) }
         }
     }
@@ -1546,8 +1863,11 @@ class AppModel private constructor(private val ctx: Context) {
                 } else {
                     // Another skwod: a throwaway client on its session, only to ask. A p2p host
                     // is asked only if its session is already up (no dialing from here).
-                    val base = (if (w.isP2P) w.nodeId?.let { P2PManager.liveBase(it) } else w.server) ?: continue
-                    val other = SkwodClient(base, w.token)
+                    val base = (if (w.isP2P) P2PManager.liveBase(w.id) else w.server) ?: continue
+                    // Through its own front: presenting only a credential.
+                    val armed = arm(w.id, base, rotate = false) ?: continue
+                    val presenting = WireRule.of(isFront(base), armed.credential, armed.workspace.token) ?: continue
+                    val other = SkwodClient(base, presenting)
                     try { other.pendingRings() } finally { try { other.close() } catch (_: Exception) {} }
                 }
             } catch (_: Exception) { continue }
@@ -1636,8 +1956,7 @@ class AppModel private constructor(private val ctx: Context) {
             uniffi.skwod_core.resolveBeaconVerified(pub, ck, pinned, w.beaconTimestamp.toULong(), emptyList())
         } catch (_: Exception) { null } ?: return
         if (res.address != w.server) {
-            workspaces = workspaces.map { if (it.localId == w.localId) it.copy(beaconTimestamp = res.createdAt.toLong()) else it }
-            saveWorkspaces()
+            patch(w.localId) { it.copy(beaconTimestamp = res.createdAt.toLong()) }
             reconnectIfKnown(res.address)
         }
     }
@@ -1711,7 +2030,7 @@ class AppModel private constructor(private val ctx: Context) {
      */
     suspend fun pairingStart(offer: uniffi.skwod_core.PairingOffer): PairingRun {
         if (!workspacesLoaded) {
-            workspaces = loadWorkspaces() ?: throw IllegalStateException("Couldn't read this phone's secure storage. Close Skwod and open it again.")
+            records.load(loadWorkspaces() ?: throw IllegalStateException("Couldn't read this phone's secure storage. Close Skwod and open it again."))
             workspacesLoaded = true
         }
         if (workspaces.any { it.nodeId == offer.nodeId && it.userId == offer.userId && !it.isSignedOut }) {
@@ -1785,7 +2104,7 @@ class AppModel private constructor(private val ctx: Context) {
         // The list is about to be written back: it must have been read first, or the skwods
         // this device is signed out of (and their keys' records) would be dropped.
         if (!workspacesLoaded) {
-            workspaces = loadWorkspaces() ?: throw IllegalStateException("Couldn't read this phone's secure storage. Close Skwod and open it again.")
+            records.load(loadWorkspaces() ?: throw IllegalStateException("Couldn't read this phone's secure storage. Close Skwod and open it again."))
             workspacesLoaded = true
         }
         // Pin the server's cryptographic identity. For a p2p host this is fetched THROUGH the
@@ -1824,8 +2143,7 @@ class AppModel private constructor(private val ctx: Context) {
             instanceName = existing?.instanceName,
             nameSetByUser = existing?.nameSetByUser ?: false)
         // One entry per skwod and account: an older dead record of this same skwod goes with it.
-        workspaces = WorkspaceDedupe.merge(workspaces.filter { it.localId != localId } + w, crossAddress = false).kept
-        saveWorkspaces()
+        records.edit { all -> WorkspaceDedupe.merge(all.filter { it.localId != localId } + w, crossAddress = false).kept }
         // A join started before this account existed on this device now belongs to it.
         joins.bind(stored, w.username, localId)
         rememberServer(stored, w.displayName)   // address only (no secrets), survives sign-out
@@ -1883,10 +2201,9 @@ class AppModel private constructor(private val ctx: Context) {
         val base = baseUrl ?: return
         val pinned = w.pinnedKey ?: return
         val rec = try { uniffi.skwod_core.fetchAddressRecord(base, pinned, w.addressTs) } catch (_: Exception) { null } ?: return
-        val updated = if (w.isP2P) w.copy(addressTs = rec.ts, fallbackUrl = rec.address) else w.copy(addressTs = rec.ts)
-        workspaces = workspaces.map { if (it.localId == w.localId) updated else it }
-        saveWorkspaces()
-        if (current?.localId == w.localId) current = updated
+        // (Into the record as it is now; only if it is still the one that was asked, at that base.)
+        if (current?.localId != w.localId || baseUrl != base) return
+        patch(w.localId, only = { !it.isSignedOut }) { if (it.isP2P) it.copy(addressTs = rec.ts, fallbackUrl = rec.address) else it.copy(addressTs = rec.ts) } ?: return
         if (!w.isP2P && rec.address != w.server) reconnectIfKnown(rec.address)
     }
 
@@ -1927,9 +2244,8 @@ class AppModel private constructor(private val ctx: Context) {
         val pinned = known.pinnedKey ?: return false
         val proven = try { uniffi.skwod_core.verifyServerIdentity(newServer, pinned) } catch (_: Exception) { false }
         if (!proven) return false
-        val moved = known.copy(server = newServer)
-        workspaces = workspaces.map { if (it.localId == known.localId) moved else it }
-        saveWorkspaces()
+        // (Only the address, into the record as it is now: the same session continues there.)
+        val moved = patch(known.localId, only = { !it.isP2P && !it.isSignedOut && it.pinnedKey == pinned }) { it.copy(server = newServer) } ?: return false
         activate(moved)
         return true
     }
@@ -2036,11 +2352,12 @@ class AppModel private constructor(private val ctx: Context) {
     /** Fetch every subscribed server's member statuses and seed the realtime presence store. */
     private suspend fun pollPresence() {
         val statuses = HashMap<String, String>()
+        val askedAt = realtime.presenceClock()
         for (sid in realtime.subscribedServerIds()) {
             if (sid.isEmpty() || sid == "demo") continue
             for (m in listPresenceMembers(sid)) statuses[m.userId] = m.status
         }
-        if (statuses.isNotEmpty()) realtime.seedPresence(statuses)
+        if (statuses.isNotEmpty()) realtime.seedPresence(statuses, askedAt) else realtime.unheard.value++
     }
 
     /** Resolve my public username on the active skwod from any member list (fallback when it wasn't
@@ -2054,9 +2371,7 @@ class AppModel private constructor(private val ctx: Context) {
             // The answer is about the workspace that was asked: after a switch it names nobody here.
             if (current?.localId != asked.localId || client !== c) return null
             if (mine != null) {
-                current = current?.copy(username = mine.username)
-                workspaces = workspaces.map { if (it.localId == asked.localId) it.copy(username = mine.username) else it }
-                saveWorkspaces()
+                patch(asked.localId) { it.copy(username = mine.username) }
                 return mine.username
             }
         }
@@ -2100,6 +2415,7 @@ class AppModel private constructor(private val ctx: Context) {
         val owners = ServerList.owners(httpGet("api/servers")) ?: return
         if (current?.localId != wid) return
         serverOwners = owners
+        chat.serversListed(owners.keys)
         val gone = ServerList.gone(chat.spaces.map { it.serverId }, owners.keys)
         for (sid in gone) chat.removeServer(sid)
         // A server renamed by its owner (on any device): the decrypted names.
@@ -2138,10 +2454,7 @@ class AppModel private constructor(private val ctx: Context) {
         val accepted = name?.takeIf { SkwodName.accepted(it, others) }
         val latest = workspaces.firstOrNull { it.localId == w.localId } ?: return
         if (latest.instanceName == accepted) return
-        val named = latest.copy(instanceName = accepted)
-        workspaces = workspaces.map { if (it.localId == w.localId) named else it }
-        saveWorkspaces()
-        if (current?.localId == w.localId) current = current?.copy(instanceName = accepted)
+        patch(w.localId) { it.copy(instanceName = accepted) }
     }
 
     /**
@@ -2179,8 +2492,8 @@ class AppModel private constructor(private val ctx: Context) {
     fun removeDuplicate(localId: String): Boolean {
         val w = workspaces.firstOrNull { it.localId == localId } ?: return false
         if (current?.localId == localId || !WorkspaceLabel.hasTwin(w, workspaces)) return false
-        workspaces = workspaces.filter { it.localId != localId }
-        saveWorkspaces()
+        if (!w.isSignedOut) endSession(w, null)
+        records.edit { all -> all.filter { it.localId != localId } }
         return true
     }
 
@@ -2341,7 +2654,6 @@ class AppModel private constructor(private val ctx: Context) {
     /** Sign out of every skwod on this device. */
     fun signOut() {
         dropSessions(workspaces.toList())
-        launchIO { P2PManager.disconnectAll() }
         ConnectionService.stop(ctx)
     }
 
@@ -2356,11 +2668,10 @@ class AppModel private constructor(private val ctx: Context) {
         val liveId = current?.localId
         val ids = targets.map { it.localId }.toSet()
         for (w in targets) {
-            revokeSession(w, if (w.localId == liveId) baseUrl else null)
-            w.nodeId?.let { node -> launchIO { P2PManager.disconnect(node) } }
+            endSession(w, if (w.localId == liveId) baseUrl else null, ids)
         }
-        workspaces = workspaces.map { if (it.localId in ids) LocalData.signedOut(it) else it }
-        saveWorkspaces()
+        records.edit { all -> all.map { if (it.localId in ids) LocalData.signedOut(it).copy(rotationKey = null) else it } }
+        for (w in targets) secretPut(LocalData.routesName(w.id), null)
         AttachmentService.purgeCache(ctx)   // decrypted copies never outlive the session that made them
         if (liveId != null && liveId in ids) { teardownLive(); current = null }
     }
@@ -2415,7 +2726,7 @@ class AppModel private constructor(private val ctx: Context) {
     private suspend fun forgetLocally(w: Workspace, why: LocalData.Departure): Boolean {
         val parts = LocalData.removedBy(why)
         val live = current?.localId == w.localId
-        if (LocalData.Part.SESSION_TOKEN in parts) revokeSession(w, if (live) baseUrl else null)
+        val ended = if (LocalData.Part.SESSION_TOKEN in parts) endSession(w, if (live) baseUrl else null) else null
         if (live) { teardownLive(keepsCache = LocalData.Part.CACHE_FILE !in parts); current = null }
         if (LocalData.Part.CACHE_FILE in parts) { chat.forgetParked(w.id); deleteCache(w); Uploads.purgeWork(ctx, w.id) }
         if (LocalData.Part.CACHE_KEY in parts) {
@@ -2435,11 +2746,10 @@ class AppModel private constructor(private val ctx: Context) {
         }
         if (LocalData.Part.WORKSPACE_RECORD in parts) {
             contacts.forget(w.id); joins.forgetWorkspace(w.id); notifier.forget(w.id)
-            workspaces = workspaces.filter { it.localId != w.localId }
-            saveWorkspaces()
+            records.edit { all -> all.filter { it.localId != w.localId } }
         }
         AttachmentService.purgeCache(ctx)
-        w.nodeId?.let { P2PManager.disconnect(it) }
+        if (ended == null && w.nodeId != null) P2PManager.disconnect(w.id)
         val next = workspaces.firstOrNull { !it.isSignedOut }
         if (next != null) { activate(next); return true }
         try { prefs.edit().remove("current").apply() } catch (_: Exception) {}
@@ -2456,6 +2766,8 @@ class AppModel private constructor(private val ctx: Context) {
     private fun revokeSession(w: Workspace, base: String?) {
         if (w.isSignedOut) return
         val url = base ?: (if (!w.isP2P && w.server.startsWith("https://")) w.server else null) ?: return
+        // Never the token to a front (or anything shaped like one): that is endSession's.
+        if (try { uniffi.skwod_core.isFrontBase(url) || uniffi.skwod_core.isFrontSuspect(url) } catch (_: Throwable) { true }) return
         val token = w.token
         Thread {
             try {
@@ -2470,6 +2782,41 @@ class AppModel private constructor(private val ctx: Context) {
             } catch (_: Exception) {}
         }.start()
     }
+    /**
+     * Build 51: the session of [w] ends here. Through its p2p front the host is told over the
+     * member connection itself ([P2pSession.logout], bounded) — never through the loopback port —
+     * and the front's token is cleared before that returns; only then is the front closed. An
+     * https skwod is told as before. Returns the job doing it.
+     */
+    /** [ending]: every entry that ends now. */
+    private fun endSession(w: Workspace, base: String?, ending: Set<String> = setOf(w.localId)): kotlinx.coroutines.Job? {
+        // Another entry of this device, which stays, uses the very same session: only this one's
+        // front goes.
+        if (!SessionEnd.SIGN_OUT.tellsHost(w.token, workspaces.filter { it.localId != w.localId && it.localId !in ending }.map { it.token })) {
+            val s = P2PManager.detach(w.id) ?: return null
+            return ioScope.launch { try { s.disconnect() } catch (_: Exception) {}; try { s.close() } catch (_: Exception) {} }
+        }
+        val boundIsFront = base?.let { try { uniffi.skwod_core.isFrontBase(it) || uniffi.skwod_core.isFrontSuspect(it) } catch (_: Throwable) { true } } ?: false
+        when (SignOutRoute.of(base, boundIsFront, w.nodeId != null)) {
+            SignOutRoute.Route.SERVER, SignOutRoute.Route.NONE -> { revokeSession(w, base); return null }
+            SignOutRoute.Route.FRONT -> {}
+        }
+        // Out of the map NOW: a sign-in that follows dials its own front.
+        val s = P2PManager.detach(w.id) ?: return null
+        val token = w.token
+        return ioScope.launch {
+            // The core takes and clears the token, then logs out with it; a front that held no
+            // token (never signed in here) is signed in once to say so.
+            val told = try { s.endSession(false, 4000u) } catch (_: Exception) { false }
+            if (!told && token.isNotEmpty() && (try { s.signIn(token) } catch (_: Exception) { null }) != null) {
+                try { s.endSession(false, 4000u) } catch (_: Exception) {}
+            }
+            try { s.disconnect() } catch (_: Exception) {}
+            try { s.close() } catch (_: Exception) {}
+        }
+    }
+
+
 
     /** The encrypted cache AND its SQLite side files (`-wal`, `-shm`, `-journal`). */
     private fun deleteCache(w: Workspace) {
@@ -2481,12 +2828,10 @@ class AppModel private constructor(private val ctx: Context) {
 
     // ---- workspace persistence (JSON in EncryptedSharedPreferences) ----
 
-    private fun saveWorkspaces() {
-        // Every save re-checks host-supplied names against the whole list ([SkwodName.revalidate]).
-        workspaces = SkwodName.revalidate(workspaces)
-        current?.let { c -> workspaces.firstOrNull { it.localId == c.localId }?.let { r -> if (r.instanceName != c.instanceName) current = c.copy(instanceName = r.instanceName) } }
+    /** (Under [records]' lock.) [durable]: on disk before it returns, and whether it is. */
+    private fun writeWorkspaces(list: List<Workspace>, durable: Boolean): Boolean {
         val arr = JSONArray()
-        for (w in workspaces) {
+        for (w in list) {
             arr.put(JSONObject().apply {
                 put("server", w.server); put("userId", w.userId); put("token", w.token)
                 put("expiresAt", w.expiresAt); put("name", w.name); put("localId", w.localId)
@@ -2498,12 +2843,16 @@ class AppModel private constructor(private val ctx: Context) {
                 w.nodeId?.let { put("nodeId", it) }; w.fallbackUrl?.let { put("fallbackUrl", it) }
                 put("addressTs", w.addressTs)
                 put("tokenIssuedAt", w.tokenIssuedAt)
+                w.rotationKey?.let { put("rotationKey", it) }
                 if (w.signedOutByUser) put("signedOutByUser", true)
                 w.instanceName?.let { put("instanceName", it) }
                 if (w.nameSetByUser) put("nameSetByUser", true)
             })
         }
-        prefs.edit().putString("workspaces", arr.toString()).apply()
+        val edit = prefs.edit().putString("workspaces", arr.toString())
+        if (durable) return try { edit.commit() } catch (_: Exception) { false }
+        edit.apply()
+        return true
     }
 
     /** The stored workspaces; null when the secure store could not be read (NOT the same as none). */
@@ -2532,6 +2881,7 @@ class AppModel private constructor(private val ctx: Context) {
                     fallbackUrl = if (o.has("fallbackUrl") && o.optLong("addressTs", 0) > 0) o.getString("fallbackUrl") else null,
                     addressTs = o.optLong("addressTs", 0),
                     tokenIssuedAt = o.optLong("tokenIssuedAt", 0),
+                    rotationKey = if (o.has("rotationKey")) o.getString("rotationKey") else null,
                     signedOutByUser = o.optBoolean("signedOutByUser", false),
                     instanceName = if (o.has("instanceName")) SkwodName.clean(o.getString("instanceName")) else null,
                     nameSetByUser = o.optBoolean("nameSetByUser", false))

@@ -49,6 +49,8 @@ mod problems;
 #[cfg(test)]
 mod tests;
 #[cfg(test)]
+mod migration_tests;
+#[cfg(test)]
 mod p2p_tests;
 #[cfg(test)]
 mod basics_tests;

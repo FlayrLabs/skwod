@@ -1,0 +1,48 @@
+{
+ "_doc": "What joining a call says when it fails, identical on Apple (VoiceFailure.swift) and Android (VoiceFailure.kt). 'messages': the failure code and its one fixed sentence. 'codes': the core's CoreError.Voice code and the failure it is. 'media': signaling worked (or not) by the voice tunnel's counters before and after the attempt ([accepted, up, down, undelivered]); null = no tunnel. No sentence blames a VPN: a phone on cellular hits 'media_blocked' without one. 'gate': the host's voice status, and what the Voice row does.",
+ "messages": {
+  "off": "Voice is off on this Skwod right now. Ask the host to check it.",
+  "starting": "Voice is starting on this Skwod. Try again in a moment.",
+  "unreachable": "Couldn't reach the host. Check your connection and try again.",
+  "no_access": "You can't join this channel. Ask the host to let you in.",
+  "unavailable": "The host didn't open the call. Try again in a moment.",
+  "port_taken": "Another call is using this device's sound and video path. End it, then try again.",
+  "media_blocked": "Reached the call, but this device's connection blocked its sound and video. Joining on Wi-Fi may work.",
+  "media_silent": "Reached the call, but sound and video didn't get through. Try again in a moment.",
+  "other": "Couldn't join the call. Try again."
+ },
+ "retry_once": ["starting", "unreachable"],
+ "codes": [
+  { "code": "off", "expect": "off" },
+  { "code": "starting", "expect": "starting" },
+  { "code": "unreachable", "expect": "unreachable" },
+  { "code": "no_access", "expect": "no_access" },
+  { "code": "unavailable", "expect": "unavailable" },
+  { "code": "port_taken", "expect": "port_taken" },
+  { "code": "media_blocked", "expect": "other" },
+  { "code": "something new", "expect": "other" },
+  { "code": "", "expect": "other" }
+ ],
+ "media": [
+  { "why": "the call server was never reached", "before": [0, 0, 0, 0], "after": [0, 0, 0, 0], "expect": "unreachable" },
+  { "why": "packets from an earlier call do not count", "before": [3, 900, 900, 0], "after": [3, 900, 900, 0], "expect": "unreachable" },
+  { "why": "signaling worked, the engine could not send to the device's own address", "before": [0, 0, 0, 0], "after": [1, 0, 0, 0], "expect": "media_blocked" },
+  { "why": "answers came and none could be handed over (a socket on a point-to-point interface)", "before": [1, 40, 38, 2], "after": [2, 52, 48, 12], "expect": "media_blocked" },
+  { "why": "sent, and the host answered nothing: not this device", "before": [0, 0, 0, 0], "after": [1, 30, 0, 0], "expect": "media_silent" },
+  { "why": "both ways and still no call", "before": [0, 0, 0, 0], "after": [1, 30, 28, 0], "expect": "media_silent" },
+  { "why": "some answers undeliverable, some delivered: not blocked", "before": [0, 0, 0, 0], "after": [1, 30, 28, 3], "expect": "media_silent" },
+  { "why": "the connection was replaced meanwhile (counters went back): nothing is claimed", "before": [1, 500, 500, 0], "after": [2, 4, 0, 0], "expect": "other" },
+  { "why": "no tunnel: nothing is known", "before": null, "after": null, "expect": "other" }
+ ],
+ "gate": [
+  { "configured": true, "status": "on", "reason": "managed", "bundled": true, "owner": false, "expect": "join" },
+  { "configured": true, "status": "on", "reason": "external", "bundled": true, "owner": true, "expect": "join" },
+  { "configured": true, "status": "on", "reason": "", "bundled": false, "owner": true, "expect": "join" },
+  { "configured": false, "status": "starting", "reason": "launching", "bundled": true, "owner": true, "expect": "starting" },
+  { "configured": false, "status": "off", "reason": "exited", "bundled": true, "owner": true, "expect": "off" },
+  { "configured": false, "status": "off", "reason": "exited", "bundled": true, "owner": false, "expect": "off" },
+  { "configured": false, "status": "off", "reason": "disabled", "bundled": false, "owner": false, "expect": "not_set_up" },
+  { "configured": false, "status": "off", "reason": "", "bundled": false, "owner": true, "expect": "set_up" },
+  { "configured": false, "status": "off", "reason": "", "bundled": false, "owner": false, "expect": "not_set_up" }
+ ]
+}

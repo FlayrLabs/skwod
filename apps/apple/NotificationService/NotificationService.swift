@@ -41,6 +41,8 @@ final class NotificationService: UNNotificationServiceExtension {
     private var contentHandler: ((UNNotificationContent) -> Void)?
     private var original: UNMutableNotificationContent?
     private var work: Task<Void, Never>?
+    /// This wake's hold on the encrypted cache: over before the banner is delivered.
+    private let hold = WakeHold(.shared)
     private let finishLock = NSLock()
     private var finished = false
     /// The wake's tag: which skwod it is for, as far as this device can tell.
@@ -61,14 +63,15 @@ final class NotificationService: UNNotificationServiceExtension {
             let known = WakeOrigin.knownIds(SharedContainer.defaults.data(forKey: WakeOrigin.registrationIdsKey),
                                             now: Int64(Date().timeIntervalSince1970))
             let origin = WakeOrigin.of(credentialId: request.content.userInfo["skwod_cred"], known: known)
-            let rewritten = await NotificationDecryptor.rewrite(tag: tag, origin: origin)
+            let rewritten = await NotificationDecryptor.rewrite(tag: tag, origin: origin, hold: self?.hold ?? WakeHold(.shared))
             self?.finish(with: rewritten)
         }
     }
 
-    /// The system is about to kill us: deliver the generic text now.
+    /// The system is about to kill us: let go of the cache and deliver the generic text now.
     override func serviceExtensionTimeWillExpire() {
         work?.cancel()
+        hold.end()
         finish(with: nil)
     }
 
@@ -76,6 +79,9 @@ final class NotificationService: UNNotificationServiceExtension {
         finishLock.lock(); defer { finishLock.unlock() }
         guard !finished, let contentHandler, let content = original else { return }
         finished = true
+        // Once the banner is delivered this process may be suspended at any moment — never with the
+        // lock held, whatever a call that was left behind is still doing (it can use nothing).
+        hold.end()
         // The push itself carries no sound (older gateways), so a banner that should be
         // noticed gets one here: without it a sleeping phone lights up silently, with no
         // haptic, which reads as "no notification". The quiet line below takes it off again.
@@ -150,7 +156,7 @@ enum NotificationDecryptor {
     private static let totalBudget: TimeInterval = 22
     private static let maxWorkspaces = 3
 
-    static func rewrite(tag: String? = nil, origin: WakeOrigin = .stranger) async -> Result? {
+    static func rewrite(tag: String? = nil, origin: WakeOrigin = .stranger, hold: WakeHold) async -> Result? {
         // Whose wake this is and whether it may interrupt at all is decided FIRST, from the
         // tag and the skwods' own mutes (`WakeRule`) — before anything is dialed, opened or
         // decrypted. It is the passive line (an extension cannot drop the alert) only when
@@ -184,22 +190,14 @@ enum NotificationDecryptor {
         }
         // Never open the cache while the app has it — and let go of it the moment the app asks:
         // the app waits for this lock before it opens the cache, so holding on would freeze it.
-        guard !StoreLock.shared.yieldRequested, StoreLock.shared.tryAcquire() else {
+        guard hold.acquire() else {
             nseLog.notice("generic: the app holds (or wants) the cache")
             return nil
         }
-        // The lock is released only after every client this run made is gone (each lives
-        // inside `newest(in:)`): when the function returns — or, for a skwod that did not
-        // answer in its time and was left behind, when that call has ended too.
+        // The lock is let go when this returns, and every client this run made is cut off from the
+        // cache first — also one a skwod that did not answer in its time left behind.
         var leftBehind: [BoundedCall.Lingering] = []
-        defer {
-            if leftBehind.isEmpty {
-                StoreLock.shared.release()
-            } else {
-                let waiting = leftBehind
-                Task { for call in waiting { await call.task.value }; StoreLock.shared.release() }
-            }
-        }
+        defer { hold.end() }
         let yielding = YieldFlag()
         StoreLock.shared.onYield { yielding.set() }
 
@@ -223,7 +221,7 @@ enum NotificationDecryptor {
             let abandoned = YieldFlag()
             let outcome = await BoundedCall.run(seconds: min(perWorkspaceBudget, left), shouldStop: { yielding.isSet },
                                                 onAbandon: { abandoned.set() }) {
-                await newest(in: w, yielding: yielding, abandoned: abandoned)
+                await newest(in: w, yielding: yielding, abandoned: abandoned, hold: hold)
             }
             if let lingering = outcome.lingering { leftBehind.append(lingering) }
             switch outcome.value {
@@ -239,8 +237,7 @@ enum NotificationDecryptor {
         }
         if candidates.count > maxWorkspaces { unknown = true }
         // A skwod that was left behind still has the cache open: it gets what is left of the
-        // wake's time to end, so the banner is not delivered (and the extension suspended)
-        // with the lock held. One that has still not ended keeps the lock until it does.
+        // wake's time to end by itself.
         leftBehind = await BoundedCall.wait(for: leftBehind, until: deadline)
         // Every message this wake claimed is shown: the newest as the push itself, the others
         // beside it (`WakePick`; `newest(in:)` claimed no more than can be shown).
@@ -263,7 +260,7 @@ enum NotificationDecryptor {
     }
 
     /// Sync one skwod and return its newest not-yet-announced message from someone else.
-    private static func newest(in w: Workspace, yielding: YieldFlag, abandoned: YieldFlag) async -> Found? {
+    private static func newest(in w: Workspace, yielding: YieldFlag, abandoned: YieldFlag, hold: WakeHold) async -> Found? {
         // `abandoned`: this skwod did not answer in its time and the wake went on without it.
         // From then on nothing here is recorded or claimed — its result is shown by nobody.
         let stop = { Task.isCancelled || yielding.isSet || abandoned.isSet || StoreLock.shared.yieldRequested }
@@ -277,7 +274,10 @@ enum NotificationDecryptor {
         var session: P2pSession?
         let base: String
         if let nodeId = w.nodeId {
-            guard let s = try? await p2pConnect(nodeId: nodeId, publicFallback: NotificationState.publicFallback) else {
+            // (This process's relay gate, before its dial.)
+            let relays = NotificationState.publicFallback
+            p2pRelaysInit(allowed: relays)
+            guard let s = try? await p2pConnect(nodeId: nodeId, publicFallback: relays) else {
                 nseLog.notice("skip: host unreachable")
                 return nil
             }
@@ -290,7 +290,17 @@ enum NotificationDecryptor {
         defer { if let session { Task { await session.disconnect() } } }
 
         if stop() { return nil }
-        let client = SkwodClient(baseUrl: base, token: w.token)
+        // Build 51: through its own front the stored token is signed in there and the client
+        // presents only the credential (the token never crosses loopback).
+        var presenting = w.token
+        if let session {
+            guard let c = await session.signIn(token: w.token) else { return nil }
+            presenting = c
+        }
+        let client = SkwodClient(baseUrl: base, token: presenting)
+        // Opened only under this wake's hold, which ends the use of it when the wake is over.
+        let lease = client.cacheLease()
+        guard !stop(), hold.lease(lease) else { return nil }
         // `attachCache` returning false means "no usable identity here" — the extension must
         // never register a device or create keys; that is the app's job.
         guard (try? await client.attachCache(path: SharedContainer.cachePath(forWorkspace: w.id), keyHex: keyHex)) == true else {
@@ -411,7 +421,8 @@ enum NotificationDecryptor {
         }
         // Left behind (out of time) or asked to stop: whatever was found is shown by nobody,
         // so nothing is remembered as seen and nothing is claimed — the next wake finds it.
-        if abandoned.isSet || Task.isCancelled { return nil }
+        // (Cut off from the cache: what was read from it is not all there was.)
+        if abandoned.isSet || Task.isCancelled || lease.isOver() { return nil }
         if stop() { complete = false }
         // The red "@ n" in the app (`MentionBadgeLedger`, in the app group): each mention once.
         for (scope, ids) in mentionsByScope {

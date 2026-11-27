@@ -134,6 +134,12 @@ struct HostWizardView: View {
                                 .font(.caption2).foregroundStyle(.white.opacity(0.5)).fixedSize(horizontal: false, vertical: true)
                         }
                     }
+                    // The same setting as in Profile: applied the same way (an opt-out closes what
+                    // this app's own connections relay, not only what the server will).
+                    .onChange(of: publicFallback) { _, v in
+                        NotificationState.publicFallback = v
+                        Task { await app.reconnectAfterTransportSettingChange() }
+                    }
                     .tint(.skAccent)
                 }
                 .padding(.top, 8)
@@ -632,7 +638,7 @@ struct HostInvitePanel: View {
             return
         }
         // The E2EE client attaches a moment after sign-in.
-        for _ in 0..<60 where app.client == nil || app.deviceId == nil {
+        for _ in 0..<60 where !app.clientIsOnline || app.deviceId == nil {
             try? await Task.sleep(for: .milliseconds(250))
         }
         guard let client = app.client, app.deviceId != nil else {

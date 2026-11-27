@@ -381,11 +381,11 @@ final class Build45Tests: XCTestCase {
     /// added there without being added to `WorkspaceItems` fails here.
     func testEveryPerSkwodKeychainItemIsOnTheWipeList() {
         for prefix in [KeyAccess.cacheKeyPrefix, KeyAccess.mutesPrefix, KeyAccess.skwodMutePrefix,
-                       KeyAccess.notifNamesPrefix, KeyAccess.notifSendersPrefix, KeyAccess.retiredMuteConvsPrefix] {
+                       KeyAccess.notifNamesPrefix, KeyAccess.notifSendersPrefix, KeyAccess.routesPrefix, KeyAccess.retiredMuteConvsPrefix] {
             XCTAssertTrue(WorkspaceItems.keychainPrefixes.contains(prefix), prefix)
         }
         XCTAssertEqual(Set(WorkspaceItems.keychainAccounts("w")),
-                       ["cache-key-w", "mutes-w", "mute-skwod-w", "notif-names-w", "notif-senders-w", "mute-convs-w"])
+                       ["cache-key-w", "mutes-w", "mute-skwod-w", "notif-names-w", "notif-senders-w", "routes-w", "mute-convs-w"])
         // Every Keychain item whose class follows the cache key is kept per skwod, so it is wiped.
         for prefix in [KeyAccess.notifNamesPrefix, KeyAccess.notifSendersPrefix] {
             XCTAssertTrue(KeyAccess.followsCacheKey(prefix + "w"))

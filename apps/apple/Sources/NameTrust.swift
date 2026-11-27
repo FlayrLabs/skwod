@@ -11,7 +11,8 @@ enum ContactTrust {
         case none          // known: shown normally
         case verified      // safety number compared
         case unverified    // server-claimed only; the directory agrees the name is this account's
-        case unconfirmed   // server-claimed, and the directory lookup failed or said otherwise
+        case unconfirmed   // server-claimed, and the directory has not answered (yet)
+        case mismatch      // server-claimed, and the directory said it is another account's, or nobody's
         case impersonation // looks like someone the user knows but is another account — or
                            // holds characters no Skwod name has
     }
@@ -28,7 +29,7 @@ enum ContactTrust {
         /// underline for UNVERIFIED, nothing for a known or verified name).
         var chipWords: String? {
             switch badge {
-            case .unconfirmed: return "unconfirmed"
+            case .unconfirmed, .mismatch: return "unconfirmed"
             case .impersonation: return "look-alike"
             case .none, .verified, .unverified: return nil
             }
@@ -38,7 +39,7 @@ enum ContactTrust {
             switch badge {
             case .none, .verified: return text
             case .unverified: return text.hasPrefix("Unknown contact") ? text : "\(text) (unverified)"
-            case .unconfirmed: return text.hasPrefix("Unknown contact") ? text : "\(text) (unconfirmed)"
+            case .unconfirmed, .mismatch: return text.hasPrefix("Unknown contact") ? text : "\(text) (unconfirmed)"
             case .impersonation: return text
             }
         }
@@ -60,6 +61,34 @@ enum ContactTrust {
         case .messageHeader, .memberRow, .dmRow, .mentionChip, .profileCard: return .badge
         case .notification, .incomingCall, .dialogTitle, .joinConfirmation, .groupConfirmation, .kickBanDialog, .securityNotice, .typing,
              .mentionPicker, .replyPreview, .actionSheet, .approvalRow, .blockReportTarget: return .text
+        }
+    }
+
+    /// How a badge is drawn. In rows (`compact`) an ordinary member — nobody's name is confirmed
+    /// until the user does it — carries a quiet symbol that explains itself; whatever says this may
+    /// NOT be who the name says stays loud everywhere; screens where one decides about people
+    /// (joining a group, a person's card) keep the words.
+    enum Mark: Equatable { case none, shield, symbol(String), words, loud }
+
+    static func mark(_ badge: Badge, compact: Bool) -> Mark {
+        switch badge {
+        case .none: return .none
+        case .verified: return .shield
+        case .unverified: return compact ? .symbol("questionmark.circle") : .words
+        case .unconfirmed: return compact ? .symbol("questionmark.circle.dashed") : .loud
+        case .mismatch, .impersonation: return .loud
+        }
+    }
+
+    /// What a mark means, in a sentence or two (nil: nothing to explain).
+    static func explanation(_ badge: Badge) -> String? {
+        switch badge {
+        case .none: return nil
+        case .verified: return "You compared safety numbers with this person."
+        case .unverified: return "This name comes from the host of this Skwod. To be sure who it is, compare safety numbers."
+        case .unconfirmed: return "This name comes from the host of this Skwod, which has not answered yet whose it is. To be sure who it is, compare safety numbers."
+        case .mismatch: return "Looking this person's name up leads to another account, or to nobody. Don't rely on it."
+        case .impersonation: return "This account's name looks like someone's you know, or has characters no Skwod name has. Don't rely on it."
         }
     }
 
@@ -110,7 +139,7 @@ enum ContactTrust {
         if collides(userId: userId, name: name, book: book, roster: roster) { return Display(text: unknownName(userId), badge: .impersonation) }
         // So does a name no Skwod server issues (other scripts, invisible characters): on its own.
         if WaitingTrust.hasUnusualCharacters(name) { return Display(text: unknownName(userId), badge: .impersonation) }
-        if lookup == false { return Display(text: unknownName(userId), badge: .unconfirmed) }
+        if lookup == false { return Display(text: unknownName(userId), badge: .mismatch) }
         return Display(text: name, badge: lookup == true ? .unverified : .unconfirmed)
     }
 
@@ -162,11 +191,11 @@ enum ContactTrust {
     }
 
     /// May an explicit verification pin this name? Not a flagged one (unconfirmed, look-alike).
-    static func mayPinOnVerify(_ badge: Badge) -> Bool { badge != .unconfirmed && badge != .impersonation }
+    static func mayPinOnVerify(_ badge: Badge) -> Bool { !isFlagged(badge) }
 
     /// A flag that stands in the way of trusting a name: a look-alike / unusual characters, a
     /// directory lookup that led elsewhere, or one that could not be made.
-    static func isFlagged(_ badge: Badge) -> Bool { badge == .impersonation || badge == .unconfirmed }
+    static func isFlagged(_ badge: Badge) -> Bool { badge == .impersonation || badge == .mismatch || badge == .unconfirmed }
 
     /// What OPENING a conversation does to the contact book.
     ///

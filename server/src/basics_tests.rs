@@ -352,6 +352,216 @@ async fn rotating_a_token_keeps_the_sign_in_and_the_push_registration() {
     assert_eq!(send(&app, "GET", "/api/auth/me", Some(&new), None).await.0, StatusCode::OK);
 }
 
+/// Build 51: a rotation whose answer was lost is asked for again — only by whoever holds the key it
+/// was asked with, only within the old token's grace (not extended), only while what it issued is
+/// unused; what was issued and never held is gone.
+#[tokio::test]
+async fn a_lost_rotation_can_be_asked_for_again_with_its_key_only() {
+    let state = test_state().await;
+    let app = crate::api::router(state.clone());
+    let (_, old) = signup(&app, "rotator").await;
+    let rotate = |token: String, key: Option<String>| {
+        let app = app.clone();
+        async move {
+            let mut req = Request::builder().method("POST").uri("/api/auth/rotate").header("authorization", format!("Bearer {token}"));
+            if let Some(k) = key { req = req.header(crate::auth::ROTATION_KEY_HEADER, k); }
+            let res = app.clone().oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
+            let status = res.status();
+            let body = res.into_body().collect().await.unwrap().to_bytes();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            (status, v["token"].as_str().map(str::to_string))
+        }
+    };
+    let me = |t: &str| { let (app, t) = (app.clone(), t.to_string()); async move { send(&app, "GET", "/api/auth/me", Some(&t), None).await.0 } };
+    let key = "k".repeat(64);
+    let (st, lost) = rotate(old.clone(), Some(key.clone())).await;
+    assert_eq!(st, StatusCode::OK);
+    let lost = lost.unwrap();
+    let grace = expiry(&state, &old).await.unwrap();
+
+    // A thief with the old token only: as before, nothing. (And a wrong key is no key.)
+    assert_eq!(rotate(old.clone(), None).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(rotate(old.clone(), Some("x".repeat(64))).await.0, StatusCode::UNAUTHORIZED);
+
+    // The client, with its key: a fresh token; the one it never received is gone; no more grace.
+    let (st, fresh) = rotate(old.clone(), Some(key.clone())).await;
+    assert_eq!(st, StatusCode::OK);
+    let fresh = fresh.unwrap();
+    assert_eq!(me(&lost).await, StatusCode::UNAUTHORIZED, "never held: gone");
+    assert_eq!(expiry(&state, &old).await.unwrap(), grace, "the old token's grace is not extended");
+    let live: i64 = sqlx::query_scalar("SELECT count(*) FROM sessions WHERE superseded = 0").fetch_one(&state.db).await.unwrap();
+    assert_eq!(live, 1, "one live token for the sign-in");
+
+    // Used: final. Even with the key the old token rotates no more, and the new one keeps working.
+    assert_eq!(me(&fresh).await, StatusCode::OK);
+    assert_eq!(rotate(old.clone(), Some(key.clone())).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(me(&fresh).await, StatusCode::OK);
+
+    // After the grace: nothing, with or without the key.
+    let (st, next) = rotate(fresh.clone(), Some("n".repeat(64))).await;
+    assert_eq!(st, StatusCode::OK);
+    sqlx::query("UPDATE sessions SET expires_at = $1 WHERE token_hash = $2").bind(now_ms() - 1).bind(crate::auth::token_hash(&fresh)).execute(&state.db).await.unwrap();
+    assert_eq!(rotate(fresh, Some("n".repeat(64))).await.0, StatusCode::UNAUTHORIZED);
+    assert_eq!(me(&next.unwrap()).await, StatusCode::OK);
+}
+
+/// …and a push registration follows through a repeated rotation, never cascaded away.
+#[tokio::test]
+async fn a_repeated_rotation_keeps_the_push_registration() {
+    let state = test_state().await;
+    let app = crate::api::router(state.clone());
+    let (user, old) = signup(&app, "pusher").await;
+    let reg = json!({ "provider": "gateway", "gateway": "https://push.example.org", "apns_token": "ab".repeat(32), "voip_token": null, "topic": "io.skwod.app" });
+    assert_eq!(send(&app, "POST", "/api/push/register", Some(&old), Some(reg)).await.0, StatusCode::OK);
+    sqlx::query("UPDATE sessions SET superseded = 1, rotation_key = $1, successor_hash = $2, expires_at = $3 WHERE token_hash = $4")
+        .bind(crate::auth::token_hash(&"k".repeat(64))).bind(crate::auth::token_hash("lost")).bind(now_ms() + 60_000).bind(crate::auth::token_hash(&old)).execute(&state.db).await.unwrap();
+    sqlx::query("INSERT INTO sessions (id, user_id, token_hash, created_at, expires_at, last_used_at, origin_at) VALUES ('lost', $1, $2, $3, $4, $3, $3)")
+        .bind(&user).bind(crate::auth::token_hash("lost")).bind(now_ms()).bind(now_ms() + 1_000_000).execute(&state.db).await.unwrap();
+    sqlx::query("UPDATE push_registrations SET session_hash = $1").bind(crate::auth::token_hash("lost")).execute(&state.db).await.unwrap();
+    let before: i64 = sqlx::query_scalar("SELECT count(*) FROM push_registrations").fetch_one(&state.db).await.unwrap();
+    let req = Request::builder().method("POST").uri("/api/auth/rotate").header("authorization", format!("Bearer {old}"))
+        .header(crate::auth::ROTATION_KEY_HEADER, "k".repeat(64)).body(Body::empty()).unwrap();
+    assert_eq!(app.clone().oneshot(req).await.unwrap().status(), StatusCode::OK);
+    let after: i64 = sqlx::query_scalar("SELECT count(*) FROM push_registrations").fetch_one(&state.db).await.unwrap();
+    assert_eq!((before, after), (1, 1));
+}
+
+/// Any number of rotations of one token at the same moment: one goes on, and what is recorded (key
+/// and successor) is that one's. Repeated with the key: still one live token, the recorded one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn racing_rotations_issue_one_token() {
+    let state = crate::tests::test_state_concurrent().await;
+    let app = crate::api::router(state.clone());
+    let race = |token: String, keys: Vec<String>| {
+        let app = app.clone();
+        async move {
+            let gate = std::sync::Arc::new(tokio::sync::Barrier::new(keys.len()));
+            let asked: Vec<_> = keys.into_iter().map(|key| {
+                let (app, token, gate) = (app.clone(), token.clone(), gate.clone());
+                tokio::spawn(async move {
+                    gate.wait().await;
+                    let req = Request::builder().method("POST").uri("/api/auth/rotate").header("authorization", format!("Bearer {token}"))
+                        .header(crate::auth::ROTATION_KEY_HEADER, &key).body(Body::empty()).unwrap();
+                    let res = app.oneshot(req).await.unwrap();
+                    let status = res.status();
+                    let body = res.into_body().collect().await.unwrap().to_bytes();
+                    let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                    (status, key, v["token"].as_str().map(str::to_string))
+                })
+            }).collect();
+            let mut out = Vec::new();
+            for a in asked { out.push(a.await.unwrap()); }
+            out
+        }
+    };
+    for round in 0..6 {
+        let (user, old) = signup(&app, &format!("racer{round}")).await;
+        // Different askers, each with a key of its own.
+        let got = race(old.clone(), (0..6).map(|i| format!("{i}").repeat(64)).collect()).await;
+        let won: Vec<_> = got.iter().filter(|g| g.0 == StatusCode::OK).collect();
+        assert_eq!(won.len(), 1, "{:?}", got.iter().map(|g| g.0).collect::<Vec<_>>());
+        assert!(got.iter().all(|g| g.0 == StatusCode::OK || g.0 == StatusCode::UNAUTHORIZED), "{:?}", got.iter().map(|g| g.0).collect::<Vec<_>>());
+        let recorded = || async {
+            let r: (Option<Vec<u8>>, Option<Vec<u8>>) = sqlx::query_as("SELECT rotation_key, successor_hash FROM sessions WHERE token_hash = $1").bind(crate::auth::token_hash(&old)).fetch_one(&state.db).await.unwrap();
+            let live: Vec<Vec<u8>> = sqlx::query_scalar("SELECT token_hash FROM sessions WHERE user_id = $1 AND superseded = 0").bind(&user).fetch_all(&state.db).await.unwrap();
+            (r.0.unwrap(), r.1.unwrap(), live)
+        };
+        let (key, successor, live) = recorded().await;
+        assert_eq!(key, crate::auth::token_hash(&won[0].1), "the winner's key");
+        assert_eq!(successor, crate::auth::token_hash(won[0].2.as_ref().unwrap()), "the winner's successor");
+        assert_eq!(live, vec![successor]);
+        // The answer was lost, and it is asked for again — several times at once, with the key.
+        let again = race(old.clone(), vec![won[0].1.clone(); 5]).await;
+        assert!(again.iter().any(|g| g.0 == StatusCode::OK), "{:?}", again.iter().map(|g| g.0).collect::<Vec<_>>());
+        let (key, successor, live) = recorded().await;
+        assert_eq!(key, crate::auth::token_hash(&won[0].1));
+        assert_eq!(live, vec![successor], "one live token, the recorded one");
+        assert!(again.iter().any(|g| g.2.as_ref().is_some_and(|t| crate::auth::token_hash(t) == live[0])), "and it was answered to somebody");
+    }
+}
+
+/// The unheld successor is itself rotated while the old token's key asks again: one of the two
+/// goes on, the other is refused and harms nothing — one live session, the winner's. (A rotation
+/// marks what it rotates superseded, never used.)
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_repeated_rotation_racing_the_successors_own_leaves_one_session() {
+    let state = crate::tests::test_state_concurrent().await;
+    let app = crate::api::router(state.clone());
+    let rotate = |token: String, key: String| {
+        let app = app.clone();
+        tokio::spawn(async move {
+            let req = Request::builder().method("POST").uri("/api/auth/rotate").header("authorization", format!("Bearer {token}"))
+                .header(crate::auth::ROTATION_KEY_HEADER, key).body(Body::empty()).unwrap();
+            let res = app.oneshot(req).await.unwrap();
+            let status = res.status();
+            let body = res.into_body().collect().await.unwrap().to_bytes();
+            let v: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+            (status, v["token"].as_str().map(str::to_string))
+        })
+    };
+    let postgres = std::env::var_os("SKWOD_TEST_POSTGRES").is_some();
+    let (mut retries_won, mut successors_won) = (0, 0);
+    for round in 0..16 {
+        let (user, old) = signup(&app, &format!("both{round}")).await;
+        let key = "k".repeat(64);
+        let (st, s) = rotate(old.clone(), key.clone()).await.unwrap();
+        assert_eq!(st, StatusCode::OK);
+        let s = s.unwrap();
+        let other = "n".repeat(64);
+        // On PostgreSQL the order is forced on the first rounds: a row lock holds one of them
+        // between what it read and what it writes.
+        let (retry, own) = if postgres && round < 4 {
+            let held = crate::auth::token_hash(if round % 2 == 0 { &old } else { &s });
+            let mut lock = state.db.begin().await.unwrap();
+            sqlx::query("UPDATE sessions SET last_used_at = last_used_at WHERE token_hash = $1").bind(&held).execute(&mut *lock).await.unwrap();
+            let waiting = |n: i64| {
+                let db = state.db.clone();
+                async move {
+                    for _ in 0..200 {
+                        let w: i64 = sqlx::query_scalar("SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'").fetch_one(&db).await.unwrap();
+                        if w >= n { return; }
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    panic!("nobody waits for the lock");
+                }
+            };
+            let retry = rotate(old.clone(), key.clone());
+            waiting(1).await;
+            let own = if round % 2 == 0 {
+                // The retry has read the successor as unused; the successor is rotated; it goes on.
+                let own = rotate(s.clone(), other.clone()).await.unwrap();
+                lock.rollback().await.unwrap();
+                own
+            } else {
+                // Both wait for the successor's row, the retry first.
+                let own = rotate(s.clone(), other.clone());
+                waiting(2).await;
+                lock.rollback().await.unwrap();
+                own.await.unwrap()
+            };
+            (retry.await.unwrap(), own)
+        } else {
+            let (a, b) = if round % 2 == 0 {
+                let a = rotate(old.clone(), key.clone());
+                (a, rotate(s.clone(), other.clone()))
+            } else {
+                let b = rotate(s.clone(), other.clone());
+                (rotate(old.clone(), key.clone()), b)
+            };
+            (a.await.unwrap(), b.await.unwrap())
+        };
+        let live: Vec<Vec<u8>> = sqlx::query_scalar("SELECT token_hash FROM sessions WHERE user_id = $1 AND superseded = 0").bind(&user).fetch_all(&state.db).await.unwrap();
+        assert_eq!(live.len(), 1, "round {round}: {retry:?} {own:?}");
+        let (won, lost) = if retry.0 == StatusCode::OK { retries_won += 1; (&retry, &own) } else { successors_won += 1; (&own, &retry) };
+        assert_eq!((won.0, lost.0), (StatusCode::OK, StatusCode::UNAUTHORIZED), "round {round}");
+        let token = won.1.clone().unwrap();
+        assert_eq!(live[0], crate::auth::token_hash(&token), "the winner's");
+        assert_eq!(send(&app, "GET", "/api/auth/me", Some(&token), None).await.0, StatusCode::OK);
+    }
+    eprintln!("retry won {retries_won}, the successor's own rotation {successors_won}");
+    if postgres { assert!(retries_won > 0 && successors_won > 0, "both orders were seen: {retries_won} {successors_won}"); }
+}
+
 #[tokio::test]
 async fn usernames_are_plain_ascii_only() {
     let state = test_state().await;

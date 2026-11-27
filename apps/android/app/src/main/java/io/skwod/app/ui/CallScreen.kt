@@ -48,8 +48,10 @@ import io.livekit.android.util.flow
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 
 /** What the call screen learned, for the DEBUG end-to-end hooks (never shown, never logged). */
 object CallDebug {
@@ -92,6 +94,11 @@ fun VoiceCallScreen(serverId: String, onClose: () -> Unit) {
         roomState.value?.let { r -> r.disconnect(); r.release() }
         roomState.value = null
         CallState.active.value = false
+        CallState.workspace = null
+        // The call kept the app in-band: ended while in the background, the background steps run now.
+        if (!model.appForeground) P2PManager.suspendAll()
+        // A re-key the call delayed is done now.
+        else model.retryConnection()
         CallState.speaking.value = "" to emptySet()
         CallDebug.phase = "idle"; CallDebug.cameraOn = false; CallDebug.remoteParticipants = 0
         CallService.stop(ctx)
@@ -134,18 +141,45 @@ fun VoiceCallScreen(serverId: String, onClose: () -> Unit) {
             // constructor calls into it); LiveKit.create alone would be too late.
             LiveKit.init(ctx.applicationContext)
             val keyProvider = BaseKeyProvider(enableSharedKey = false)
-            val tok = withContext(Dispatchers.IO) { client.voiceToken(chanId) }
-            val url = tok.url
-            if (url.isNullOrEmpty()) { errorText = "Calls aren't set up on this Skwod."; phase = "failed"; return@LaunchedEffect }
-            phase = "connecting"; CallDebug.phase = "connecting"
-            // The keyring is still empty here, which is itself fail-closed: nothing can be decrypted
-            // or published until keys are registered below.
-            val room = LiveKit.create(
-                appContext = ctx.applicationContext,
-                options = RoomOptions(e2eeOptions = E2EEOptions(keyProvider = keyProvider)),
-            )
-            roomState.value = room
-            withContext(Dispatchers.IO) { room.connect(url, tok.token) }
+            // Nothing has been joined until the room is connected, so a host that was not reached, or
+            // whose call server is still starting, is tried once more with a fresh token.
+            var retried = false
+            var joined: Room? = null
+            while (joined == null) {
+                val before = voiceCounters(client)
+                val failure = try {
+                    val tok = withContext(Dispatchers.IO) { client.voiceToken(chanId) }
+                    val url = tok.url
+                    if (url.isNullOrEmpty()) { errorText = "Calls aren't set up on this Skwod."; phase = "failed"; return@LaunchedEffect }
+                    phase = "connecting"; CallDebug.phase = "connecting"
+                    // The keyring is still empty here, which is itself fail-closed: nothing can be
+                    // decrypted or published until keys are registered below.
+                    val room = LiveKit.create(
+                        appContext = ctx.applicationContext,
+                        options = RoomOptions(e2eeOptions = E2EEOptions(keyProvider = keyProvider)),
+                    )
+                    roomState.value = room
+                    // `connect` covers signaling only; the room is CONNECTED once the media path is up.
+                    val signaled = try { withContext(Dispatchers.IO) { room.connect(url, tok.token) }; true }
+                        catch (c: CancellationException) { throw c }
+                        catch (_: Exception) { false }
+                    when {
+                        !signaled -> VoiceFailure.UNREACHABLE
+                        mediaUp(room) -> { joined = room; null }
+                        VoiceFailure.media(before, voiceCounters(client)) == VoiceFailure.MEDIA_BLOCKED -> VoiceFailure.MEDIA_BLOCKED
+                        else -> VoiceFailure.MEDIA_SILENT
+                    }
+                } catch (e: uniffi.skwod_core.CoreException.Voice) {
+                    VoiceFailure.of(e.code)
+                }
+                if (joined != null) break
+                roomState.value?.let { r -> roomState.value = null; r.disconnect(); r.release() }
+                val why = failure ?: VoiceFailure.OTHER
+                if (!why.retriesOnce || retried) { errorText = why.message; phase = "failed"; return@LaunchedEffect }
+                retried = true
+                delay(if (why == VoiceFailure.STARTING) 4000 else 1500)
+            }
+            val room = joined ?: return@LaunchedEffect
             // Per-call keys: each device generates a RANDOM media key for this room session and sends
             // it — over sealed libsignal sessions only — to the people in the call (LiveKit identity
             // == user id). When one of them drops out of the participant list the core hands back a
@@ -180,6 +214,7 @@ fun VoiceCallScreen(serverId: String, onClose: () -> Unit) {
             if (registerAll() == 0) { errorText = "Couldn't set up this call's keys."; phase = "failed"; return@LaunchedEffect }
             // The call outlives the app being in front: a foreground service (phoneCall +
             // microphone/camera) keeps capture alive when the user switches apps.
+            CallState.workspace = model.current?.id
             CallState.active.value = true
             CallService.start(ctx)
             room.localParticipant.setMicrophoneEnabled(true)
@@ -200,8 +235,9 @@ fun VoiceCallScreen(serverId: String, onClose: () -> Unit) {
             errorText = "This call's encryption keys couldn't be updated after someone left, so the call was ended."; phase = "failed"
         } catch (e: uniffi.skwod_core.CoreException.UpdateRequired) {
             errorText = "Update required: this Skwod and this app use different encryption versions."; phase = "failed"
-        } catch (_: Exception) {
-            errorText = "Couldn't join the call. Check your connection and try again."; phase = "failed"
+        } catch (e: Exception) {
+            // Fixed sentences only: the underlying error can carry an address.
+            errorText = voiceFailureOf(e).message; phase = "failed"
         } catch (_: LinkageError) {
             // The media engine failed to load on this device: fail the call, never the app.
             errorText = "Calls aren't supported on this device."; phase = "failed"
@@ -240,6 +276,68 @@ fun VoiceCallScreen(serverId: String, onClose: () -> Unit) {
             }
         }
     }
+}
+
+/** A failed voice request of the core. */
+internal fun voiceFailureOf(e: Throwable): VoiceFailure =
+    if (e is uniffi.skwod_core.CoreException.Voice) VoiceFailure.of(e.code) else VoiceFailure.OTHER
+
+private fun voiceCounters(client: uniffi.skwod_core.SkwodClient): VoiceFailure.Counters? =
+    client.voiceTunnel()?.let { VoiceFailure.Counters(it.accepted.toLong(), it.packetsUp.toLong(), it.packetsDown.toLong(), it.undelivered.toLong()) }
+
+/** Wait for the media path. The SDK's `connect` returns before it; without this a blocked path
+ *  looked like a connected call with no sound. */
+private suspend fun mediaUp(room: Room): Boolean =
+    withTimeoutOrNull(15_000) { room::state.flow.first { it != Room.State.CONNECTING && it != Room.State.RECONNECTING } } == Room.State.CONNECTED
+
+/** Skwod settings, host only: the call server saved for this skwod, if one is, and the way back to
+ *  its own. Shown only while one is saved; the server takes it from the owner's device alone (signed). */
+@Composable
+fun VoiceServerCard() {
+    val model = AppModel.get(LocalContext.current)
+    val scope = rememberCoroutineScope()
+    var config by remember { mutableStateOf<uniffi.skwod_core.VoiceConfig?>(null) }
+    var confirm by remember { mutableStateOf(false) }
+    var busy by remember { mutableStateOf(false) }
+    var note by remember { mutableStateOf("") }
+    var tick by remember { mutableIntStateOf(0) }
+    LaunchedEffect(tick) {
+        config = try { withContext(Dispatchers.IO) { model.client?.voiceConfig() } }
+            catch (c: CancellationException) { throw c } catch (_: Exception) { null }
+    }
+    val cfg = config?.takeIf { it.external }
+    if (cfg != null) {
+        val host = cfg.url?.let { runCatching { java.net.URI(it).host }.getOrNull() } ?: "another server"
+        Surface(color = GlassCardTone, shape = RoundedCornerShape(16.dp), modifier = Modifier.fillMaxWidth()) {
+            Column(Modifier.padding(16.dp)) {
+                Text("Voice & video", color = Color.White, fontWeight = FontWeight.SemiBold)
+                Text("Calls use a call server saved here: $host.", color = Color.White.copy(alpha = 0.5f), style = MaterialTheme.typography.labelSmall)
+                TextButton(enabled = !busy, onClick = { confirm = true }) {
+                    Text(if (cfg.bundled) "Use this Skwod's own call server" else "Remove it", color = Color(0xFFF87171))
+                }
+            }
+        }
+        Spacer(Modifier.height(14.dp))
+    }
+    if (note.isNotEmpty()) Text(note, color = Color.White.copy(alpha = 0.6f), style = MaterialTheme.typography.labelSmall)
+    if (confirm && cfg != null) AlertDialog(
+        onDismissRequest = { confirm = false },
+        title = { Text(if (cfg.bundled) "Use this Skwod's own call server?" else "Remove the saved call server?") },
+        text = { Text("The saved address, key and secret are removed. Calls in progress end." + if (cfg.bundled) "" else " Voice is off until a call server is set up again.") },
+        confirmButton = {
+            TextButton(onClick = {
+                confirm = false; busy = true
+                scope.launch {
+                    note = try {
+                        withContext(Dispatchers.IO) { model.client?.clearVoiceConfig() }
+                        if (cfg.bundled) "Done. Voice is starting." else "Removed."
+                    } catch (c: CancellationException) { throw c } catch (_: Exception) { "Couldn't remove it. Check your connection and try again." }
+                    busy = false; tick++
+                }
+            }) { Text(if (cfg.bundled) "Use its own" else "Remove", color = Color(0xFFF87171)) }
+        },
+        dismissButton = { TextButton(onClick = { confirm = false }) { Text("Cancel") } },
+    )
 }
 
 /** The connected call: participant tiles (video when published), then the controls. */

@@ -386,14 +386,19 @@ extension AppState {
     // MARK: After a restore or a link
 
     /// This install just became a working device (linked, restored, or reset): take its state,
-    /// start syncing, and rebuild the sidebar from what came back.
+    /// start syncing, and rebuild the sidebar from what came back. (The sheet this is called from
+    /// goes away in the middle of it: `OutlivingWork`.)
     func deviceBecameActive() async {
+        await OutlivingWork.run { await self.takeUpDevice() }
+    }
+
+    private func takeUpDevice() async {
         await routeDeviceState()
         guard deviceId != nil else { return }
         resetPending = nil
         pinPrompt = nil
         if let w = current { await activate(w) }
-        await chatModel?.recoverMemberships()
+        chatModel?.recoverMemberships()
         await chatModel?.refreshDMList()
     }
 
@@ -402,7 +407,8 @@ extension AppState {
     func setUpAgain() async {
         // Signed out as well (a removal ends the session): log in first; binding then asks the
         // server and comes back here.
-        guard let client, session != nil else { stopped = nil; return }
+        guard let asked = bound, let workspace = current, asked.workspaceId == workspace.id, session != nil else { stopped = nil; return }
+        let client = asked.client
         // Only what the CORE has confirmed makes this install forget its registration.
         switch await client.deviceState() {
         case .superseded:
@@ -411,7 +417,9 @@ extension AppState {
             // and log in again; the new session sets this install up as a new device.
             await client.forgetRegistration()
             stopped = nil
-            if let w = current { await handleSignedOut(w) }
+            // (That install's workspace, if it is still the one bound.)
+            guard bound?.client === client, bound?.turn == asked.turn, current?.id == workspace.id else { return }
+            await handleSignedOut(workspace)
         case .removed:
             await client.forgetRegistration()
             stopped = nil

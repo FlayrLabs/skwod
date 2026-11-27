@@ -6,23 +6,18 @@ import AppKit
 #if os(iOS)
 import UIKit
 
-/// A few seconds of guaranteed run time while leaving the foreground, so the frame that tells
-/// the server "push me from now on" is really sent before the process is suspended.
-@MainActor
-final class BackgroundGrace {
-    private var id: UIBackgroundTaskIdentifier = .invalid
-
-    init(_ name: String) {
-        id = UIApplication.shared.beginBackgroundTask(withName: name) { [weak self] in
-            Task { @MainActor in self?.end() }
-        }
-    }
-
-    func end() {
-        guard id != .invalid else { return }
-        UIApplication.shared.endBackgroundTask(id)
-        id = .invalid
-    }
+extension BackgroundTime {
+    /// UIKit's background tasks: for every hold the app takes (`BackgroundHold`, `StoreLifecycle`).
+    static let uikit = BackgroundTime(
+        begin: { name, expired in
+            // (UIKit calls it on the main thread, and expects the task ended when it returns.)
+            let id = UIApplication.shared.beginBackgroundTask(withName: name) { MainActor.assumeIsolated { expired() } }
+            return id == .invalid ? nil : id.rawValue
+        },
+        end: { UIApplication.shared.endBackgroundTask(UIBackgroundTaskIdentifier(rawValue: $0)) },
+        after: { seconds, fire in
+            DispatchQueue.main.asyncAfter(deadline: .now() + seconds) { MainActor.assumeIsolated { fire() } }
+        })
 }
 #endif
 
@@ -48,14 +43,8 @@ final class BackgroundGrace {
 ///   push-wakes an install that has no live socket.
 @MainActor
 final class Realtime: NSObject, ObservableObject {
-    /// userId → (status, learnedAt). Merged over polled member lists for instant flips; entries
-    /// older than the server's 3-minute stale window are ignored at read time.
-    @Published var presence: [String: PresenceSeen] = [:]
-
-    struct PresenceSeen {
-        let status: String
-        let at: Date
-    }
+    /// Who is online, from live events and polled member lists: the newest word wins (`PresenceBook`).
+    @Published private(set) var presence = PresenceBook()
 
     /// channelId/conversationId → display name, for notification titles (set by ChatModel).
     var chatNames: [String: String] = [:]
@@ -76,7 +65,9 @@ final class Realtime: NSObject, ObservableObject {
     private var baseUrl = ""
     private var token = ""
     private var myUserId = ""
-    private var myStatus = "online"
+    /// The status this device announces; nil while the app is away (`PresenceAnnounce`).
+    private var announced: String? = "online"
+    private var announcedAt: TimeInterval?
     private var closedByUs = true
     private var reconnectDelay: TimeInterval = 1
     private var pingTask: Task<Void, Never>?
@@ -86,12 +77,15 @@ final class Realtime: NSObject, ObservableObject {
     private var pushActive = true
     /// Whether the socket in `task` has delivered a frame yet (the server answers our first
     /// frames at once) — the moment it does, the connection is up and `onConnected` fires.
-    private var live = false
+    private var live = false {
+        // (What is shown about others depends on it: `PresenceRoster`.)
+        didSet { if live != oldValue { presence = presence } }
+    }
     /// Every event except `presence`: (topic, event name, payload).
     var onEvent: ((String, String, [String: Any]) -> Void)?
     /// People this account blocked (`BlockList`): their presence is not tracked or shown.
     var blockedIds: Set<String> = [] {
-        didSet { for id in blockedIds where presence[id] != nil { presence[id] = nil } }
+        didSet { for id in blockedIds where presence.seen[id] != nil { presence.forget(id) } }
     }
     /// A socket came up (first connect and every reconnect): whatever was posted while there was
     /// none produced no event, so the app catches up now.
@@ -106,30 +100,18 @@ final class Realtime: NSObject, ObservableObject {
     /// Whether a socket is open and has spoken.
     var isLive: Bool { task != nil && live }
 
-    /// The freshest status for a member: a live event within the stale window wins over the poll.
-    func liveStatus(userId: String, polled: String) -> String {
-        if let seen = presence[userId], Date().timeIntervalSince(seen.at) < 180 { return seen.status }
-        return polled
+    /// The status to list someone under (online / offline sections), and the one their dot shows:
+    /// "unknown" while this device cannot tell.
+    func status(userId: String) -> String { presence.view(userId, now: PresenceClock.now).status }
+    func dot(userId: String) -> String { PresenceRoster.dot(presence.view(userId, now: PresenceClock.now).dot, live: isLive) }
+
+    /// A member list that was asked for at `askedAt` (`PresenceClock`).
+    func seedPresence(_ statuses: [String: String], askedAt: TimeInterval) {
+        presence.polled(statuses.filter { !blockedIds.contains($0.key) }, askedAt: askedAt)
     }
 
-    /// Status for a user with no accompanying poll (DM rows, people strip): the freshest known
-    /// entry (live event or seeded poll), staled to offline after the server's 3-minute window.
-    func status(userId: String) -> String {
-        guard let seen = presence[userId] else { return "offline" }
-        return Date().timeIntervalSince(seen.at) < 180 ? seen.status : "offline"
-    }
-
-    /// Merge a polled member-list snapshot into the store. A poll never clobbers a live event that
-    /// arrived moments ago (the socket is fresher than any poll cycle).
-    func seedPresence(_ statuses: [String: String]) {
-        var merged = presence
-        let now = Date()
-        for (uid, status) in statuses {
-            if let existing = merged[uid], now.timeIntervalSince(existing.at) < 5 { continue }
-            merged[uid] = PresenceSeen(status: status, at: now)
-        }
-        presence = merged
-    }
+    /// A poll brought nothing: what is shown may have become "unknown" — look again.
+    func presenceUnheard() { presence = presence }
 
     /// Server ids parsed from the subscribed topics — the app-level poll walks these.
     var subscribedServerIds: Set<String> {
@@ -137,12 +119,13 @@ final class Realtime: NSObject, ObservableObject {
     }
 
     /// (Re)bind to a workspace and connect. Safe to call repeatedly (workspace switches).
-    func configure(baseUrl: String, token: String, userId: String, status: String) {
+    func configure(baseUrl: String, token: String, userId: String, status: String?) {
+        // (Another account's people are not this one's.)
+        if myUserId != userId { presence = PresenceBook() }
         self.baseUrl = baseUrl
         self.token = token
         self.myUserId = userId
-        self.myStatus = status
-        presence = [:]
+        announced = status
         closedByUs = false
         suspended = false
         reconnectDelay = 1
@@ -162,8 +145,11 @@ final class Realtime: NSObject, ObservableObject {
     }
 
     /// Push a status change through the socket (instant fan-out to everyone subscribed).
-    func sendPresence(_ status: String) {
-        myStatus = status
+    /// Nil: away — nothing is said, and nothing is repeated.
+    func sendPresence(_ status: String?) {
+        announced = status
+        guard let status else { return }
+        announcedAt = PresenceClock.now
         send(["type": "presence", "status": status])
     }
 
@@ -177,7 +163,7 @@ final class Realtime: NSObject, ObservableObject {
         guard pushActive != active else { return }
         pushActive = active
         guard let t = task, let frame = Realtime.pushFrame(active: active) else { return }
-        let grace = BackgroundGrace("skwod.push-state")
+        let grace = BackgroundHold("skwod.push-state", system: .uikit)
         t.send(.string(frame)) { _ in
             Task { @MainActor in
                 // Over p2p "sent" means "handed to the in-process proxy": a beat for it to
@@ -203,9 +189,11 @@ final class Realtime: NSObject, ObservableObject {
         openSocket()
     }
 
-    /// The app is going to the background (iOS): say "offline" — which also makes this install
-    /// push-wakeable at once — and close the socket rather than let the system kill it silently
-    /// a little later. The binding (address, topics) is kept; `reconnectNow` brings it back.
+    /// The app is going to the background (iOS): say so — which makes this install push-wakeable at
+    /// once — and close the socket rather than let the system kill it silently a little later.
+    /// (Not `presence: offline`: that is the whole account's, and another device of it may be in
+    /// use. The host takes the account offline with its last socket.) The binding (address, topics)
+    /// is kept; `reconnectNow` brings it back.
     func suspend() {
         guard !closedByUs, !suspended else { return }
         suspended = true
@@ -214,13 +202,12 @@ final class Realtime: NSObject, ObservableObject {
         task = nil
         live = false
         subscribed = []
-        let frame = (try? JSONSerialization.data(withJSONObject: ["type": "presence", "status": "offline"]))
-            .flatMap { String(data: $0, encoding: .utf8) } ?? ""
-        // Close only once the frame is on the wire, so the server sees "offline" first — and
+        let frame = Realtime.pushFrame(active: false) ?? ""
+        // Close only once the frame is on the wire, so the server sees it first — and
         // hold the process awake until it is: without a background task the app could be
         // suspended with the frame still queued, leaving a socket the server took for live.
         #if os(iOS)
-        let grace = BackgroundGrace("skwod.goodbye")
+        let grace = BackgroundHold("skwod.goodbye", system: .uikit)
         t.send(.string(frame)) { _ in
             Task { @MainActor in
                 // Over p2p "sent" means "handed to the in-process proxy": a beat for it to
@@ -236,7 +223,8 @@ final class Realtime: NSObject, ObservableObject {
         #endif
     }
 
-    func disconnect() {
+    /// `keepingPresence`: the same skwod, out of reach for now — what was last seen stays.
+    func disconnect(keepingPresence: Bool = false) {
         closedByUs = true
         suspended = false
         live = false
@@ -244,7 +232,7 @@ final class Realtime: NSObject, ObservableObject {
         task?.cancel(with: .goingAway, reason: nil)
         task = nil
         subscribed = []
-        presence = [:]
+        if !keepingPresence { presence = PresenceBook() }
     }
 
     // MARK: - Socket lifecycle
@@ -254,7 +242,8 @@ final class Realtime: NSObject, ObservableObject {
         task = nil
         live = false
         subscribed = []
-        guard !suspended, !baseUrl.isEmpty, var comps = URLComponents(string: baseUrl) else { return }
+        // (`RawSink`: never to a retired or SUSPECT front.)
+        guard !suspended, RawSink.allows(baseUrl), var comps = URLComponents(string: baseUrl) else { return }
         comps.scheme = (comps.scheme == "http") ? "ws" : "wss"
         comps.path = (comps.path.hasSuffix("/") ? String(comps.path.dropLast()) : comps.path) + "/api/ws"
         guard let url = comps.url else { return }
@@ -267,7 +256,7 @@ final class Realtime: NSObject, ObservableObject {
         t.resume()
         receiveLoop(on: t)
         // Announce presence + subscribe as the first frames; the server answers subscribed/error.
-        send(["type": "presence", "status": myStatus])
+        sendPresence(announced)
         // Where the app is, on every socket: the server then goes by this alone (not by
         // presence — "offline" is also what a backgrounded call says, and it stays in-band).
         #if os(iOS)
@@ -280,9 +269,15 @@ final class Realtime: NSObject, ObservableObject {
     private func startPing() {
         pingTask?.cancel()
         pingTask = Task { [weak self] in
+            var tick = 0
             while !Task.isCancelled {
                 try? await Task.sleep(for: .seconds(30))
-                await self?.send(["type": "ping"])
+                guard !Task.isCancelled, let self else { return }
+                self.send(["type": "ping"])
+                // The minute's heartbeat, here and not in the sync loop, where one slow pass
+                // could outlast the host's 3-minute window and show a person in use offline.
+                tick += 1
+                if tick % 2 == 0, let status = self.announced, status != "offline" { self.sendPresence(status) }
             }
         }
     }
@@ -356,7 +351,11 @@ final class Realtime: NSObject, ObservableObject {
         switch event {
         case "presence":
             if let uid = payload["user_id"] as? String, let status = payload["status"] as? String, !blockedIds.contains(uid) {
-                presence[uid] = PresenceSeen(status: status, at: Date())
+                let now = PresenceClock.now
+                presence.event(uid, status, at: now)
+                if PresenceAnnounce.corrects(eventUser: uid, status: status, me: myUserId, announced: announced, lastSentAt: announcedAt, now: now) {
+                    sendPresence(announced)
+                }
             }
         case "typing":
             // Only ever shown in the open conversation (`TypingState`); never a notification.

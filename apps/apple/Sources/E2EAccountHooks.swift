@@ -61,7 +61,7 @@ extension E2E {
                     pending += text.split(whereSeparator: \.isNewline).map { $0.trimmingCharacters(in: .whitespaces) }
                 }
                 // Commands wait until the app has finished restoring (and, for most, has a client).
-                if !app.restoring {
+                if !app.restoring, !app.isConnecting {
                     for command in pending where !command.isEmpty { await account(command, app: app) }
                     pending = []
                 }

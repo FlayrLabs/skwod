@@ -16,6 +16,7 @@ final class ContactBook: ObservableObject {
     /// "user id|name" → whether the directory lookup of that name led to that account.
     @Published private(set) var lookups: [String: Bool] = [:]
     private var lookingUp: Set<String> = []
+    private var askedAt: [String: Date] = [:]
     private weak var app: AppState?
     private var loadedFor: String?
     /// The last write of the book did not go through.
@@ -83,7 +84,7 @@ final class ContactBook: ObservableObject {
         return out
     }
 
-    func reset() { saving = nil; entries = [:]; loadedFor = nil; unsaved = false; roster = [:]; rosterByServer = [:]; lookups = [:]; lookingUp = [] }
+    func reset() { saving = nil; entries = [:]; loadedFor = nil; unsaved = false; roster = [:]; rosterByServer = [:]; lookups = [:]; lookingUp = []; askedAt = [:] }
 
     /// Replace one server's accepted members.
     func setRoster(serverId: String, members: [String: String]) {
@@ -92,13 +93,16 @@ final class ContactBook: ObservableObject {
         roster = rosterByServer.values.reduce(into: [:]) { $0.merge($1) { first, _ in first } }
     }
 
-    /// Cross-check a server-claimed name with the directory (once per name per launch): does
-    /// looking it up lead to exactly this account? The answer only decides between the quiet
-    /// "unverified" marker and a flag — it never makes a name trusted.
-    func check(_ userId: String, name: String) async {
+    /// Cross-check a server-claimed name with the directory (until it answers, at most once a
+    /// minute; `again`: the user asked): does looking it up lead to exactly this account? The
+    /// answer only decides between the quiet "unverified" marker and a flag — it never makes a
+    /// name trusted.
+    func check(_ userId: String, name: String, again: Bool = false) async {
         let key = "\(userId)|\(name)"
-        guard !name.isEmpty, lookups[key] == nil, level(userId) < .known, let bound = app?.bound, lookingUp.insert(key).inserted else { return }
+        guard !name.isEmpty, lookups[key] == nil, level(userId) < .known, let bound = app?.bound,
+              again || askedAt[key].map({ Date().timeIntervalSince($0) >= 55 }) ?? true, lookingUp.insert(key).inserted else { return }
         defer { lookingUp.remove(key) }
+        askedAt[key] = Date()
         // The answer is the directory of the workspace that was ASKED: if the user is in
         // another one when it comes (a server can hold it), it says nothing about this book.
         var answer: Bool?
@@ -107,6 +111,12 @@ final class ContactBook: ObservableObject {
         catch {}   // no answer: stays unconfirmed, asked again next time
         guard app?.bound?.workspaceId == bound.workspaceId, app?.bound?.turn == bound.turn else { return }
         if let answer { lookups[key] = answer }
+    }
+
+    /// `check` for the people now on screen, without making anyone wait for it.
+    func checkSoon(_ people: [(userId: String, name: String)]) {
+        let me = app?.session?.userId
+        Task { for p in people where p.userId != me { await check(p.userId, name: p.name) } }
     }
 
     private func save() {
@@ -221,38 +231,70 @@ final class ContactBook: ObservableObject {
     }
 }
 
-/// The marker beside a name: a shield for a verified contact, a quiet "unverified" for a name
-/// only the server vouches for, a red warning for a look-alike. Nothing for a known contact.
+/// The marker beside a name (`ContactTrust.mark`): a shield for a verified contact, a quiet symbol
+/// (rows) or a word for a name only the server vouches for, a loud warning for a look-alike or a
+/// name that is another account's. Nothing for a known contact.
 struct TrustBadge: View {
     let badge: ContactTrust.Badge
     var compact = false
 
     var body: some View {
-        switch badge {
+        switch ContactTrust.mark(badge, compact: compact) {
         case .none:
             EmptyView()
-        case .verified:
+        case .shield:
             Image(systemName: "checkmark.shield.fill").font(.system(size: compact ? 9 : 11)).foregroundStyle(.green)
                 .accessibilityLabel("Verified")
-        case .unconfirmed:
-            Text("unconfirmed name").font(.system(size: compact ? 8.5 : 9.5, weight: .semibold)).foregroundStyle(.orange)
-                .padding(.horizontal, 4).padding(.vertical, 1)
-                .overlay(Capsule().strokeBorder(.orange.opacity(0.5), lineWidth: 1))
-                .accessibilityLabel("Name could not be confirmed")
-        case .unverified where compact:
-            // Rows (build 49): a small mark, not a word after every name.
-            Image(systemName: "questionmark.circle").font(.system(size: 10)).foregroundStyle(.white.opacity(0.4))
-                .accessibilityLabel("Name not verified")
-        case .unverified:
-            Text("unverified").font(.system(size: compact ? 8.5 : 9.5, weight: .medium)).foregroundStyle(.white.opacity(0.45))
+        case .symbol(let name):
+            Image(systemName: name).font(.system(size: 10)).foregroundStyle(.white.opacity(0.4))
+                .accessibilityLabel(badge == .unconfirmed ? "Name not confirmed yet" : "Name not verified")
+        case .words:
+            Text("unverified").font(.system(size: 9.5, weight: .medium)).foregroundStyle(.white.opacity(0.45))
                 .padding(.horizontal, 4).padding(.vertical, 1)
                 .overlay(Capsule().strokeBorder(.white.opacity(0.18), lineWidth: 1))
                 .accessibilityLabel("Name not verified")
-        case .impersonation:
+        case .loud where badge == .impersonation:
             Label("possible impersonation", systemImage: "exclamationmark.octagon.fill")
                 .font(.system(size: compact ? 9 : 10, weight: .semibold)).foregroundStyle(.red)
                 .labelStyle(.titleAndIcon)
                 .accessibilityLabel("Possible impersonation")
+        case .loud:
+            Text("unconfirmed name").font(.system(size: compact ? 8.5 : 9.5, weight: .semibold)).foregroundStyle(.orange)
+                .padding(.horizontal, 4).padding(.vertical, 1)
+                .overlay(Capsule().strokeBorder(.orange.opacity(0.5), lineWidth: 1))
+                .accessibilityLabel("Name could not be confirmed")
+        }
+    }
+}
+
+/// The badge of a row: a tap says what it means, and offers to settle it.
+struct TrustBadgeButton: View {
+    @EnvironmentObject private var app: AppState
+    let userId: String
+    /// The name on screen, which is also the one that was claimed (but for "Unknown contact …").
+    let name: String
+    let badge: ContactTrust.Badge
+    @State private var explaining = false
+    @State private var verifying = false
+
+    var body: some View {
+        if let text = ContactTrust.explanation(badge) {
+            Button { explaining = true } label: { TrustBadge(badge: badge, compact: true).contentShape(Rectangle()) }
+                .buttonStyle(.plain)
+                .popover(isPresented: $explaining) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text(text).fixedSize(horizontal: false, vertical: true)
+                        if badge == .unconfirmed, name != ContactTrust.unknownName(userId) {
+                            Button("Check again") { Task { await app.contacts.check(userId, name: name, again: true) } }
+                        }
+                        if badge != .verified {
+                            Button("Verify safety number…") { explaining = false; verifying = true }
+                        }
+                    }
+                    .font(.callout).padding(14).frame(width: 260, alignment: .leading)
+                    .presentationCompactAdaptation(.popover)
+                }
+                .sheet(isPresented: $verifying) { DismissableSheet { SafetyNumberView(peerName: name, peerUserId: userId) } }
         }
     }
 }

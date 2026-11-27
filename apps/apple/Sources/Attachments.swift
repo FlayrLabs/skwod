@@ -106,8 +106,11 @@ struct BlobStore {
         self.token = token
     }
 
+    /// Every request of this store passes the one sink (`RawSink`) — before each request and
+    /// each chunk; refused, it fails at once (an unusable URL) instead of reaching the port.
     private func request(_ path: String, method: String) -> URLRequest {
-        var req = URLRequest(url: base.appendingPathComponent(path))
+        let target = RawSink.allows(base.absoluteString) ? base.appendingPathComponent(path) : URL(string: "about:blank")!
+        var req = URLRequest(url: target)
         req.httpMethod = method
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         return req
@@ -126,7 +129,7 @@ struct BlobStore {
         if let tokenHash { fields["download_token_hash"] = tokenHash }
         create.httpBody = try JSONSerialization.data(withJSONObject: fields)
         let body: Data, resp: URLResponse
-        do { (body, resp) = try await URLSession.shared.data(for: create) } catch { throw AttachmentError.upload }
+        do { (body, resp) = try await RawSink.data(for: create) } catch { throw AttachmentError.upload }
         let status = (resp as? HTTPURLResponse)?.statusCode ?? 0
         guard status == 200,
               let obj = try? JSONSerialization.jsonObject(with: body) as? [String: Any],
@@ -216,7 +219,7 @@ struct BlobStore {
     func uploadLimit() async -> Int64?? {
         var req = request("api/instance/limits", method: "GET")
         req.timeoutInterval = 8
-        guard let (body, resp) = try? await URLSession.shared.data(for: req) else { return nil }
+        guard let (body, resp) = try? await RawSink.data(for: req) else { return nil }
         switch (resp as? HTTPURLResponse)?.statusCode ?? 0 {
         case 200: return UploadLimit.parse(body).map { .some($0) }
         case 404, 405: return .some(nil)
@@ -254,6 +257,7 @@ struct BlobStore {
                   limit: Int = AttachmentLimits.ciphertextLimit(forPlaintext: AttachmentLimits.inMemoryCap)) async throws -> Data {
         // Into memory: bounded by a fixed constant, never by what a server says it allows.
         let limit = min(limit, AttachmentLimits.ciphertextLimit(forPlaintext: AttachmentLimits.inMemoryCap))
+        guard RawSink.allows(base.absoluteString) else { throw AttachmentError.download }
         var req = URLRequest(url: base.appendingPathComponent("api/blobs/\(blobId)"))
         req.httpMethod = "GET"
         if let downloadToken, !downloadToken.isEmpty {
@@ -289,6 +293,7 @@ struct BlobStore {
     /// limit is refused before a byte is read, and writing stops one byte past it. Nothing
     /// partial is left behind on failure.
     func download(_ blobId: String, token downloadToken: String? = nil, limit: Int, to destination: URL) async throws {
+        guard RawSink.allows(base.absoluteString) else { throw AttachmentError.download }
         var req = URLRequest(url: base.appendingPathComponent("api/blobs/\(blobId)"))
         req.httpMethod = "GET"
         if let downloadToken, !downloadToken.isEmpty {
@@ -323,7 +328,7 @@ struct BlobStore {
     /// Delete a blob this account uploaded (a DM attachment whose message was removed, or an
     /// upload whose message never went out). Best effort.
     func delete(_ blobId: String) async {
-        _ = try? await URLSession.shared.data(for: request("api/blobs/\(blobId)", method: "DELETE"))
+        _ = try? await RawSink.data(for: request("api/blobs/\(blobId)", method: "DELETE"))
     }
 }
 

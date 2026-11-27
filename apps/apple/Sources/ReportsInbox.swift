@@ -194,7 +194,7 @@ extension AppState {
         var req = URLRequest(url: base.appendingPathComponent(path))
         req.httpMethod = "DELETE"
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        let code = ((try? await URLSession.shared.data(for: req))?.1 as? HTTPURLResponse)?.statusCode ?? 0
+        let code = ((try? await RawSink.data(for: req))?.1 as? HTTPURLResponse)?.statusCode ?? 0
         guard code == 200 else { throw ModerationError() }
     }
 }

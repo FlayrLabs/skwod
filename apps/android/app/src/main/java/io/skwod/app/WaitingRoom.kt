@@ -348,7 +348,7 @@ class WaitingRoom(private val model: AppModel) {
         if (!Asked.holds(asked, model.bound)) return
         // "Let in" is the user vouching for this account under this name, on this device.
         // (In the contact book of the workspace it was done in — not one switched to since.)
-        if (problem == null && model.client === c) { model.refreshRoster(); if (model.client === c) model.contacts.markKnown(w.userId, w.username, WaitingTrust.Lookup.Found(w.userId)) }
+        if (problem == null && model.client === c) { model.refreshRoster(); if (model.client === c) model.contacts.markKnown(asked.workspaceId, w.userId, w.username, WaitingTrust.Lookup.Found(w.userId)) }
         if (handOffFailed && problem == null) {
             // They are admitted, but have no keys from us yet. Say so, and keep trying.
             problem = "${w.displayName} was let in, but their keys could not be handed over yet. Skwod keeps trying while this device is online."

@@ -74,13 +74,11 @@ struct ServerRailView: View {
                         relogin = w
                         return
                     }
-                    chat.homeMode = false
-                    chat.railServerId = nil
-                    chat.selection = nil
                     // Tapping the skwod already open only shows its overview: re-activating it
                     // rebuilt the client and re-checked the session on every tap.
-                    guard w.id != app.current?.id else { return }
-                    Task { await app.activate(w) }
+                    guard w.id != app.current?.id else { chat.showServers(); return }
+                    chat.switching(to: w.id)
+                    Task { await app.activate(w); chat.switchEnded(w.id) }
                 } content: {
                     AvatarTile(key: w.instanceId.map(AvatarStore.skwodKey), name: w.displayName, size: 48, cornerRadius: 16)
                         .opacity(w.isSignedOut ? 0.45 : 1)

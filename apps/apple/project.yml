@@ -6,19 +6,20 @@ options:
   # this file, committed) is installed into the project after every `xcodegen generate`. It fixes
   # the transitive packages too (LiveKit's WebRTC and FFI binaries). To update a package: change
   # exactVersion below, generate, let Xcode resolve, and copy the project's Package.resolved back.
+  # LiveKit is a local package: the pinned commit plus livekit-swift.patch (see the script).
+  preGenCommand: ./fetch-livekit-swift.sh
   postGenCommand: mkdir -p Skwod.xcodeproj/project.xcworkspace/xcshareddata/swiftpm && cp Package.resolved Skwod.xcodeproj/project.xcworkspace/xcshareddata/swiftpm/Package.resolved
 packages:
   Sparkle:
     url: https://github.com/sparkle-project/Sparkle
     exactVersion: "2.10.1"
   LiveKit:
-    url: https://github.com/livekit/client-sdk-swift.git
-    exactVersion: "2.19.0"
+    path: Vendor/client-sdk-swift   # v2.19.0, pinned by commit in fetch-livekit-swift.sh
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    MARKETING_VERSION: "0.50"
-    CURRENT_PROJECT_VERSION: "50"
+    MARKETING_VERSION: "0.51"
+    CURRENT_PROJECT_VERSION: "51"
     ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
     # --- build-time switches (docs/APPLE.md) -------------------------------------------------
     # Blind push gateway base URL (https://…). Empty = remote push disabled; the app then only
@@ -143,6 +144,9 @@ targets:
       - path: Sources/Workspace.swift
       - path: Sources/Invites.swift
       - path: Sources/Shared.swift
+      # The cross-process lock on the caches (Foundation only).
+      - path: Sources/StoreLock.swift
+      - path: Sources/Compose.swift
       # Who may be announced under a conversation's title (Foundation only).
       - path: Sources/ConversationStore.swift
       # Which rows a wake treats as new: by id, never by the server's clock (Foundation only).
@@ -219,6 +223,8 @@ targets:
       # Build 47: who is in a voice room, and a left server staying gone.
       - path: Sources/VoiceRoster.swift
       - path: Sources/LeaveRules.swift
+      # Build 51: what a failed call says, stage by stage.
+      - path: Sources/VoiceFailure.swift
       # Build 48: a p2p connect always ends (deadline that does not wait on a stalled call), and
       # what the log-in screen says when the host can't be reached.
       - path: Sources/ConnectRules.swift
@@ -230,6 +236,19 @@ targets:
       - path: Sources/SiblingRules.swift
       # Build 49: the emoji picker's catalog, search and recents.
       - path: Sources/EmojiCatalog.swift
+      # Build 51: when a dead p2p session is replaced, when conversations catch up, and where
+      # the message list scrolls.
+      - path: Sources/ConnectionRecovery.swift
+      # Build 51: the lock on the encrypted caches, and when the app may hold it.
+      - path: Sources/StoreLock.swift
+      # Build 51: what a person sends goes where they sent it; a client goes online with its pin.
+      - path: Sources/Compose.swift
+      # Build 51: the channel a server opens with.
+      - path: Sources/ChannelLanding.swift
+      # Build 51: who shows as online, and what this device says about its own account.
+      - path: Sources/PresenceRules.swift
+      # Build 51: the account's servers this device does not show yet.
+      - path: Sources/ServerRecovery.swift
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: io.skwod.logic-tests

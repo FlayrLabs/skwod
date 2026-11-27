@@ -71,7 +71,7 @@ object ContactTrust {
             Flag.IMPERSONATION -> "Possible impersonation. This account's name looks like the name of someone you already know — a contact, or a member of a server you share — but it is a DIFFERENT account. Do not trust it on the strength of the name; compare safety numbers." to true
             Flag.UNUSUAL -> "This name contains unusual or invisible characters, which real usernames here never have. It may be made to look like someone else's name. Treat this account as a stranger." to true
             Flag.MISMATCH -> "This name doesn't match this account: looking the name up does not lead to it. Don't rely on the name." to true
-            Flag.UNCHECKED -> "Couldn't check this name against the account yet. Until it has been checked, treat it as unconfirmed." to false
+            Flag.UNCHECKED -> "This name comes from the host of this Skwod, which has not answered yet whose it is. To be sure who it is, compare safety numbers." to false
             Flag.NONE -> if (unverified) "Unverified: this name is only what the server says. Compare safety numbers, or accept the contact if you know who this is." to false else null
         }
     }
@@ -214,6 +214,22 @@ object ContactTrust {
     /** Build 49: a mention of me reads "you" — never a name the server could have supplied
      *  (matching Apple). */
     const val SELF_MENTION = "you"
+
+    /** Build 49: the book after verifying [userId] under [claimed] — the gate evaluated against
+     *  THIS book (the one being written) — or null when the name is flagged (nothing pinned). */
+    fun verifiedBook(book: Map<String, Contact>, userId: String, claimed: String?, roster: Map<String, String>,
+                     lookups: Map<String, WaitingTrust.Lookup>): Map<String, Contact>? {
+        val raw = claimed?.takeIf { it.isNotBlank() }
+        val level = book[userId]?.level ?: TrustLevel.UNVERIFIED
+        val name = if (level == TrustLevel.UNVERIFIED) raw ?: book[userId]?.name?.takeIf { it.isNotBlank() } else null
+        val lookup = if (name == null) null else lookups["$userId|$name"]
+        val shown = display(userId, claimed, book, CollisionSet.of(book, roster), lookup)
+        if (!mayPinOnVerify(shown)) return null
+        return record(book, userId, shown.name, TrustLevel.VERIFIED)
+    }
+
+    /** Drawn as a quiet symbol in rows: only a name nothing speaks against, not looked up yet. */
+    fun quiet(shown: Shown, words: Boolean): Boolean = !words && shown.flag == Flag.UNCHECKED
 
     /** May an explicit verification pin this name? Not a flagged one. */
     fun mayPinOnVerify(shown: Shown): Boolean = shown.flag == Flag.NONE
@@ -366,23 +382,25 @@ class ContactBook(private val model: AppModel) {
      *  ([SiblingRules.mergedBook]). False when another skwod's book is loaded. */
     fun mergeFromSibling(synced: Map<String, Contact>, workspaceId: String, vouched: Set<String>, mismatched: Set<String>): Boolean {
         if (workspaceId.isEmpty() || loadedFor != workspaceId || model.current?.id != workspaceId) return false
-        update { book -> SiblingRules.mergedBook(book, synced, vouched, mismatched, rosterState.value).let { if (it == book) book else it } }
+        update(workspaceId) { book -> SiblingRules.mergedBook(book, synced, vouched, mismatched, rosterState.value).let { if (it == book) book else it } }
         return true
     }
 
     /** The book of [workspaceId] as a sibling payload (null for another skwod's book). */
     fun siblingPayload(workspaceId: String): String? = if (workspaceId.isNotEmpty() && loadedFor == workspaceId) SiblingBook.encode(state.value) else null
 
+    /** Every write names the skwod it is for ([workspaceId], captured by the caller with the
+     *  client it asked, before any await). Nothing is written unless that skwod is the current
+     *  and loaded one before and after the change, and the write goes to its key ([GatedWrite]). */
     @Synchronized
-    private fun update(change: (Map<String, Contact>) -> Map<String, Contact>) {
-        val wid = model.current?.id ?: return
-        // Not read yet (the read failed earlier): read now, or change nothing.
-        if (loadedFor != wid) { load(); if (loadedFor != wid) return }
-        val next = change(state.value)
-        if (next === state.value) return
+    private fun update(workspaceId: String, change: (Map<String, Contact>) -> Map<String, Contact>) {
+        // Not read yet (the read failed earlier): read now — only while it is the current skwod.
+        if (workspaceId.isNotEmpty() && loadedFor != workspaceId && model.current?.id == workspaceId) load()
+        val next = GatedWrite.apply(workspaceId, { model.current?.id }, { loadedFor }, state.value, change) { w, book ->
+            model.secretPut(key(w), ContactTrust.encode(book))
+        } ?: return
         state.value = next
         reindex()
-        model.secretPut(key(wid), ContactTrust.encode(next))
     }
 
     /**
@@ -456,10 +474,10 @@ class ContactBook(private val model: AppModel) {
     }
 
     /** First run: seed the book from the stored conversations ([ContactTrust.migrate]). */
-    fun migrate(conversations: List<ContactTrust.Legacy>) = update { if (it.isEmpty()) ContactTrust.migrate(conversations) else it }
+    fun migrate(workspaceId: String, conversations: List<ContactTrust.Legacy>) = update(workspaceId) { if (it.isEmpty()) ContactTrust.migrate(conversations) else it }
 
     /** A server-supplied name for a DM peer: remembered as a claim, nothing more. */
-    fun claim(userId: String, name: String?) { if (!name.isNullOrBlank()) update { ContactTrust.record(it, userId, name, TrustLevel.UNVERIFIED) } }
+    fun claim(workspaceId: String, userId: String, name: String?) { if (!name.isNullOrBlank()) update(workspaceId) { ContactTrust.record(it, userId, name, TrustLevel.UNVERIFIED) } }
 
     /** An explicit action by the user on this device: started the DM, let them in, accepted the contact. */
     /**
@@ -467,12 +485,12 @@ class ContactBook(private val model: AppModel) {
      * [lookup]: what the directory said for this name when the caller itself just asked;
      * otherwise the cached cross-check (none yet = "couldn't check" = not pinned).
      */
-    fun markKnown(userId: String, name: String, lookup: WaitingTrust.Lookup? = null) = update {
+    fun markKnown(workspaceId: String, userId: String, name: String, lookup: WaitingTrust.Lookup? = null) = update(workspaceId) {
         ContactTrust.promote(it, userId, name, collisions.value, lookup ?: lookups.value["$userId|$name"])
     }
 
     /** A chat was opened from the New chat dialog: see [ContactTrust.onDmOpened]. */
-    fun dmOpened(userId: String, name: String, alreadyListed: Boolean, lookup: WaitingTrust.Lookup?) = update {
+    fun dmOpened(workspaceId: String, userId: String, name: String, alreadyListed: Boolean, lookup: WaitingTrust.Lookup?) = update(workspaceId) {
         ContactTrust.onDmOpened(it, userId, name, alreadyListed, collisions.value, lookup)
     }
 
@@ -481,13 +499,19 @@ class ContactBook(private val model: AppModel) {
      *  clean right now ([ContactTrust.mayPinOnVerify] on [shown]: no look-alike, no unusual
      *  characters, no failed name check). Returns false when refused. The only caller that raises
      *  is `SafetyNumberDialog.refreshStatus(explicitVerify = true)` (see Build49Test). */
-    fun setVerified(userId: String, verified: Boolean, name: String?): Boolean {
-        if (verified) {
-            val shown = shown(userId, name)
-            if (!ContactTrust.mayPinOnVerify(shown)) return false
-            update { ContactTrust.record(it, userId, shown.name, TrustLevel.VERIFIED) }
-        } else update { ContactTrust.unverify(it, userId) }
-        return true
+    fun setVerified(workspaceId: String, userId: String, verified: Boolean, name: String?): Boolean = setVerifiedIn(workspaceId, userId, verified, name)
+
+    /** Synchronized: the [shown] gate and the write see the same book. */
+    @Synchronized
+    private fun setVerifiedIn(workspaceId: String, userId: String, verified: Boolean, name: String?): Boolean {
+        if (!verified) { update(workspaceId) { ContactTrust.unverify(it, userId) }; return true }
+        var pinned = false
+        // The gate runs INSIDE the write, against the book being written (that skwod's, loaded):
+        // a flagged name leaves it unchanged.
+        update(workspaceId) { book ->
+            ContactTrust.verifiedBook(book, userId, name, rosterState.value, lookups.value)?.also { pinned = true } ?: book
+        }
+        return pinned
     }
 
     /** Build 49: the sibling merge's raise, bound to [workspaceId] inside the store's lock: a
@@ -496,11 +520,13 @@ class ContactBook(private val model: AppModel) {
     @Synchronized
     fun setVerifiedFromSibling(userId: String, name: String?, workspaceId: String): Boolean {
         if (workspaceId.isEmpty() || loadedFor != workspaceId || model.current?.id != workspaceId) return false
-        return setVerified(userId, true, name)
+        return setVerifiedIn(workspaceId, userId, true, name)
     }
 
-    /** A read of the core's state: may only demote ([ContactTrust.afterStatusRead]). */
-    fun noteStatusRead(userId: String, verified: Boolean) = update { ContactTrust.afterStatusRead(it, userId, verified) }
+    /** A read of the core's state: may only demote ([ContactTrust.afterStatusRead]), only into
+     *  [workspaceId]'s book. */
+    fun noteStatusRead(workspaceId: String, userId: String, verified: Boolean) =
+        update(workspaceId) { ContactTrust.afterStatusRead(it, userId, verified) }
 
     /** Known / verified people, as (account id, name) — what a new name is compared against. */
     fun knownPeople(): List<Pair<String, String>> = state.value.values.filter { it.level != TrustLevel.UNVERIFIED }.map { it.userId to it.name }

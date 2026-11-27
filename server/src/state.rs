@@ -60,6 +60,8 @@ pub struct AppState {
     pub rings: crate::voice::Rings,
     /// Who is in which voice room right now (in memory; `voice_state.rs`).
     pub voice_states: crate::voice_state::VoiceStates,
+    /// Whether the bundled call server runs, and why not (`livekit.rs`).
+    pub voice: crate::livekit::VoiceHealth,
     /// Serializes "a member opens a server's first voice room" so two members arriving at once
     /// get the same room instead of two (`structure.rs`).
     pub voice_room_lock: Arc<Mutex<()>>,
@@ -158,6 +160,7 @@ impl AppState {
             p2p_endpoint: Arc::default(),
             rings: crate::voice::Rings::default(),
             voice_states: crate::voice_state::VoiceStates::default(),
+            voice: Default::default(),
             voice_room_lock: Arc::default(),
             public_urls: Arc::new(
                 std::env::var("SKWOD_PUBLIC_URL").map(|v| v.split(',').map(|s| s.trim().to_string()).collect()).unwrap_or_default(),

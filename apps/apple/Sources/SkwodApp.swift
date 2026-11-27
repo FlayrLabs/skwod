@@ -81,7 +81,13 @@ final class AppState: ObservableObject {
     /// resolved for (`LiveBase`), and reads as "" for any other workspace. `session` comes from
     /// `current`, so a request built from `session` + `serverURL` can never pair one skwod's
     /// token with another skwod's server — not even while a switch is still dialing.
-    var liveBase: String { LiveBase.url(liveBinding, for: current?.id) }
+    var liveBase: String {
+        let url = LiveBase.url(liveBinding, for: current?.id)
+        // Build 51: never a loopback URL whose session was closed (`isRetiredBase`): every raw
+        // request reads this per request, so none goes to a port another process may now hold.
+        // …nor one whose front is SUSPECT (back from the background, not yet proved ours).
+        return url.isEmpty || RawSink.allows(url) ? url : ""
+    }
     @Published private var liveBinding: LiveBase?
     /// An invite that arrived from outside (tapped `skwod://` link, scanned QR) and is waiting for
     /// the connect form. Already validated; the user still has to confirm by signing up / logging in.
@@ -99,8 +105,25 @@ final class AppState: ObservableObject {
     /// Where the client is put up (`bind`, by turn) and taken down (`dropClient`). `client` and
     /// `bound` are both read from it, so they cannot disagree.
     private let binding = ClientBinding<SkwodClient>()
-    /// Counts `activate` calls: one that suspended before switching gives way to a later one.
-    private var activations = 0
+    /// Build 51: the bind turn of the client that is up (nil: none), published — an open
+    /// conversation is keyed on it, so it reloads from (and catches up through) every new client.
+    @Published private(set) var clientTurn: Int?
+    /// Build 51: become-active, wake, network back, connection re-established → one catch-up.
+    var catchUpGate = CatchUpGate()
+    /// When every joined channel was last swept, and whether the socket came up since.
+    var lastChannelSweep: Date?
+    var socketCameUpSinceSweep = true
+    /// When the app may hold the encrypted cache; counts `activate` calls (one that suspended gives
+    /// way to a later one, and to the background).
+    let store = StoreLifecycle(lock: .shared, system: BackgroundTime.platform)
+    /// The activation that is running, if it is the one that counts.
+    private var activating: StoreLifecycle.Ticket?
+    /// The bind turn of a client that was put up with no way to its host (`offlineBase`).
+    private var offlineTurn: Int?
+    /// A client is up and has been given a way to its host (which may still not answer).
+    var clientIsOnline: Bool { bound != nil && offlineTurn != bound?.turn }
+    /// The active skwod is being reached right now.
+    var isConnecting: Bool { activating.map(store.holds) ?? false }
     /// No client — and any `bind` still in flight is over: it will assign nothing.
     private func dropClient() { binding.begin() }
 
@@ -150,11 +173,44 @@ final class AppState: ObservableObject {
 
     init() {
         reads.app = self
+        binding.onChange = { [weak self] in
+            guard let self else { return }
+            let turn = self.binding.bound?.turn
+            if self.clientTurn != turn { self.clientTurn = turn }
+        }
         #if DEBUG
         E2E.atLaunch()
         E2E.startAccountDriver(self)
         #endif
         CallCoordinator.shared.app = self
+        store.takeDown = { [weak self] in
+            self?.reconnectTask?.cancel()
+            self?.inboxTask?.cancel()
+            self?.dropClient()
+        }
+        #if os(iOS)
+        store.suspectFronts = { [weak self] in P2PManager.shared.suspendAll(except: self?.callFrontExempt) }
+        store.callIsLive = { [weak self] in
+            CallManager.shared.isAnswered || (self?.activeCall != nil && CallCoordinator.shared.session?.phase != .failed)
+        }
+        // The app's own state, not the view's: a view is told of a change late, or — in a process
+        // the system started in the background — not at all.
+        let center = NotificationCenter.default
+        sceneObservers = [
+            center.addObserver(forName: UIApplication.didBecomeActiveNotification, object: nil, queue: nil) { [weak self] _ in
+                MainActor.assumeIsolated { self?.becameActive() }
+            },
+            center.addObserver(forName: UIApplication.didEnterBackgroundNotification, object: nil, queue: nil) { [weak self] _ in
+                MainActor.assumeIsolated { self?.store.enteredBackground() }
+            },
+        ]
+        switch UIApplication.shared.applicationState {
+        case .active: store.becameActive()
+        // (Started by a push: not in use. `becameActive` says otherwise.)
+        case .background: appActive = false; realtime.appActive = false
+        default: break
+        }
+        #endif
         // Everything the live connection reports drives a refresh somewhere (LiveSync.swift).
         realtime.onEvent = { [weak self] topic, event, payload in self?.realtimeEvent(topic: topic, event: event, payload: payload) }
         realtime.onConnected = { [weak self] in self?.realtimeConnected() }
@@ -167,28 +223,74 @@ final class AppState: ObservableObject {
         waitingCancellable = waiting.objectWillChange
             .sink { [weak self] in self?.objectWillChange.send() }
         // The connection indicator reads P2PManager through `connection`.
+        DirectRoutes.mayKeep = { [weak self] id in self?.workspaces.contains { $0.id == id && !$0.isSignedOut } == true }
         p2pCancellable = P2PManager.shared.objectWillChange
             .sink { [weak self] in self?.objectWillChange.send() }
         networkObserver = NotificationCenter.default.addObserver(
             forName: .skwodNetworkChanged, object: nil, queue: .main
         ) { [weak self] _ in Task { @MainActor in await self?.connectionMayHaveChanged() } }
+        // Build 51: a session's loopback proxy failed for good — replace it now.
+        proxyClosedObserver = NotificationCenter.default.addObserver(
+            forName: .skwodSessionProxyClosed, object: nil, queue: .main
+        ) { [weak self] note in
+            Task { @MainActor in
+                guard let self, let key = note.object as? String, self.current?.id == key else { return }
+                await self.checkConnection(urgent: true)
+            }
+        }
+        #if os(macOS)
+        // Back from sleep: the session (and the socket on it) may have died with the network.
+        wakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification, object: nil, queue: .main
+        ) { [weak self] _ in Task { @MainActor in await self?.connectionMayHaveChanged(trigger: .wake) } }
+        #endif
     }
+    private var proxyClosedObserver: NSObjectProtocol?
+    private var sceneObservers: [NSObjectProtocol] = []
+    #if os(macOS)
+    private var wakeObserver: NSObjectProtocol?
+    #endif
 
     /// How the active workspace is reached right now (drives `ConnectionPill`).
     var connection: ConnectionQuality {
         guard let w = current else { return .offline }
-        guard let nodeId = w.nodeId else { return .server }
+        guard w.nodeId != nil else { return .server }
         // A p2p workspace currently served by its https fallback.
-        if !liveBase.isEmpty, P2PManager.shared.liveBase(for: nodeId) != liveBase { return .server }
-        return P2PManager.shared.quality[nodeId] ?? (liveBase.isEmpty ? .offline : .connecting)
+        if !liveBase.isEmpty, P2PManager.shared.liveBase(for: w.id) != liveBase { return .server }
+        return P2PManager.shared.quality[w.id] ?? (liveBase.isEmpty ? .offline : .connecting)
     }
 
     /// Compatibility accessors so existing views keep working against the active workspace.
     var session: AuthSession? {
         // A workspace the server signed out has no session: the root shows the log-in screen.
         guard let w = current, !w.isSignedOut else { return nil }
-        return AuthSession(userId: w.userId, token: w.token, expiresAt: w.expiresAt)
+        return AuthSession(userId: w.userId, token: wireToken(for: w), expiresAt: w.expiresAt)
     }
+
+    /// Build 51: what the app's own requests present as the session. Through a p2p FRONT only
+    /// the opaque credential `sign_in` handed out — the token itself never crosses loopback
+    /// (nothing at all while there is none); to an https server, the token.
+    func wireToken(for w: Workspace) -> String {
+        let base = LiveBase.url(liveBinding, for: w.id)
+        // Not bound right now: a p2p workspace presents nothing (its only target is a front).
+        if base.isEmpty { return w.nodeId == nil ? w.token : "" }
+        guard isFront(base) else { return w.token }
+        guard let c = liveCredential, c.workspaceId == w.id else { return "" }
+        return c.url
+    }
+    /// A front URL, or one shaped like it (suspect counts).
+    private func isFront(_ base: String) -> Bool { isFrontBase(baseUrl: base) || isFrontSuspect(baseUrl: base) }
+
+    /// The live record of `w` — only if it is still signed in with the same token.
+    private func liveRecord(_ w: Workspace) -> Workspace? {
+        let live = workspaces.first { $0.id == w.id }
+        guard let live, LiveRecordRule.stillValid(liveId: live.id, liveSignedOut: live.isSignedOut, liveToken: live.token, startId: w.id, startToken: w.token) else { return nil }
+        return live
+    }
+
+    /// The credential of the front the active workspace is bound through (`LiveBase` shape:
+    /// workspace id + the credential).
+    @Published private var liveCredential: LiveBase?
     /// The live base URL for REST/WebSocket calls against the active workspace ("" = unreachable).
     var serverURL: String { liveBase }
 
@@ -242,13 +344,14 @@ final class AppState: ObservableObject {
         guard scope.hasPrefix("channel:") || scope.hasPrefix("dm:") else { return }
         let wanted = workspaces.first(where: { $0.id == workspaceId && !workspaceId.isEmpty })
             ?? workspaces.first(where: { !tag.isEmpty && $0.wakeTag == tag })
-        if let wanted, wanted.id != current?.id, !wanted.isSignedOut { await activate(wanted) }
-        if let wanted, wanted.id != current?.id { return }
+        // (Not waited for: its host may be out of reach, and the conversation is on this device.)
+        if let wanted, wanted.id != current?.id, !wanted.isSignedOut { Task { await activate(wanted) } }
         #if os(macOS)
         NSApp.activate(ignoringOtherApps: true)
         #endif
-        for _ in 0..<24 {
-            if chatModel?.open(scope: scope) == true { return }
+        let opens = wanted?.id ?? current?.id
+        for _ in 0..<40 {
+            if let opens, chatModel?.spacesWorkspaceId == opens, current?.id == opens, chatModel?.open(scope: scope) == true { return }
             try? await Task.sleep(for: .milliseconds(250))
         }
     }
@@ -257,16 +360,40 @@ final class AppState: ObservableObject {
     @Published var voiceRoster = VoiceRoster()
     @Published var activeCall: CallTarget? {
         didSet {
+            if activeCall != nil, oldValue == nil { callWorkspaceId = current?.id }
             if activeCall == nil, oldValue != nil {
+                callWorkspaceId = nil
                 CallCoordinator.shared.callSheetClosed()
                 #if os(iOS)
                 // The call that kept this install in-band is over and the app is not in
-                // front: from now on it is pushed.
-                if !appActive { pushPhase(.background) }
+                // front: from now on it is pushed — and the background steps a call skipped run
+                // now (the cache let go, socket closed, fronts suspect).
+                store.callMayHaveEnded()
+                if !appActive || store.phase != .active {
+                    pushPhase(.background)
+                    realtime.suspend()
+                    P2PManager.shared.suspendAll()
+                }
                 #endif
+                // A re-key the call delayed is done now.
+                if appActive { Task { @MainActor in await self.checkConnection(urgent: true) } }
             }
         }
     }
+    /// The workspace whose front carries `activeCall`.
+    private var callWorkspaceId: String?
+    func callIsIn(_ workspaceId: String) -> Bool { callWorkspaceId == nil || callWorkspaceId == workspaceId }
+    /// `ForegroundRule`: the front that carries a connected call with a live audio session.
+    private var callFrontExempt: String? {
+        #if os(iOS)
+        let audioLive = CallManager.shared.audioLive
+        #else
+        let audioLive = false
+        #endif
+        return ForegroundRule.exempt(callWorkspace: activeCall == nil ? nil : callWorkspaceId,
+                                     connected: CallCoordinator.shared.session?.phase == .connected, audioLive: audioLive)
+    }
+
     /// A call that is ringing right now (from a `ring` event). iOS shows it through CallKit only;
     /// macOS shows the in-app banner.
     @Published var incomingCall: IncomingCall?
@@ -289,26 +416,65 @@ final class AppState: ObservableObject {
         // Tell the server we are away, then close the live socket. A socket left open is killed
         // by the system some seconds later without a word, and until the server notices it keeps
         // delivering in-band to a process that is no longer listening — no push, no wake. An
-        // explicit "offline" makes this install push-wakeable immediately. (A call keeps the
+        // explicit goodbye makes this install push-wakeable immediately. (A call keeps the
         // process running in the background, and with it the socket.)
         if activeCall == nil { realtime.suspend() }
         inboxTask?.cancel()
         if let w = current { NotificationState.setHighWater(Int64(Date().timeIntervalSince1970 * 1000), workspaceId: w.id) }
         NotificationState.publicFallback = P2PManager.publicFallback
         seenStoreGeneration = NotificationState.storeGeneration
-        StoreLock.shared.release()
+        // Last: the client goes, and with it the lock (kept only under a live call); the fronts are
+        // SUSPECT until proved ours on the way back. Nothing that is still on its way — a dial, an
+        // activation, the reconnect loop — puts a client up from here.
+        store.enteredBackground()
         #endif
+    }
+
+    /// In front: the cache may be held again, from now on (not once some task gets to run).
+    func becameActive() {
+        store.becameActive()
+        if !appActive { setActive(true) }
+        guard store.needsActivation, !foregroundQueued else { return }
+        foregroundQueued = true
+        Task { await enterForeground() }
+    }
+    private var foregroundQueued = false
+
+    /// A call was answered on the system's call screen: with the app not in front, the client is
+    /// put up for it now (`StoreLifecycle`).
+    func callAnswered() {
+        guard store.callAnswered(), let w = current, !w.isSignedOut else { return }
+        Task { await activate(w) }
     }
 
     /// Back in the foreground: take the cache back (waiting briefly for the extension to finish),
     /// and if the extension wrote to it meanwhile, re-open it so we never work from stale state.
     func enterForeground() async {
+        foregroundQueued = false
         #if os(iOS)
+        // (Queued before the app was sent away again: not in front after all.)
+        guard store.phase == .active else { return }
+        // Every front is suspect until proved ours (since `StoreLifecycle.becameActive`, before this
+        // ran) — but the one carrying a live call, which is challenged at once all the same (and is
+        // suspect if that fails).
+        if let exempt = callFrontExempt, case .moved = await P2PManager.shared.ensureFront(key: exempt, callActive: true),
+           let w = current, w.id == exempt, !w.isSignedOut {
+            RawSink.cancel(base: LiveBase.url(liveBinding, for: w.id))
+            realtime.disconnect()
+            await activate(w)
+        }
+        guard store.phase == .active else { return }
+        if let activating, activating.mayBind, store.holds(activating) {
+            // Begun since we are back (or by this very return): it proves its front, and does all of
+            // what follows. One from before has proved nothing: it starts over.
+            if !store.begunInThisFront(activating), let w = current, !w.isSignedOut { await activate(w) }
+            return
+        }
         if let w = current, !w.isSignedOut {
             // The extension may have used the cache while we were away — or may be using it
-            // right now. Either way the client we kept is not touched again: `activate` drops
-            // it, waits for the lock (asking the extension to yield) and opens the cache anew.
-            if NotificationState.storeGeneration != seenStoreGeneration || !StoreLock.shared.acquire(timeout: 0) {
+            // right now. The client was taken down (a call's was kept, with the lock): `activate`
+            // waits for the lock (asking the extension to yield) and opens the cache anew.
+            if store.needsActivation || NotificationState.storeGeneration != seenStoreGeneration {
                 seenStoreGeneration = NotificationState.storeGeneration
                 await activate(w)
                 return
@@ -316,39 +482,63 @@ final class AppState: ObservableObject {
             if inboxTask == nil || inboxTask?.isCancelled == true { startInboxSync() }
         }
         #endif
-        await connectionMayHaveChanged()
+        // iOS: back from the background (a real event). macOS: the scene is made active on
+        // every window focus — not a reason to replace anything on its own.
+        #if os(iOS)
+        await connectionMayHaveChanged(trigger: .foreground)
+        #else
+        await connectionMayHaveChanged(trigger: .windowFocus)
+        #endif
     }
 
     /// Attach the workspace's own encrypted cache to a client, restoring its engine or registering a
     /// fresh device. Each workspace has an independent cache key in the Keychain.
-    private func bind(_ w: Workspace, base: String) async {
+    /// `token`: exactly what this client presents (`WireRule`; "" = nothing).
+    private func bind(_ w: Workspace, base: String, token: String) async {
         // Drop the previous client first so two clients never hold the same cache at once.
         // This bind's turn. A later bind, or anything that takes the client down, ends it: after
         // every suspension below a superseded bind stops, discards `c` and assigns nothing —
         // and what it does assign is under `w.id`, the workspace THIS call was given.
         let turn = binding.begin()
-        let c = SkwodClient(baseUrl: base, token: w.token)
+        if base == Self.offlineBase { offlineTurn = turn }
+        let c = SkwodClient(baseUrl: base, token: token)
         // A nil key means the Keychain read failed transiently (NOT "no key exists") — attaching
         // would register a fresh device and orphan the real cache. Retry briefly (launch-time
         // keychain hiccups clear fast), then come back cache-less; the next activate retries.
-        var keyHex = Keychain.cacheKeyHex(for: w.id)
-        for _ in 0..<3 where keyHex == nil {
-            try? await Task.sleep(for: .milliseconds(300))
-            keyHex = Keychain.cacheKeyHex(for: w.id)
-        }
-        guard binding.isCurrent(turn) else { return }
-        guard let keyHex else {
-            deviceId = nil
-            _ = binding.commit(turn, workspaceId: w.id, client: c, cacheOpen: false)
-            return
-        }
+        //
         // The cache is opened ONLY while this process holds the cross-process lock. If the
         // notification extension has it (it was decrypting a push), it is asked to yield and
         // we wait for it; without the lock nothing is opened — two processes advancing the
         // same ratchets would corrupt the sessions.
-        let locked = await StoreLock.shared.holdForApp()
-        guard binding.isCurrent(turn) else { return }
-        guard locked else {
+        //
+        // A cache file that will not open under its key is moved aside by the core (returns false).
+        // A cache that could not be opened AT ALL (I/O, a lock) throws: then nothing may be
+        // registered — a device made now would be forgotten at the next launch.
+        let opening = CacheOpening(
+            lock: store.lock,
+            isCurrent: { self.binding.isCurrent(turn) },
+            key: { Keychain.cacheKeyHex(for: w.id) },
+            lease: { c.cacheLease() },
+            attach: {
+                #if DEBUG
+                StoreLockTrace.note("app_holds_lock")
+                #endif
+                // The cache file is device-only data: never in an iCloud / Finder backup (it holds the
+                // identity key; a restored copy on another device would be a clone of this one).
+                SharedContainer.excludeCacheFromBackup(forWorkspace: w.id)
+                _ = try await c.attachCache(path: self.cachePath(for: w), keyHex: $0)
+            })
+        switch await opening.run() {
+        case .open: break
+        case .superseded: return
+        case .closed:
+            // Not in front (any more): nothing is put up and nothing is said. `enterForeground`.
+            return
+        case .noKey:
+            deviceId = nil
+            _ = binding.commit(turn, workspaceId: w.id, client: c, cacheOpen: false)
+            return
+        case .busy:
             deviceId = nil
             _ = binding.commit(turn, workspaceId: w.id, client: c, cacheOpen: false)
             Log.app.error("cache lock not available; not opening the cache")
@@ -361,20 +551,7 @@ final class AppState: ObservableObject {
                 await self.activate(w)
             }
             return
-        }
-        #if DEBUG
-        StoreLockTrace.note("app_holds_lock")
-        #endif
-        // The cache file is device-only data: never in an iCloud / Finder backup (it holds the
-        // identity key; a restored copy on another device would be a clone of this one).
-        SharedContainer.excludeCacheFromBackup(forWorkspace: w.id)
-        // A cache that will not open under its key is moved aside by the core (returns false).
-        // A cache that could not be opened AT ALL (I/O, a lock) throws: then nothing may be
-        // registered — a device made now would be forgotten at the next launch.
-        do {
-            _ = try await c.attachCache(path: cachePath(for: w), keyHex: keyHex)
-        } catch {
-            guard binding.isCurrent(turn) else { return }
+        case .failed:
             deviceId = nil
             _ = binding.commit(turn, workspaceId: w.id, client: c, cacheOpen: false)
             enqueueNotice(SecurityAlert(
@@ -382,7 +559,6 @@ final class AppState: ObservableObject {
                 message: "Skwod could not open the encrypted data it keeps for \(w.displayName) on this device, so nothing was set up or changed. Quit and open Skwod again; if this keeps happening, restart the device."))
             return
         }
-        guard binding.isCurrent(turn) else { return }
         // (Again now that the file certainly exists: the first open creates it.)
         SharedContainer.excludeCacheFromBackup(forWorkspace: w.id)
         #if DEBUG
@@ -406,10 +582,8 @@ final class AppState: ObservableObject {
                 // no device is registered and nothing encrypted happens until this is resolved.
                 guard binding.isCurrent(turn) else { return }
                 deviceId = nil
-                _ = binding.commit(turn, workspaceId: w.id, client: c, cacheOpen: true)
-                enqueueNotice(SecurityAlert(
-                    title: "Couldn't verify this skwod",
-                    message: "The server identity saved for this skwod could not be loaded, so Skwod can't check that it is talking to the right server. Nothing was sent. Try again; if this keeps happening, leave this skwod and join again with a fresh invite."))
+                _ = binding.commit(turn, workspaceId: w.id, client: c, cacheOpen: true, pin: .failed)
+                enqueueNotice(Self.pinNotice)
                 return
             }
         }
@@ -429,7 +603,47 @@ final class AppState: ObservableObject {
         }
         guard binding.isCurrent(turn) else { return }
         // Up, in one step, as `w.id`'s — or not at all.
-        guard binding.commit(turn, workspaceId: w.id, client: c, cacheOpen: true) else { return }
+        guard binding.commit(turn, workspaceId: w.id, client: c, cacheOpen: true, pin: .applied(key: w.pinnedKey)) else { return }
+        guard base != Self.offlineBase else {
+            // Nobody to ask yet: what this device knows by itself.
+            await routeDeviceState()
+            if binding.isCurrent(turn) { await loadSecurityActivity() }
+            return
+        }
+        await settleIn(turn)
+    }
+
+    /// The client that was put up offline is given its way to the host. It stays up throughout —
+    /// what is being read or written goes on — and its pin is applied, and its session bound, before
+    /// anything of it asks the host for something. Otherwise it was not: `.notThisOne` (also when the
+    /// core could not bind it there — it then keeps its offline way) is bound anew; `.pinFailed`
+    /// reaches nobody.
+    private func goOnline(_ up: BoundClient<SkwodClient>, _ w: Workspace, base: String, token: String) async -> GoOnline<SkwodClient>.Outcome {
+        let outcome = await GoOnline(
+            up: up, pinned: w.pinnedKey,
+            isCurrent: { self.bound?.client === up.client && self.bound?.turn == up.turn && self.liveRecord(w) != nil },
+            goOnline: { client, pinned in
+                do { _ = try await client.goOnline(baseUrl: base, token: token, pinnedServerKey: pinned) } catch {
+                    Log.app.info("not online yet: \(String(describing: error), privacy: .public)")
+                    throw error
+                }
+            },
+            isPinError: { if case CoreError.Invalid = $0 { return true } else { return false } },
+            renew: { self.binding.renew() }, failPin: { self.binding.failPin() }).run()
+        switch outcome {
+        case .online(let turn): await settleIn(turn)
+        case .pinFailed: enqueueNotice(Self.pinNotice)
+        case .notThisOne, .superseded: break
+        }
+        return outcome
+    }
+
+    private static let pinNotice = SecurityAlert(
+        title: "Couldn't verify this skwod",
+        message: "The server identity saved for this skwod could not be loaded, so Skwod can't check that it is talking to the right server. Nothing was sent. Try again; if this keeps happening, leave this skwod and join again with a fresh invite.")
+
+    /// A client is up that can ask its host: where this install stands, and what it was told.
+    private func settleIn(_ turn: Int) async {
         await routeDeviceState(registerIfNew: true)
         guard binding.isCurrent(turn) else { return }
         await confirmRemovalIfFlagged()
@@ -617,6 +831,13 @@ final class AppState: ObservableObject {
         // account (which connects via stable localhost) works immediately — the tunnel is separate.
         await HostManager.shared.ensureLocalServerRunning()
         #endif
+        #if os(iOS)
+        // A push can start the app on a phone nobody has unlocked since it was restarted: what is
+        // stored cannot be read yet, and "unreadable" is not "signed in nowhere".
+        while WorkspaceStore.loadIfReadable() == nil, !UIApplication.shared.isProtectedDataAvailable {
+            try? await Task.sleep(for: .seconds(1))
+        }
+        #endif
         // Nothing a skwod answers (member lists, limits, profiles) is written to the system's
         // on-disk URL cache, which is not encrypted with anything of ours: responses are kept
         // in memory only, and what an earlier build left on disk is removed.
@@ -650,7 +871,11 @@ final class AppState: ObservableObject {
         // A skwod whose session ended is not where the app opens when another one is signed in:
         // its tile says "Log in again" instead of the whole app becoming a log-in screen.
         if target.isSignedOut, let live = workspaces.first(where: { !$0.isSignedOut }) { target = live }
-        await activate(target)
+        // The app opens as soon as what this device has is up; the host is reached behind it.
+        let opening = Task { [target] in await activate(target) }
+        var ended = false
+        Task { await opening.value; ended = true }
+        while !ended, bound == nil { try? await Task.sleep(for: .milliseconds(30)) }
     }
 
     /// A signed-out copy of a skwod + account that also has a signed-in entry (made by an older
@@ -684,7 +909,7 @@ final class AppState: ObservableObject {
               let base = URL(string: liveBase), !liveBase.isEmpty else { return }
         var req = URLRequest(url: base.appendingPathComponent("api/instance/name"))
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+        guard let (data, resp) = try? await RawSink.data(for: req),
               (resp as? HTTPURLResponse)?.statusCode == 200,
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               var fresh = workspaces.first(where: { $0.id == w.id }), fresh.nameSetByUser != true else { return }
@@ -731,7 +956,7 @@ final class AppState: ObservableObject {
     /// Keys, cache and messages on disk are not deleted. Only for an entry that HAS a duplicate.
     func removeDuplicate(_ w: Workspace) async {
         guard duplicateWorkspaceIds.contains(w.id) else { return }
-        if !w.isSignedOut { revokeSession(w, base: w.id == current?.id ? liveBase : nil) }
+        if !w.isSignedOut { endSession(w, base: w.id == current?.id ? liveBase : nil, ending: [w]) }
         let wasCurrent = current?.id == w.id
         workspaces.removeAll { $0.id == w.id }
         WorkspaceStore.save(workspaces)
@@ -744,16 +969,19 @@ final class AppState: ObservableObject {
     /// host by key first; if it can't be reached the workspace still opens on its local cache and
     /// a background task keeps trying.
     func activate(_ w: Workspace) async {
-        var w = w
+        // The stored record decides, never a stale copy: one signed out meanwhile is activated
+        // as signed out (log-in), one removed is not activated at all.
+        guard var w = workspaces.first(where: { $0.id == w.id }) else { return }
         reconnectTask?.cancel()
-        activations += 1
-        let activation = activations
+        let activation = store.begin()
+        activating = activation
+        defer { if activating == activation { activating = nil } }
         if current?.id != w.id {
             // What the previous workspace's lists still have to write is written through ITS
             // client, while that client is still up — not dropped with it.
             await chatModel?.flushConversations()
             // A later activate started meanwhile: that one decides where the app goes.
-            guard activation == activations else { return }
+            guard store.holds(activation) else { return }
         }
         // The previous workspace's client goes BEFORE `current` changes: until `bind` there is
         // no client at all, rather than workspace A's client under workspace B's name.
@@ -763,6 +991,7 @@ final class AppState: ObservableObject {
             // its base URL (the new session token must never be sent there), and not its live
             // socket (its events must never be handled as the new workspace's).
             liveBinding = nil
+            liveCredential = nil
             inboxTask?.cancel()
             realtime.disconnect()
         }
@@ -778,40 +1007,92 @@ final class AppState: ObservableObject {
             signedOut = SignedOutNotice(workspaceId: w.id, name: w.displayName, address: w.server)
             return
         }
-        let base = await resolveBase(for: w)
-        guard current?.id == w.id else { return }   // superseded while dialing
-        // A token older than a week is swapped for a fresh one BEFORE the client is built with it.
-        if let base, let fresh = await rotatedIfDue(w, base: base) {
-            w = fresh
-            current = w
+        // Not in front (a wake, a call that rings): where the app is has been settled, and nothing is
+        // dialed or opened for it. In front again, or a call answered, it is activated.
+        guard activation.mayBind else { return }
+        // The host is dialed from now on; meanwhile what this device has is put up without it: the
+        // messages can be read, and what is written is queued (a dial that fails takes 8 s).
+        let target = w
+        let dial = Task { await resolveBase(for: target) }
+        // (One whose pin could not be applied is made anew.)
+        if bound?.pin == .failed { dropClient() }
+        if bound?.workspaceId != w.id {
+            await bind(w, base: Self.offlineBase, token: "")
+            guard store.holds(activation), current?.id == w.id else { return }
+            if bound?.workspaceId == w.id { Task { await chatModel?.loadIfNeeded() } }
+            if bound?.pin == .failed { return staysUnverified() }
         }
+        var base = await dial.value
+        // A later activate started meanwhile, or the app was sent away: that one binds, or
+        // `enterForeground`. (Here and after every await below.)
+        guard store.holds(activation), current?.id == w.id else { return }
+        // Build 51: through a p2p front the stored token is SIGNED IN to the front at every bind
+        // (also the first bind after updating from 0.50: no new log-in) and everything of the
+        // app presents the credential it hands out instead; a token older than a week is swapped
+        // for a fresh one first. No credential: nothing is bound to the front (offline, and the
+        // reconnect loop tries again) — never the token itself.
+        var credential: String?
+        if let b = base {
+            let armed = await arm(w.id, base: b, rotate: true)
+            guard store.holds(activation), current?.id == w.id else { return }
+            if let armed {
+                credential = armed.credential
+                w = armed.workspace
+                current = w
+            } else {
+                // Signed out or removed meanwhile; or no sign-in right now: offline.
+                guard let stored = workspaces.first(where: { $0.id == w.id }), !stored.isSignedOut else { return }
+                w = stored
+                base = nil
+            }
+        }
+        guard liveRecord(w) != nil else { return }
+        // Exactly what this bind presents: the credential through a front, the token to https,
+        // nothing to the offline base.
+        let wire = base.flatMap { WireRule.of(baseIsFront: isFront($0), credential: credential, token: w.token) }
+        if base != nil, wire == nil { base = nil }
         liveBinding = base.map { LiveBase(workspaceId: w.id, url: $0) }
-        await bind(w, base: base ?? Self.offlineBase)
+        liveCredential = credential.map { LiveBase(workspaceId: w.id, url: $0) }
+        var upOffline = bound.flatMap { $0.workspaceId == w.id && $0.cacheOpen && $0.turn == offlineTurn ? $0 : nil }
+        if let up = upOffline, let base, await goOnline(up, w, base: base, token: wire ?? "") == .notThisOne { upOffline = nil }
+        if upOffline == nil { await bind(w, base: base ?? Self.offlineBase, token: base == nil ? "" : (wire ?? "")) }
         // Superseded while binding (another activate, a sign-out, leaving): that bind put nothing
         // up, and what follows must not run for `w` against no client or another workspace's.
-        guard bound?.workspaceId == w.id else { return }
+        guard store.holds(activation), bound?.workspaceId == w.id, liveRecord(w) != nil else { return }
+        // Its pin could not be applied: it asks nobody anything — no sync, no socket — and its messages
+        // can be read. (The notice said so; the next activation tries again.)
+        if bound?.pin == .failed { return staysUnverified() }
+        let mine = bound?.turn
         // The sidebar waited for this workspace's own client (`ChatModel.loadIfNeeded`).
         await chatModel?.loadIfNeeded()
+        guard bound?.workspaceId == w.id, bound?.turn == mine, liveRecord(w) != nil else { return }
         // The server may have ended this session while the app was closed (expired, revoked from
         // another device, account removed). That is "signed out", not "unreachable".
-        if base != nil, let client, await client.sessionState() == .signedOut {
-            await handleSignedOut(w)
-            return
-        }
+        if base != nil, await endIfHostEnded(w) { return }
+        guard bound?.workspaceId == w.id, bound?.turn == mine, liveRecord(w) != nil else { return }
         signedOut = nil
         startInboxSync()
-        if let base {
-            // Live relay: instant presence flips + message notifications for this workspace.
+        if let base, let wire {
+            // Live relay: instant presence flips + message notifications for this workspace —
+            // presenting exactly what the bind presents.
             realtime.mentionWorkspaceId = w.id
-            realtime.configure(baseUrl: base, token: w.token, userId: w.userId, status: effectiveStatus)
+            realtime.configure(baseUrl: base, token: wire, userId: w.userId, status: effectiveStatus)
             await avatars.loadIfNeeded()
             await refreshServerCreatePermission()
             await refreshInstanceName()
         } else {
-            realtime.disconnect()
+            realtime.disconnect(keepingPresence: true)
             scheduleReconnect(w)
         }
         await refreshEntitlement()
+    }
+
+    private func staysUnverified() {
+        liveBinding = nil
+        liveCredential = nil
+        inboxTask?.cancel()
+        realtime.disconnect()
+        Task { await chatModel?.loadIfNeeded() }
     }
 
     /// The base URL to talk to `w` through right now, or nil if it can't be reached.
@@ -822,7 +1103,18 @@ final class AppState: ObservableObject {
         if w.nodeId == nil { return await HostManager.shared.gatedBase(w.server) }
         #endif
         guard let nodeId = w.nodeId else { return w.server }
-        if let base = await connectWithPatience(nodeId: nodeId) { return base }
+        // The front dialed by the log-in screen becomes this workspace's (one per host+account).
+        P2PManager.shared.adopt(nodeId: nodeId, as: w.id)
+        if var base = await connectWithPatience(nodeId: nodeId, key: w.id) {
+            // A front still SUSPECT (back from the background) is proved ours — or re-keyed —
+            // before anything is bound to it.
+            if isFrontSuspect(baseUrl: base) {
+                _ = await P2PManager.shared.ensureFront(key: w.id, callActive: activeCall != nil)
+                guard let now = P2PManager.shared.liveBase(for: w.id), !isFrontSuspect(baseUrl: now) else { return nil }
+                base = now
+            }
+            return base
+        }
         // The host also has a domain (VPS). That address is only ever one the host itself signed
         // (`checkAddressRecord`, learned over the pinned p2p connection — never an invite's
         // `?u=`), it must prove the pinned key FOR THAT ADDRESS, and switching to it is the
@@ -843,18 +1135,18 @@ final class AppState: ObservableObject {
     /// Dial a p2p host, but don't make the app wait on a host that isn't answering: after
     /// `patience` seconds the caller carries on offline (cached history, "Host is offline") while
     /// the same dial keeps going in the background and is picked up by the reconnect loop.
-    private func connectWithPatience(nodeId: String, patience: Double = 8) async -> String? {
-        if let live = P2PManager.shared.liveBase(for: nodeId) { return live }
+    private func connectWithPatience(nodeId: String, key: String, patience: Double = 8) async -> String? {
+        if let live = P2PManager.shared.liveBase(for: key, nodeId: nodeId) { return live }
         var finished = false
         Task { @MainActor in
-            _ = try? await P2PManager.shared.connect(nodeId: nodeId)
+            _ = try? await P2PManager.shared.connect(nodeId: nodeId, key: key)
             finished = true
         }
         let deadline = Date().addingTimeInterval(patience)
         while Date() < deadline, !finished {
             try? await Task.sleep(for: .milliseconds(150))
         }
-        return P2PManager.shared.liveBase(for: nodeId)
+        return P2PManager.shared.liveBase(for: key, nodeId: nodeId)
     }
 
     /// Keep dialing an unreachable p2p host (5 s → 60 s backoff) until it answers or the user
@@ -867,7 +1159,9 @@ final class AppState: ObservableObject {
                 try? await Task.sleep(for: .seconds(delay))
                 guard !Task.isCancelled, let self, self.current?.id == w.id, self.liveBase.isEmpty else { return }
                 if await self.resolveBase(for: w) != nil {
-                    await self.activate(w)
+                    guard !Task.isCancelled else { return }
+                    // (Not in this task: `activate` cancels it.)
+                    Task { await self.activate(w) }
                     return
                 }
                 delay = min(delay * 2, 60)
@@ -877,21 +1171,128 @@ final class AppState: ObservableObject {
 
     /// The app came to the foreground or the network changed: nudge the transport, and if the
     /// active host was unreachable, try again now instead of waiting out the backoff.
-    func connectionMayHaveChanged() async {
+    func connectionMayHaveChanged(trigger: UrgencyRule.Trigger = .networkChange) async {
+        // Back in front: the front is proved ours (or re-keyed) BEFORE anything is sent.
+        if trigger == .foreground, let w = current, w.nodeId != nil, !w.isSignedOut {
+            if case .moved = await P2PManager.shared.ensureFront(key: w.id, callActive: activeCall != nil), current?.id == w.id {
+                RawSink.cancel(base: LiveBase.url(liveBinding, for: w.id))
+                realtime.disconnect()
+                await activate(w)
+            }
+        }
         await P2PManager.shared.networkChanged()
         guard let w = current else { return }
-        if liveBase.isEmpty {
+        if LiveBase.url(liveBinding, for: w.id).isEmpty {
+            if !checkingConnection, !isConnecting { await activate(w) }
+        } else if await checkConnection(urgent: UrgencyRule.isUrgent(trigger)) == .healthy {
+            // The front answered: only the socket may have gone stale meanwhile.
+            realtime.reconnectNow()
+        }
+        // Whatever arrived while the app was away, asleep or offline (`catchUp`; coalesced
+        // with the one the socket coming up asks for).
+        catchUp()
+    }
+
+    /// Build 51: is the front the active workspace is bound through still usable? Checked in
+    /// process (`P2PManager.checkHealth`): a host that does not answer gets a fresh connection
+    /// BEHIND the same front (paced in the core) — the base URL, the client, the socket, push
+    /// and an active call's LiveKit URL all stay as they are; a listener the OS took away comes
+    /// back (`ensureFront`). Only in the rare case the front had to move is the workspace bound
+    /// again (`activate`). Returns true when it re-bound. One check at a time.
+    /// What a connection check came to.
+    enum CheckResult { case healthy, rebound, busyOrFailed }
+
+    @discardableResult
+    func checkConnection(urgent: Bool, userAsked: Bool = false) async -> CheckResult {
+        guard let w = current, !w.isSignedOut, w.nodeId != nil, !checkingConnection else { return .busyOrFailed }
+        let bound = LiveBase.url(liveBinding, for: w.id)
+        guard !bound.isEmpty, bound != w.fallbackURL else { return .busyOrFailed }
+        checkingConnection = true
+        defer { checkingConnection = false }
+        // A call may only delay a re-key; a front that is not proved is suspect meanwhile.
+        switch await P2PManager.shared.checkHealth(key: w.id, urgent: urgent, userAsked: userAsked,
+                                                   callActive: activeCall != nil) {
+        case .moved:
+            guard current?.id == w.id else { return .busyOrFailed }
+            // What is still in flight to the old URL is cut; everything is bound again.
+            RawSink.cancel(base: bound)
+            realtime.disconnect()
+            await activate(w)
+            return .rebound
+        case .unchanged:
+            // The front is gone (closed elsewhere, or another host now) or has moved under another
+            // check: bind again.
+            if P2PManager.shared.liveBase(for: w.id, nodeId: w.nodeId) != bound, current?.id == w.id {
+                RawSink.cancel(base: bound)
+                await activate(w)
+                return .rebound
+            }
+            return FrontProof.isHealthy(.proved, maySend: RawSink.allows(bound)) ? .healthy : .busyOrFailed
+        case .unproved:
+            // Asked again soon (a re-key delayed by a call, a check that was running).
+            if proofRetry == nil {
+                proofRetry = Task { @MainActor in
+                    try? await Task.sleep(for: .seconds(3))
+                    self.proofRetry = nil
+                    if self.appActive || self.activeCall != nil { await self.checkConnection(urgent: true) }
+                }
+            }
+            return .busyOrFailed
+        }
+    }
+    private var proofRetry: Task<Void, Never>?
+    private var checkingConnection = false
+
+    /// Relays are off and there has been no direct way to the host for a while (`DirectOnlyRule`).
+    @Published private(set) var cannotReachDirectly = false
+    private var directOnly = DirectOnlyRule()
+    private func noteReachability() {
+        let w = current.flatMap { $0.nodeId != nil && !$0.isSignedOut ? $0 : nil }
+        let shows = directOnly.note(workspace: w?.id, usable: connection.isUsable, relaysOff: !P2PManager.publicFallback, now: Date())
+        if shows != cannotReachDirectly { cannotReachDirectly = shows }
+    }
+
+    /// "Turn on" in the notice above (asked for, and confirmed).
+    func useRelayWhenNeeded() async {
+        P2PManager.publicFallback = true
+        NotificationState.publicFallback = true
+        cannotReachDirectly = false
+        await reconnectAfterTransportSettingChange()
+    }
+
+    /// "Retry" on the "Host is offline" banner: dial now, not when the backoff says.
+    func retryConnection() async {
+        guard let w = current, !w.isSignedOut else { return }
+        if LiveBase.url(liveBinding, for: w.id).isEmpty {
+            reconnectTask?.cancel()
             await activate(w)
         } else {
-            realtime.reconnectNow()
+            await checkConnection(urgent: true, userAsked: true)
         }
     }
 
-    /// The relay setting changed: existing sessions were dialed under the old rule, so drop them
-    /// and dial again.
+    /// The relay setting changed: every connection is replaced under the new setting BEHIND
+    /// its front (turning relays off closes the relayed ones at once, in the core); nothing is
+    /// re-bound. If the active workspace was offline, it is dialed under the new setting.
     func reconnectAfterTransportSettingChange() async {
-        await P2PManager.shared.disconnectAll()
-        if let w = current { await activate(w) }
+        guard await P2PManager.shared.applyRelaySetting() else {
+            // Fail closed: nothing stays connected under a setting that could not be applied.
+            realtime.disconnect()
+            liveBinding = nil
+            liveCredential = nil
+            enqueueNotice(SecurityAlert(
+                title: "Disconnected",
+                message: "Skwod couldn't confirm that relayed connections were closed, so it disconnected from every host. Close Skwod and open it again to reconnect without a relay."))
+            return
+        }
+        guard let w = current, !w.isSignedOut else { return }
+        if LiveBase.url(liveBinding, for: w.id).isEmpty {
+            reconnectTask?.cancel()
+            await activate(w)
+        } else {
+            realtime.reconnectNow()
+            catchUp()
+        }
     }
 
     /// Whether I may create servers in this skwod (host-only + grantable). Defaults open until
@@ -904,7 +1305,7 @@ final class AppState: ObservableObject {
         guard let token = session?.token, let base = URL(string: serverURL), !serverURL.isEmpty else { return }
         var req = URLRequest(url: base.appendingPathComponent("api/instance/can-create-servers"))
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+        guard let (data, resp) = try? await RawSink.data(for: req),
               (resp as? HTTPURLResponse)?.statusCode == 200,
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any] else { return }
         canCreateServers = obj["can_create"] as? Bool ?? true
@@ -921,13 +1322,32 @@ final class AppState: ObservableObject {
     /// Run a periodic inbox sync while this workspace is active: as a host it fulfills members'
     /// provision requests (auto-join case); for anyone it installs relayed keys. Idempotent + cheap.
     /// Also heartbeats presence (~once a minute) so members lists can show who's online.
+    private var rebindPacer = RebindPacer()
+    private let connectionWatch = ConnectionWatch()
     private func startInboxSync() {
         inboxTask?.cancel()
+        // The indicator and the health probe run on their own: a sync pass can wait half a minute
+        // for a host that has gone, and "Reconnecting…" does not wait with it. A dead connection is
+        // replaced instead of shown as "Reconnecting…" until a relaunch.
+        connectionWatch.start { [weak self] tick in
+            guard let self, let w = self.current, w.nodeId != nil, !w.isSignedOut else { return }
+            #if os(iOS)
+            guard ConnectionWatch.looks(appActive: self.appActive, inBackground: UIApplication.shared.applicationState == .background,
+                                        callActive: self.activeCall != nil) else { return }
+            #endif
+            await P2PManager.shared.refresh(key: w.id)
+            self.noteReachability()
+            if tick % Int(SessionHealthRule.foregroundInterval / 5) == 2 { await self.checkConnection(urgent: false) }
+        }
         inboxTask = Task { [weak self] in
             var tick = 0
             var failures = 0
             while !Task.isCancelled {
-                if let self, let client = self.client, let me = self.session?.userId {
+                // One pass is one client, its bind and its workspace — taken together, here: what is
+                // asked through it is applied to nothing else.
+                if let self, let asked = self.bound, let workspace = self.current, asked.workspaceId == workspace.id,
+                   let me = self.session?.userId {
+                    let client = asked.client
                     // The mailbox (DMs, keys, provision requests) is synced when the server says
                     // something is in it (`sealed` → `syncMailbox`) and when the socket comes up;
                     // this is the slow safety net behind those: every 30 s, or right away while
@@ -940,41 +1360,61 @@ final class AppState: ObservableObject {
                             bound = try await client.bindSession()
                             _ = try await client.processControlInbox(myUserId: me)
                             failures = 0
-                            if self.hostNewerWorkspaceId == self.current?.id { self.hostNewerWorkspaceId = nil }
+                            self.rebindPacer.succeeded(workspace.id)
+                            if self.hostNewerWorkspaceId == workspace.id { self.hostNewerWorkspaceId = nil }
                             await self.drainDmEvents()
                             await self.surfaceSecurityNotices()
                         } catch {
+                            let stillOurs = { !Task.isCancelled && self.bound?.client === client && self.bound?.turn == asked.turn && self.current?.id == workspace.id }
+                            guard stillOurs() else { return }
                             // Removed, superseded, or a restore still waiting: its screen is up.
                             if await self.routeIfDeviceError(error) { return }
+                            guard stillOurs() else { return }
                             failures += 1
                             // What the refusal means (`SessionRefusal`): never a silent sign-out,
-                            // never a wipe. Only a 401 on /api/auth/me ends the session, and then
-                            // for this skwod only, with its log-in screen saying so.
-                            var updateRequired = false
+                            // never a wipe. Only the host's confirmed 401 about the current token
+                            // ends the session (`endIfHostEnded`), and then for this skwod only,
+                            // with its log-in screen saying so.
+                            var updateRequired = false, replaced = false
                             if case CoreError.UpdateRequired = error { updateRequired = true }
-                            let signedOut = updateRequired ? false : await client.sessionState() == .signedOut
+                            if case CoreError.SignInReplaced = error { replaced = true }
+                            let signedOut = updateRequired ? false : await self.endIfHostEnded(workspace, asked: asked)
+                            guard signedOut || stillOurs() else { return }
                             let decision = SessionRefusal.decide(.init(
                                 errorText: String(describing: error), updateRequired: updateRequired,
                                 sessionSignedOut: signedOut, isRegisteredDevice: self.deviceId != nil,
                                 bindSucceeded: bound))
                             Log.app.info("sync refused: \(String(describing: decision), privacy: .public)")
-                            switch decision {
+                            switch SyncFailureRule.step(signedOut: signedOut, deviceStopped: decision == .deviceStopped, signInReplaced: replaced) {
                             case .signedOut:
-                                if let w = self.current { await self.handleSignedOut(w); return }
-                            case .updateApp:
-                                failures = 0
-                                self.hostNewerWorkspaceId = self.current?.id
-                            case .linkDevice:
-                                self.needsDeviceLink = true
+                                return
+                            case .rebind:
+                                // Local (nothing was sent): bind again — this workspace, if this
+                                // client is still the one bound. Backing off, capped.
+                                if let wait = self.rebindPacer.next(workspace.id) {
+                                    Task { @MainActor in
+                                        try? await Task.sleep(for: .seconds(wait))
+                                        guard self.bound?.client === client, self.current?.id == workspace.id, self.liveRecord(workspace) != nil else { return }
+                                        await self.activate(workspace)
+                                    }
+                                    return
+                                }
                             case .deviceStopped:
                                 await self.routeDeviceState()
-                            case .bindThenRetry, .transient:
-                                break
+                            case .other:
+                                switch decision {
+                                case .updateApp:
+                                    failures = 0
+                                    self.hostNewerWorkspaceId = workspace.id
+                                case .linkDevice:
+                                    self.needsDeviceLink = true
+                                case .signedOut, .deviceStopped, .bindThenRetry, .transient:
+                                    break
+                                }
                             }
                         }
                     }
-                    if let nodeId = self.current?.nodeId { await P2PManager.shared.refresh(nodeId: nodeId) }
-                    if tick % 12 == 0 { await self.heartbeatPresence() }
+                    if tick % 12 == 0 { await self.heartbeatPresence(periodic: true) }
                     if tick % 6 == 0 { await self.refreshPrimaryChannel() }
                     if tick % 12 == 6 { await self.checkAddressRecord() }
                     // Seed everyone's presence app-wide (~30s) so every surface — DM rows, people
@@ -992,23 +1432,21 @@ final class AppState: ObservableObject {
         get { UserDefaults.standard.string(forKey: "skwod.myStatus") ?? "online" }
         set {
             UserDefaults.standard.set(newValue, forKey: "skwod.myStatus")
-            realtime.sendPresence(effectiveStatus)   // instant fan-out over the socket
-            Task { await heartbeatPresence() }        // REST fallback keeps last_seen fresh
+            Task { await heartbeatPresence() }
         }
     }
 
-    /// Whether the app is in the foreground. When it isn't (backgrounded/closed), we present as
-    /// offline immediately instead of waiting out the server's 3-minute stale window — so closing
-    /// the app reads as offline to everyone right away (parity with Android).
+    /// Whether the app is in the foreground. When it isn't, this device says nothing about the
+    /// account: closing its socket (`Realtime.suspend`) is what takes it offline, at once, when no
+    /// other device of the account is connected (`PresenceAnnounce`).
     var appActive = true
-    private var effectiveStatus: String { appActive ? myStatus : "offline" }
+    private var effectiveStatus: String? { PresenceAnnounce.status(active: appActive, chosen: myStatus) }
 
     /// Called from the scene-phase observer as the app enters foreground/background.
     func setActive(_ active: Bool) {
         appActive = active
         realtime.appActive = active
-        realtime.sendPresence(effectiveStatus)   // flip on the socket immediately
-        Task { await heartbeatPresence() }
+        if active { Task { await heartbeatPresence() } } else { realtime.sendPresence(nil) }
     }
 
     /// Fetch every subscribed server's member statuses and seed the realtime store, so presence
@@ -1016,26 +1454,31 @@ final class AppState: ObservableObject {
     func pollPresence() async {
         guard let token = session?.token, !serverURL.isEmpty, let base = URL(string: serverURL) else { return }
         var statuses: [String: String] = [:]
+        let askedAt = PresenceClock.now
         for sid in realtime.subscribedServerIds where !sid.isEmpty && sid != "demo" {
             var req = URLRequest(url: base.appendingPathComponent("api/servers/\(sid)/members"))
             req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-            guard let (data, resp) = try? await URLSession.shared.data(for: req),
+            guard let (data, resp) = try? await RawSink.data(for: req),
                   (resp as? HTTPURLResponse)?.statusCode == 200,
                   let parsed = try? JSONDecoder().decode(PresenceMemberList.self, from: data) else { continue }
             for m in parsed.members { statuses[m.userId] = m.status }
         }
-        if !statuses.isEmpty { realtime.seedPresence(statuses) }
+        if statuses.isEmpty { realtime.presenceUnheard() } else { realtime.seedPresence(statuses, askedAt: askedAt) }
     }
 
-    /// Push my current status + liveness to the server (members lists stale silent users offline).
-    func heartbeatPresence() async {
+    /// Say my current status: over the socket, or (without one) to the server's API. `periodic`:
+    /// the once-a-minute repeat, which a live socket does by itself (`Realtime.startPing`).
+    func heartbeatPresence(periodic: Bool = false) async {
+        guard let status = periodic ? PresenceAnnounce.periodic(active: appActive, chosen: myStatus) : effectiveStatus else { return }
+        if !periodic { realtime.sendPresence(status) }
+        guard !realtime.isLive else { return }
         guard let token = session?.token, !serverURL.isEmpty, let base = URL(string: serverURL) else { return }
         var req = URLRequest(url: base.appendingPathComponent("api/profiles/me/status"))
         req.httpMethod = "PUT"
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
         req.setValue("application/json", forHTTPHeaderField: "Content-Type")
-        req.httpBody = try? JSONSerialization.data(withJSONObject: ["status": effectiveStatus])
-        _ = try? await URLSession.shared.data(for: req)
+        req.httpBody = try? JSONSerialization.data(withJSONObject: ["status": status])
+        _ = try? await RawSink.data(for: req)
     }
 
     /// Adopt a session just obtained from the skwod at `address`: create/replace its workspace,
@@ -1144,27 +1587,135 @@ final class AppState: ObservableObject {
     /// Tokens are rotated about once a week.
     private static let tokenMaxAgeMs: Int64 = 7 * 24 * 60 * 60 * 1000
 
+    /// What a workspace presents now: its stored record and (through a front) its credential.
+    struct Armed { let workspace: Workspace; let credential: String? }
+    private let arming = SerialByKey()
+
+    /// Sign the STORED record of `workspaceId` in to the front at `base` (nothing to do for an
+    /// https server) and, with `rotate`, swap a token older than a week for a fresh one. One at a
+    /// time per workspace: overlapping activates, ring checks and rotations see each other's
+    /// result. The fresh token is persisted before anything else can fail. Nil: signed out or
+    /// removed, or no sign-in right now — never a reason to drop the stored token.
+    private func arm(_ workspaceId: String, base: String, rotate: Bool) async -> Armed? {
+        // (The wait is bounded; what was started is not cut short, and nothing overtakes it.)
+        await arming.run(workspaceId, deadline: .seconds(45)) { [self] in
+            var session: P2pSession?
+            let front = isFront(base)
+            if front {
+                guard let w = workspaces.first(where: { $0.id == workspaceId }),
+                      let s = P2PManager.shared.session(for: w.id, nodeId: w.nodeId), s.baseUrl() == base else { return nil }
+                session = s
+            }
+            let flow = ArmFlow<Workspace>(
+                stored: { self.workspaces.first { $0.id == workspaceId && !$0.isSignedOut } },
+                isStored: { self.liveRecord($0) != nil },
+                signIn: { await session?.signIn(token: $0.token) },
+                rotate: { await self.rotatedIfDue($0, base: base, presenting: $1) },
+                rotateToken: { await session?.rotateToken(credential: $0, token: $1.token) ?? false },
+                clear: { _ = await session?.clearCredential(credential: $0) })
+            return await flow.run(throughFront: front, rotating: rotate).map { Armed(workspace: $0.record, credential: $0.credential) }
+        }
+    }
+
+    /// The ONE way a session ends because of what the server answered: the core confirmed that
+    /// the host refused the current token (twice, over the connection itself), and what was asked
+    /// is still what is bound and stored. Anything else keeps the token.
+    @discardableResult
+    private func endIfHostEnded(_ w: Workspace, asked: BoundClient<SkwodClient>? = nil) async -> Bool {
+        guard let mine = asked ?? bound, mine.workspaceId == w.id else { return false }
+        let confirmed = await mine.client.sessionState() == .signedOut
+        guard !Task.isCancelled,
+              SignOutRule.mayEnd(confirmed: confirmed,
+                                 sameBind: bound?.client === mine.client && bound?.workspaceId == w.id && bound?.turn == mine.turn,
+                                 sameRecord: liveRecord(w) != nil) else { return false }
+        await handleSignedOut(w)
+        return true
+    }
+
     /// Swap a token older than a week for a fresh one and persist it (with its issue date).
     /// Returns the updated workspace, or nil when no rotation happened — not due, or the server
-    /// could not do it right now (the old token stays in use; a 401 is dealt with by the session
-    /// check that follows binding).
-    private func rotatedIfDue(_ w: Workspace, base: String) async -> Workspace? {
+    /// could not do it right now (the old token stays in use). Only under `arm`'s lock.
+    /// `presenting`: through a front, the credential to rotate with (the front injects the token).
+    private func rotatedIfDue(_ w: Workspace, base: String, presenting: String? = nil) async -> Workspace? {
         let now = Int64(Date().timeIntervalSince1970 * 1000)
         var due = now - (w.tokenIssuedAt ?? 0) > Self.tokenMaxAgeMs
         #if DEBUG
         if E2E.env("SKWOD_E2E_ROTATE") == "1", !E2E.rotatedOnce { due = true }
         #endif
-        guard due, !w.isSignedOut, let fresh = try? await rotateSession(baseUrl: base, token: w.token) else { return nil }
+        guard due, !w.isSignedOut,
+              let wire = WireRule.of(baseIsFront: isFront(base), credential: presenting, token: w.token) else { return nil }
         #if DEBUG
         E2E.rotatedOnce = true
         #endif
-        var updated = w
-        updated.token = fresh.token
-        updated.expiresAt = fresh.expiresAt
-        updated.tokenIssuedAt = now
-        store(updated)
-        Log.app.info("session token rotated")
-        return updated
+        #if os(iOS)
+        // Going to the background meanwhile: let it finish (the host has rotated; the answer is
+        // what must reach the Keychain).
+        let hold = BackgroundHold("rotate session", system: .uikit)
+        defer { hold.end() }
+        #endif
+        let flow = RotationFlow<Workspace>(
+            storeKey: {
+                if let key = self.liveRecord(w)?.rotationKey, !key.isEmpty { return key }
+                let key = newRotationKey()
+                guard self.liveRecord(w) != nil, let (_, saved) = self.patch(w.id, { $0.rotationKey = key }), saved else {
+                    self.patch(w.id) { $0.rotationKey = nil }
+                    return nil
+                }
+                return key
+            },
+            ask: { key in
+                guard let s = try? await rotateSession(baseUrl: base, token: wire, rotationKey: key), s.userId == w.userId else { return nil }
+                return (s.userId, s.token, s.expiresAt)
+            },
+            // Signed out (or another token stored) meanwhile: never overwritten with this one.
+            stillStored: { self.liveRecord(w) != nil },
+            persist: { fresh in
+                let before = self.workspaces.first { $0.id == w.id }
+                guard let (record, saved) = self.patch(w.id, { $0.token = fresh.token; $0.expiresAt = fresh.expiresAt; $0.tokenIssuedAt = now; $0.rotationKey = nil }) else { return nil }
+                if saved { return record }
+                // Not written: nothing uses it. The old token goes on (its grace), the key asks again.
+                if let before { self.patch(w.id) { $0 = before } }
+                return nil
+            })
+        switch await flow.run() {
+        case .rotated(let record):
+            rotationRetries[w.id] = nil
+            Log.app.info("session token rotated")
+            return record
+        case .notDue: return nil
+        case .again:
+            rotateAgain(w.id, base: base)
+            return nil
+        }
+    }
+    private var rotationRetries: [String: Int] = [:]
+
+    /// A rotation that did not come to its end is asked for again, while the old token's grace runs.
+    private func rotateAgain(_ id: String, base: String) {
+        let n = rotationRetries[id] ?? 0
+        let waits: [Double] = [10, 30, 60]
+        guard n < waits.count else { return }
+        rotationRetries[id] = n + 1
+        Task { @MainActor in
+            try? await Task.sleep(for: .seconds(waits[n]))
+            let before = self.workspaces.first { $0.id == id }?.token
+            guard self.workspaces.first(where: { $0.id == id })?.rotationKey != nil,
+                  let armed = await self.arm(id, base: base, rotate: true) else { return }
+            // (Through a front the credential stays; an https client holds the token itself.)
+            if armed.workspace.token != before, armed.credential == nil, self.current?.id == id { await self.activate(armed.workspace) }
+        }
+    }
+
+    /// Change fields of the record AS IT IS STORED NOW, and persist. Nil: there is none.
+    @discardableResult
+    private func patch(_ id: String, _ edit: (inout Workspace) -> Void) -> (record: Workspace, saved: Bool)? {
+        guard var latest = workspaces.first(where: { $0.id == id }) else { return nil }
+        edit(&latest)
+        workspaces = Workspace.revalidatingNames(workspaces.map { $0.id == id ? latest : $0 })
+        let saved = WorkspaceStore.save(workspaces)
+        let record = workspaces.first { $0.id == id } ?? latest
+        if current?.id == id { current = record }
+        return (record, saved)
     }
 
     /// Replace the stored copy of a workspace (same id) and persist.
@@ -1194,18 +1745,18 @@ final class AppState: ObservableObject {
     /// keys, cache and the pinned server identity stay), stop syncing, and show log-in. A Mac
     /// that hosts this skwod signs its owner straight back in with the login in its Keychain.
     func handleSignedOut(_ w: Workspace) async {
-        guard let stored = workspaces.first(where: { $0.id == w.id }), !stored.isSignedOut else { return }
+        // (Only the session it was about: a token stored since is kept.)
+        guard let stored = workspaces.first(where: { $0.id == w.id }), !stored.isSignedOut, stored.token == w.token else { return }
         #if os(macOS)
         // The saved password goes only to the child this app started, freshly challenged.
         if stored.server == HostManager.localURL, let local = await HostManager.shared.verifiedLocalURL(),
            let saved = HostManager.shared.ownerLogin,
            let s = try? await login(baseUrl: local, username: saved.username, password: saved.password),
            s.userId == stored.userId {
-            var updated = stored
-            updated.token = s.token
-            updated.expiresAt = s.expiresAt
-            updated.tokenIssuedAt = Int64(Date().timeIntervalSince1970 * 1000)
-            store(updated)
+            guard let (updated, _) = patch(stored.id, {
+                $0.token = s.token; $0.expiresAt = s.expiresAt; $0.rotationKey = nil
+                $0.tokenIssuedAt = Int64(Date().timeIntervalSince1970 * 1000)
+            }) else { return }
             Log.app.info("host owner signed back in")
             if current?.id == updated.id { await activate(updated) }
             return
@@ -1214,7 +1765,11 @@ final class AppState: ObservableObject {
         var updated = stored
         updated.token = ""
         updated.expiresAt = 0
+        updated.rotationKey = nil
         store(updated)
+        DirectRoutes.forget(updated.id)
+        // Its front injects nothing any more (and is re-armed only by a new sign-in).
+        if updated.nodeId != nil { _ = await P2PManager.shared.session(for: updated.id)?.clearSession(token: stored.token) }
         Log.app.info("session ended by the server; showing log-in")
         // Found out while not in front (a push or a call woke the app), or about a skwod that
         // is not the one on screen: say so, since no log-in screen is there to say it.
@@ -1254,7 +1809,7 @@ final class AppState: ObservableObject {
         var out: [(workspace: Workspace, ring: RingInfo)] = []
         for w in workspaces where !w.isSignedOut {
             let asker: SkwodClient
-            if w.id == current?.id, let client, !liveBase.isEmpty {
+            if w.id == current?.id, let client, clientIsOnline, !liveBase.isEmpty {
                 asker = client
             } else {
                 // Another skwod: a throwaway client holding only that session — no cache, no keys.
@@ -1262,13 +1817,17 @@ final class AppState: ObservableObject {
                 #if os(macOS)
                 if let plain = base { base = await HostManager.shared.gatedBase(plain) }   // own server: proven first
                 #endif
-                if let nodeId = w.nodeId { base = try? await P2PManager.shared.connect(nodeId: nodeId) }
-                guard let base, !base.isEmpty else { continue }
-                asker = SkwodClient(baseUrl: base, token: w.token)
+                if let nodeId = w.nodeId { base = try? await P2PManager.shared.connect(nodeId: nodeId, key: w.id) }
+                // Through its own front: signed in there (in turn with everything else that does),
+                // presenting only the credential.
+                guard let base, !base.isEmpty, RawSink.allows(base) || !isFront(base),
+                      let armed = await arm(w.id, base: base, rotate: false),
+                      let presenting = WireRule.of(baseIsFront: isFront(base), credential: armed.credential, token: armed.workspace.token) else { continue }
+                asker = SkwodClient(baseUrl: base, token: presenting)
             }
             if let rings = try? await asker.pendingRings() {
                 out += rings.map { (workspace: w, ring: $0) }
-            } else if await asker.sessionState() == .signedOut {
+            } else if SignOutRule.mayEnd(confirmed: await asker.sessionState() == .signedOut, sameBind: true, sameRecord: liveRecord(w) != nil) {
                 await handleSignedOut(w)
             }
         }
@@ -1278,8 +1837,8 @@ final class AppState: ObservableObject {
     /// Ask the server whether the active workspace's session still stands — called wherever the
     /// app would otherwise conclude "unreachable".
     func checkSession() async {
-        guard let client, let w = current, !liveBase.isEmpty else { return }
-        if await client.sessionState() == .signedOut { await handleSignedOut(w) }
+        guard let w = current, !liveBase.isEmpty else { return }
+        await endIfHostEnded(w)
     }
 
     /// Resolve an address to a base URL usable right now (dialing a p2p host if needed).
@@ -1384,15 +1943,13 @@ final class AppState: ObservableObject {
         // for that workspace NOW (a token rotated or a sign-out meanwhile is not undone by a
         // stale copy), and only if it is still the one on screen.
         guard current?.id == w.id, liveBase == askedBase,
-              var updated = workspaces.first(where: { $0.id == w.id }), !updated.isSignedOut else { return }
-        updated.addressTs = rec.ts
-        if let nodeId = w.nodeId {
-            guard P2PManager.shared.liveBase(for: nodeId) == askedBase else { return }   // not over p2p: ignore
-            updated.fallbackURL = rec.address
+              let stored = workspaces.first(where: { $0.id == w.id }), !stored.isSignedOut else { return }
+        if stored.nodeId != nil {
+            guard P2PManager.shared.liveBase(for: w.id) == askedBase else { return }   // not over p2p: ignore
+            patch(w.id) { $0.addressTs = rec.ts; $0.fallbackURL = rec.address }
+        } else {
+            patch(w.id) { $0.addressTs = rec.ts }
         }
-        workspaces = workspaces.map { $0.id == w.id ? updated : $0 }
-        WorkspaceStore.save(workspaces)
-        if current?.id == w.id { current = updated }
         if !w.isP2P, rec.address != w.server {
             _ = await reconnectIfKnown(.https(rec.address), liveBase: rec.address)
         }
@@ -1450,19 +2007,27 @@ final class AppState: ObservableObject {
         // through log-in, which then finds the same workspace — its keys and messages — again.)
         guard let identity = try? await fetchServerIdentity(baseUrl: base),
               let known = workspaces.first(where: { $0.instanceId != nil && $0.instanceId == identity.instanceId && !$0.isSignedOut }),
-              let pinned = known.pinnedKey, await proves(base, pinned)
+              let pinned = known.pinnedKey
         else { return false }
-        var moved = known
-        moved.server = address.stored
-        if case .p2p(let nodeId, _) = address {
-            moved.nodeId = nodeId
-            moved.fallbackURL = known.fallbackURL   // never from the link's `?u=`
-        } else {
-            moved.nodeId = nil
-            moved.fallbackURL = nil
-        }
-        workspaces = workspaces.map { $0.id == known.id ? moved : $0 }
-        WorkspaceStore.save(workspaces)
+        let newNode: String? = { if case .p2p(let n, _) = address { return n } else { return nil } }()
+        // The same session continues at the new address: the old front is closed here and the host
+        // is told nothing (`SessionEnd.moved`).
+        let flow = MoveFlow<Workspace>(
+            proves: { await self.proves(base, pinned) },
+            latest: { self.workspaces.first { $0.id == known.id && !$0.isSignedOut && $0.pinnedKey == pinned } },
+            closeFront: {
+                guard let stored = self.workspaces.first(where: { $0.id == known.id }), stored.nodeId != nil, stored.nodeId != newNode,
+                      let old = P2PManager.shared.detach(key: known.id) else { return }
+                await old.disconnect()
+            },
+            write: {
+                self.patch(known.id) {
+                    $0.server = address.stored
+                    $0.nodeId = newNode
+                    if newNode == nil { $0.fallbackURL = nil }   // (kept for p2p; never from the link's `?u=`)
+                }?.record
+            })
+        guard let moved = await flow.run() else { return false }
         KnownServerStore.remember(address: moved.server, name: moved.displayName)
         await activate(moved)
         return true
@@ -1504,14 +2069,10 @@ final class AppState: ObservableObject {
             // Before the session ends: this skwod can no longer wake this install (docs/PUSH.md).
             PushManager.shared.release(w, base: w.id == liveId ? liveBase : nil)
             #endif
-            revokeSession(w, base: w.id == liveId ? liveBase : nil)
-            if let nodeId = w.nodeId { Task { await P2PManager.shared.disconnect(nodeId: nodeId) } }
-            var updated = w
-            updated.token = ""
-            updated.expiresAt = 0
-            workspaces = workspaces.map { $0.id == updated.id ? updated : $0 }
+            endSession(w, base: w.id == liveId ? liveBase : nil, ending: targets)
+            patch(w.id) { $0.token = ""; $0.expiresAt = 0; $0.rotationKey = nil }
+            DirectRoutes.forget(w.id)
         }
-        WorkspaceStore.save(workspaces)
         AttachmentCache.wipe()   // decrypted copies never outlive the session that made them
         Log.app.info("signed out; this device's keys and messages stay")
         guard let liveId, targets.contains(where: { $0.id == liveId }) else { return }
@@ -1556,12 +2117,55 @@ final class AppState: ObservableObject {
     private func revokeSession(_ w: Workspace, base: String?) {
         let live = (base?.isEmpty == false) ? base : nil
         guard let root = live ?? ((!w.isP2P && w.server.hasPrefix("https://")) ? w.server : nil),
+              // Never the token to a front (or anything shaped like one): that is `endSession`'s.
+              !isFrontBase(baseUrl: root), !isFrontSuspect(baseUrl: root),
               let url = URL(string: root)?.appendingPathComponent("api/auth/logout") else { return }
         var req = URLRequest(url: url, timeoutInterval: 4)
         req.httpMethod = "POST"
         req.setValue("Bearer \(w.token)", forHTTPHeaderField: "Authorization")
-        Task.detached { _ = try? await URLSession.shared.data(for: req) }
+        Task.detached { _ = try? await RawSink.data(for: req) }
     }
+
+    /// Build 51: the session of `w` ends here. Through its p2p front the host is told over the
+    /// member connection itself (`P2pSession.logout`, bounded) — never through the loopback port —
+    /// and the front's token is cleared before that returns; only then is the front closed. An
+    /// https skwod is told as before.
+    /// `ending`: every entry that ends now.
+    private func endSession(_ w: Workspace, base: String?, ending: [Workspace]) {
+        // Another entry of this device, which stays, uses the very same session: only this one's
+        // front goes.
+        let staying = workspaces.filter { kept in kept.id != w.id && !ending.contains { $0.id == kept.id } }
+        guard SessionEnd.tellsHost(.signOut, token: w.token, others: staying.map(\.token)) else {
+            if let s = P2PManager.shared.detach(key: w.id) { Task { await s.disconnect() } }
+            return
+        }
+        // By what the session is bound through: an https server is told directly (its push
+        // unregister is `PushManager.release`'s); a p2p front through the core.
+        let boundIsFront = base.map { isFrontBase(baseUrl: $0) || isFrontSuspect(baseUrl: $0) } ?? false
+        switch SignOutRoute.of(boundBase: base, boundIsFront: boundIsFront, isP2P: w.nodeId != nil) {
+        case .server, .none: revokeSession(w, base: base); return
+        case .front: break
+        }
+        // Out of the map NOW: a sign-in that follows dials its own front.
+        let s = P2PManager.shared.detach(key: w.id)
+        let token = w.token
+        Task {
+            guard let s else { return }
+            #if os(iOS)
+            let push = true
+            #else
+            let push = false
+            #endif
+            // The core takes and clears the token, then unregisters and logs out with it. A front
+            // that held no token (never signed in here) is signed in once to say so.
+            if !(await s.endSession(unregisterPush: push, timeoutMs: 4000)), !token.isEmpty, await s.signIn(token: token) != nil {
+                _ = await s.endSession(unregisterPush: push, timeoutMs: 4000)
+            }
+            await s.disconnect()
+        }
+    }
+
+
 
     /// The encrypted cache AND its SQLite side files (`-wal`, `-shm`, `-journal`), which hold
     /// recent pages of the same data.
@@ -1615,7 +2219,9 @@ final class AppState: ObservableObject {
         inboxTask?.cancel()
         reconnectTask?.cancel()
         realtime.disconnect()
-        if let nodeId = w.nodeId { Task { await P2PManager.shared.disconnect(nodeId: nodeId) } }
+        // (A signed-in skwod's front is closed by `endSession`, after its logout; one signed out
+        // already has nothing to say.)
+        if w.nodeId != nil, w.isSignedOut { let key = w.id; Task { await P2PManager.shared.disconnect(key: key) } }
         noticeQueue.removeAll()
         securityNotice = nil
         dropClient()
@@ -1649,7 +2255,7 @@ final class AppState: ObservableObject {
                 try await client.eraseDevice(evenIfOffline: evenIfOffline)
             }
         }
-        revokeSession(w, base: liveBase)
+        endSession(w, base: liveBase, ending: [w])
         Log.app.info("this device was erased")
         deleteLocalData(of: w)
     }
@@ -1665,8 +2271,7 @@ final class AppState: ObservableObject {
     /// Every skwod's local data, signed in or not (factory reset, account deletion).
     private func deleteAllLocalData() {
         let liveId = current?.id
-        for w in workspaces { revokeSession(w, base: w.id == liveId ? liveBase : nil) }
-        Task { await P2PManager.shared.disconnectAll() }
+        for w in workspaces { endSession(w, base: w.id == liveId ? liveBase : nil, ending: workspaces) }
         for w in workspaces { deleteLocalData(of: w) }
         StreamedUpload.removeAllWork()
         SharedContainer.wipeSharedState()
@@ -1681,6 +2286,13 @@ final class AppState: ObservableObject {
     /// used again, so its local data goes too.
     func accountDeleted() {
         guard let w = current else { return }
+        if w.nodeId != nil {
+            let (key, token) = (w.id, w.token)
+            Task {
+                _ = await P2PManager.shared.session(for: key)?.clearSession(token: token)
+                await P2PManager.shared.disconnect(key: key)
+            }
+        }
         deleteLocalData(of: w)
     }
 
@@ -1790,7 +2402,12 @@ struct SkwodApp: App {
                     // Center): the server is told, so it pushes instead of trusting the socket.
                     app.pushPhase(phase == .active ? .active : phase == .background ? .background : .inactive)
                     #endif
-                    if phase == .active { appLock.didBecomeActive(); MentionBadges.reload(); Task { await app.enterForeground() } }
+                    if phase == .active {
+                        #if os(iOS)
+                        app.store.becameActive()
+                        #endif
+                        appLock.didBecomeActive(); MentionBadges.reload(); Task { await app.enterForeground() }
+                    }
                     // Looking at a chat again: what Notification Center holds about it is read.
                     if phase == .active, let topic = app.realtime.focusedTopic { app.realtime.clearDelivered(topic: topic) }
                     if phase == .background { appLock.didEnterBackground(); app.enterBackground() }
@@ -1931,6 +2548,17 @@ struct SkwodApp: App {
         }
         #else
         MainView()
+        #endif
+    }
+}
+
+extension BackgroundTime {
+    /// iOS: UIKit's (`uikit`). The Mac suspends nothing and has no gate.
+    static var platform: BackgroundTime? {
+        #if os(iOS)
+        return .uikit
+        #else
+        return nil
         #endif
     }
 }

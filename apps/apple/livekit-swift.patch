@@ -1,0 +1,164 @@
+diff --git a/Package.swift b/Package.swift
+index 4bca8cb3..68b64bab 100644
+--- a/Package.swift
++++ b/Package.swift
+@@ -21,10 +21,6 @@ let package = Package(
+         // LK-Prefixed Dynamic WebRTC XCFramework
+         .package(url: "https://github.com/livekit/webrtc-xcframework.git", exact: "150.7871.04"),
+         .package(url: "https://github.com/livekit/livekit-ffi-xcframework.git", exact: "0.13.1"),
+-        // Test-only: conformance oracle for the nanopb facades.
+-        .package(url: "https://github.com/apple/swift-protobuf.git", from: "1.31.0"),
+-        // Only used for DocC generation
+-        .package(url: "https://github.com/apple/swift-docc-plugin.git", from: "1.3.0"),
+     ],
+     targets: [
+         .target(
+@@ -61,46 +57,6 @@ let package = Package(
+                 .process("PrivacyInfo.xcprivacy"),
+             ],
+         ),
+-        .testTarget(
+-            // SwiftProtobuf is a test-only conformance oracle here: the same
+-            // protos are compiled with protoc-gen-swift so every nanopb-encoded
+-            // payload can be verified against a second, independent implementation.
+-            name: "LiveKitNanopbTests",
+-            dependencies: [
+-                "LiveKit",
+-                "LiveKitNanopb",
+-                .product(name: "SwiftProtobuf", package: "swift-protobuf"),
+-            ],
+-        ),
+-        .target(
+-            name: "LiveKitTestSupport",
+-            dependencies: [
+-                "LiveKit",
+-            ],
+-            path: "Tests/LiveKitTestSupport",
+-        ),
+-        .testTarget(
+-            name: "LiveKitCoreTests",
+-            dependencies: [
+-                "LiveKit",
+-                "LiveKitTestSupport",
+-                .product(name: "LiveKitFFI", package: "livekit-ffi-xcframework"),
+-            ],
+-        ),
+-        .testTarget(
+-            name: "LiveKitAudioTests",
+-            dependencies: [
+-                "LiveKit",
+-                "LiveKitTestSupport",
+-            ],
+-        ),
+-        .testTarget(
+-            name: "LiveKitObjCTests",
+-            dependencies: [
+-                "LiveKit",
+-                "LiveKitTestSupport",
+-            ],
+-        ),
+     ],
+     swiftLanguageModes: [.v5, .v6],
+ )
+diff --git a/Package@swift-6.2.swift b/Package@swift-6.2.swift
+index 78400e46..ce01d8df 100644
+--- a/Package@swift-6.2.swift
++++ b/Package@swift-6.2.swift
+@@ -22,10 +22,6 @@ let package = Package(
+         // LK-Prefixed Dynamic WebRTC XCFramework
+         .package(url: "https://github.com/livekit/webrtc-xcframework.git", exact: "150.7871.04"),
+         .package(url: "https://github.com/livekit/livekit-ffi-xcframework.git", exact: "0.13.1"),
+-        // Test-only: conformance oracle for the nanopb facades.
+-        .package(url: "https://github.com/apple/swift-protobuf.git", from: "1.31.0"),
+-        // Only used for DocC generation
+-        .package(url: "https://github.com/apple/swift-docc-plugin.git", from: "1.3.0"),
+     ],
+     targets: [
+         .target(
+@@ -62,46 +58,6 @@ let package = Package(
+                 .process("PrivacyInfo.xcprivacy"),
+             ],
+         ),
+-        .testTarget(
+-            // SwiftProtobuf is a test-only conformance oracle here: the same
+-            // protos are compiled with protoc-gen-swift so every nanopb-encoded
+-            // payload can be verified against a second, independent implementation.
+-            name: "LiveKitNanopbTests",
+-            dependencies: [
+-                "LiveKit",
+-                "LiveKitNanopb",
+-                .product(name: "SwiftProtobuf", package: "swift-protobuf"),
+-            ],
+-        ),
+-        .target(
+-            name: "LiveKitTestSupport",
+-            dependencies: [
+-                "LiveKit",
+-            ],
+-            path: "Tests/LiveKitTestSupport",
+-        ),
+-        .testTarget(
+-            name: "LiveKitCoreTests",
+-            dependencies: [
+-                "LiveKit",
+-                "LiveKitTestSupport",
+-                .product(name: "LiveKitFFI", package: "livekit-ffi-xcframework"),
+-            ],
+-        ),
+-        .testTarget(
+-            name: "LiveKitAudioTests",
+-            dependencies: [
+-                "LiveKit",
+-                "LiveKitTestSupport",
+-            ],
+-        ),
+-        .testTarget(
+-            name: "LiveKitObjCTests",
+-            dependencies: [
+-                "LiveKit",
+-                "LiveKitTestSupport",
+-            ],
+-        ),
+     ],
+     swiftLanguageModes: [.v5, .v6],
+ )
+diff --git a/Sources/LiveKit/Core/RTC.swift b/Sources/LiveKit/Core/RTC.swift
+index e2b4fede..c592e096 100644
+--- a/Sources/LiveKit/Core/RTC.swift
++++ b/Sources/LiveKit/Core/RTC.swift
+@@ -109,7 +109,11 @@ extension RTC {
+     static func createPeerConnection(_ configuration: LKRTCConfiguration,
+                                      constraints: LKRTCMediaConstraints) -> LKRTCPeerConnection?
+     {
+-        peerConnectionFactory.peerConnection(with: configuration,
++        // Skwod: WebRTC's own option, with its own default (loopback ignored) unless asked.
++        let options = LKRTCPeerConnectionFactoryOptions()
++        options.ignoreLoopbackNetworkAdapter = !LiveKitSDK.gathersLoopback
++        peerConnectionFactory.setOptions(options)
++        return peerConnectionFactory.peerConnection(with: configuration,
+                                              constraints: constraints,
+                                              delegate: nil)
+     }
+diff --git a/Sources/LiveKit/LiveKit.swift b/Sources/LiveKit/LiveKit.swift
+index a522a0b1..25b5e044 100644
+--- a/Sources/LiveKit/LiveKit.swift
++++ b/Sources/LiveKit/LiveKit.swift
+@@ -39,8 +39,18 @@ public class LiveKitSDK: NSObject, Loggable {
+     fileprivate struct State {
+         var logger: any Logger = OSLogger()
+         var tracing: any Tracing = LoggingTracer()
++        var gathersLoopback = false
+     }
+ 
++    /// Skwod: peer connections created from now on also gather candidates on this device's loopback
++    /// interface (for a media server that is reached on `127.0.0.1`, through a forwarder in the same
++    /// process). `false` is the SDK's own behaviour.
++    public static func setGathersLoopback(_ on: Bool) {
++        state.mutate { $0.gathersLoopback = on }
++    }
++
++    static var gathersLoopback: Bool { state.gathersLoopback }
++
+     fileprivate static let state = StateSync(State())
+ 
+     /// Set a custom ``Tracing`` implementation to capture operation timing.

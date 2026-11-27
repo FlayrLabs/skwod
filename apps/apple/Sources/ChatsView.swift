@@ -187,6 +187,8 @@ struct SpaceChannelView: View {
     @State private var messages: [ChatMessage] = []
     @State private var draft = ""
     @State private var sending = false
+    /// The skwod this conversation belongs to: what is sent here goes through its cache, or nowhere.
+    @State private var home: String?
     @State private var sendError: String?
     @State private var uploading = false
     /// The newest window of the channel (what `fetchChannelMessages` returns) and the older
@@ -197,6 +199,14 @@ struct SpaceChannelView: View {
     @State private var reachedStart = false
     @State private var refreshing = false
     @State private var refreshAgain = false
+    /// Build 51: the channel `messages` were loaded for; catch-ups that failed in a row, and the
+    /// retry waiting for its turn (`FetchRetryRule`).
+    @State private var loadedChannel: String?
+    /// The conversation this composer was opened for: what is written here goes here, or nowhere.
+    @State private var composedIn: String?
+    private var maySend: Bool { Landing.maySend(composedIn: composedIn, now: chat.conversationKey(space)) }
+    @State private var fetchFailures = 0
+    @State private var retryTask: Task<Void, Never>?
     @State private var showInvite = false
     @State private var showChess = false
     @State private var showWhiteboard = false
@@ -228,11 +238,23 @@ struct SpaceChannelView: View {
         // (that added a SECOND NavigationStack and a second Done button).
         .sheet(isPresented: $showMembersSheet) { MembersSheetView(serverId: space.serverId, serverName: space.name) }
         .sheet(item: $forwarding) { msg in
-            ForwardPicker(message: msg, chat: chat) { target in Task { await forward(msg, to: target) } }
+            ForwardPicker(message: msg, chat: chat) { target in forward(msg, to: target) }
         }
         // Keyed on the channel so switching servers/channels reloads — a plain `.task` runs once and the
         // switch statement REUSES this view across channels, so every server showed the first's messages.
-        .task(id: space.channelId) { await load() }
+        // Build 51: and on the client — a view opened before it was up (launch), or kept across a
+        // re-bind (back from the background after the notification extension wrote the cache, a
+        // replaced p2p session), reloads from the client that is up now and catches up through it.
+        .task(id: ConversationLoadKey(id: "\(space.channelId)|\(chat.placementChosen)", clientTurn: app.clientTurn)) { await load() }
+        .onAppear {
+            guard composedIn == nil else { return }
+            composedIn = chat.conversationKey(space)
+            home = chat.spacesWorkspaceId
+            draft = chat.draft(for: chat.conversationKey(space))
+        }
+        .onChange(of: draft) { _, now in if editing == nil, let composedIn { chat.keepDraft(now, for: composedIn) } }
+        .onChange(of: app.clientTurn) { _, _ in if sendError == Compose.opening { sendError = nil } }
+        .onReceive(NotificationCenter.default.publisher(for: .skwodCatchUp)) { _ in Task { await refresh() } }
         // Live: the relay says something happened in THIS channel (a message, an edit, a
         // delete, a reaction, a clear) → catch up now. No polling.
         .onReceive(NotificationCenter.default.publisher(for: .skwodChannelChanged)) { note in
@@ -269,7 +291,7 @@ struct SpaceChannelView: View {
                 .sorted { $0.name.lowercased() < $1.name.lowercased() }
                 + (chat.everyoneHonoured(app.session?.userId, in: space.serverId)
                    ? [(userId: MentionComposer.everyoneId, name: "everyone", username: "")] : []),
-            typingFrom: Set(memberNames.keys)))
+            typingFrom: memberNames))
         .safetyActions(blocking: $blocking, reporting: $reporting)
         .onReceive(NotificationCenter.default.publisher(for: .skwodServerChanged)) { note in
             if note.object as? String == space.serverId { Task { await syncMembers() } }
@@ -311,9 +333,9 @@ struct SpaceChannelView: View {
         guard !memberNames.isEmpty else { return nil }
         let held = Set(app.waiting.waiting(in: space.serverId).map(\.userId))
         let me = app.session?.userId
-        return memberNames.keys.filter { uid in
-            !held.contains(uid) && (uid == me || app.realtime.status(userId: uid) != "offline")
-        }.count
+        return PresenceRoster.onlineCount(memberNames.keys.filter { !held.contains($0) }, me: me, live: app.realtime.isLive) {
+            app.realtime.status(userId: $0)
+        }
     }
 
     private var chatSurface: some View {
@@ -325,19 +347,20 @@ struct SpaceChannelView: View {
             sending: sending,
             sendError: sendError,
             placeholder: "Message #\(space.channelName)",
-            onSend: { Task { await send() } },
+            onSend: { send($0) },
+            canSend: ready,
             onLoadOlder: { Task { await loadOlder() } },
             loadingOlder: loadingOlder,
             reachedStart: reachedStart,
             uploading: uploading,
-            onSendFile: { url in Task { await sendAttachment(.file(url)) } },
-            onSendMusic: { track in Task { await sendTagged { _ in try AttachmentService.musicBody(track) } } },
-            onSendImage: { data in Task { await sendAttachment(.image(data)) } },
-            onBack: { chat.selection = nil },
-            onReact: { msg, emoji in Task { await toggleReaction(msg, emoji) } },
+            onSendFile: { url in sendAttachment(.file(url)) },
+            onSendMusic: { track in sendMusic(track) },
+            onSendImage: { data in sendAttachment(.image(data)) },
+            onBack: { chat.reveal.send(false) },
+            onReact: { msg, emoji in toggleReaction(msg, emoji) },
             onReply: { msg in editing = nil; replyingTo = msg },
             onEdit: { msg in replyingTo = nil; editing = msg; draft = msg.body },
-            onDelete: { msg in Task { await deleteMessage(msg) } },
+            onDelete: { msg in deleteMessage(msg) },
             onForward: { msg in forwarding = msg },
             onSystemAction: { msg in
                 // "Review" on a held member: open the member list, where "Waiting to join" is.
@@ -352,6 +375,9 @@ struct SpaceChannelView: View {
             onCancelCompose: { if editing != nil { draft = "" }; replyingTo = nil; editing = nil },
             conversationId: space.channelId,
             onlineCount: onlineCount,
+            syncStatus: FetchRetryRule.status(failures: fetchFailures, stripShowing: ConnectionBanner.shows(app)),
+            onRetrySync: { fetchFailures = 0; Task { await refresh() } },
+            onPullToRefresh: { await refresh(force: true) },
             headerActions: {
                 AnyView(
                     HStack(spacing: 16) {
@@ -393,19 +419,27 @@ struct SpaceChannelView: View {
     @State private var presenceTick = 0
 
     private func load() async {
+        // No client yet: this runs again when one is up (keyed on `clientTurn`).
         guard let client = app.client else { return }
-        messages = []   // clear the previous channel's messages so a switch never shows stale content
-        olderRows = []; reachedStart = false; sendError = nil
-        // The user opened this channel of this server: that, on this device, is what confirms
+        if loadedChannel != space.channelId {
+            messages = []   // clear the previous channel's messages so a switch never shows stale content
+            olderRows = []; reachedStart = false
+            loadedChannel = space.channelId
+        }
+        sendError = nil; fetchFailures = 0
+        // The user opened this channel of this server (not the app, by default): that, on this device, is what confirms
         // where the channel belongs — what a later clear by that server's owner is checked
         // against (`channel_opened`). Only here, never for every channel a listing returns.
         // `false`: it is already confirmed under another server (a `channel_remap_refused`
         // notice follows and is shown with the others).
-        if !space.serverId.isEmpty, space.serverId != "demo", !space.channelId.isEmpty,
+        if chat.placementChosen, !space.serverId.isEmpty, space.serverId != "demo", !space.channelId.isEmpty,
            !(await client.channelOpened(serverId: space.serverId, channelId: space.channelId)) {
             await app.surfaceSecurityNotices()
         }
-        latestRows = await client.history(scope: scope)
+        let cached = await client.history(scope: scope)
+        // (A client whose cache was taken reads nothing: what is on screen stays.)
+        guard app.client === client else { return }
+        latestRows = cached
         messages = map(allRows)
         var tick = 0
         while !Task.isCancelled {
@@ -469,6 +503,8 @@ struct SpaceChannelView: View {
         await app.waiting.refresh(serverId: space.serverId)
         guard let members = try? await client.listMembers(serverId: space.serverId) else { return }
         for m in members { memberNames[m.userId] = m.username }
+        // The names on screen are looked up now, not at the next minute's roster pass.
+        app.contacts.checkSoon(members.map { ($0.userId, $0.username) })
     }
 
     private var scope: String { "channel:\(space.channelId)" }
@@ -563,7 +599,7 @@ struct SpaceChannelView: View {
         let rows = await client.history(scope: scope)
         let queued = await Outbox.states(client, scope: scope)
         let reactions = Self.pills(await client.channelReactions(channelId: channelId), me: me)
-        guard channelId == space.channelId else { return }
+        guard channelId == space.channelId, app.client === client else { return }
         latestRows = rows
         sendStates = queued.byMessage
         reactionsByMessage = reactions
@@ -574,67 +610,68 @@ struct SpaceChannelView: View {
     /// Cached reaction pills per message id, hydrated by `hydrateReactions` after each fetch.
     @State private var reactionsByMessage: [String: [ReactionPill]] = [:]
 
-    /// A file or photo: encrypted file-to-file, queued, uploaded in resumable chunks by the
-    /// outbox (`StreamedUpload`). Returns as soon as it is queued. The server links the blob
-    /// to the message when the queued send goes out, which is what lets members download it.
-    private func sendAttachment(_ source: StreamedUpload.Source) async {
-        uploading = true; sendError = nil
-        defer { uploading = false }
-        do {
-            try await StreamedUpload.queue(source, to: .channel(channelId: space.channelId), app: app)
-        } catch {
-            sendError = sendFailureText(error)
-        }
+    /// Can something be handed over right now? Only to the cache of the skwod this conversation is
+    /// in; while that is being opened nothing is taken from the composer, and it says so.
+    private func ready() -> Bool {
+        guard maySend else { return false }
+        if Outbox.client(of: home, app) == nil { sendError = Compose.opening; return false }
+        if sendError == Compose.opening { sendError = nil }
+        return true
     }
 
-    /// Build a tagged body (encrypted attachment upload or music card) and send it on the channel.
-    ///
-    /// An attachment is sent WITH its blob ids: the server links the blobs to the message in the
-    /// same transaction, and that link is what lets the other members download them. (Sent
-    /// without, the file opened for its uploader only.)
-    private func sendTagged(_ make: @escaping (BlobStore) async throws -> AttachmentService.Outgoing) async {
-        guard let client = app.client, let store = BlobStore(app: app) else {
-            sendError = "Not connected — try again in a moment."
-            return
+    /// Send, reply or edit. Everything about it is settled here, at the tap (`SendOrder`): what comes
+    /// after — another conversation, another skwod — changes nothing about where it goes. Nothing
+    /// waits for the network: it is queued in the core (shown at once as "Sending…").
+    private func send(_ written: String) -> Bool {
+        guard maySend else { return false }
+        let (replyTarget, editTarget, key) = (replyingTo, editing, composedIn)
+        let taken = Compose.take(text: written, home: home, bound: app.bound.flatMap { $0.cacheOpen ? $0.workspaceId : nil },
+                                 place: .channel(space.channelId), replyTo: replyTarget?.id, editing: editTarget?.id)
+        guard case .send(let order) = taken, let client = Outbox.client(of: home, app) else {
+            if taken != .nothing { sendError = Compose.opening }
+            return false
         }
-        uploading = true; sendError = nil
-        var uploaded: [String] = []
-        do {
-            let out = try await make(store)
-            uploaded = out.blobIds
-            // The upload is done; the message itself is queued, so a connection that drops
-            // right now costs nothing — it goes out (once) when the connection is back.
-            _ = try await client.queueChannelMessage(channelId: space.channelId, text: out.body, replyToId: nil, blobIds: out.blobIds, uploadIds: [])
-            Outbox.kick(app, composed: true)
-        } catch {
-            sendError = sendFailureText(error)
-            // The message was never queued: do not leave its upload behind on the host.
-            for id in uploaded { await store.delete(id) }
-        }
-        uploading = false
-    }
-
-    /// Send, reply or edit. Nothing here waits for the network: the message is queued in the
-    /// core (it is in this device's history at once, marked "Sending…") and delivered when the
-    /// connection allows — so typing while offline loses nothing.
-    private func send() async {
-        guard let client = app.client else { return }
-        let text = draft.trimmingCharacters(in: .whitespaces); guard !text.isEmpty else { return }
-        let replyTarget = replyingTo
-        let editTarget = editing
         draft = ""; sendError = nil; replyingTo = nil; editing = nil
-        do {
-            if let editTarget {
-                try await client.queueChannelEdit(channelId: space.channelId, messageId: editTarget.id, text: text)
-            } else {
-                _ = try await client.queueChannelMessage(channelId: space.channelId, text: text, replyToId: replyTarget?.id, blobIds: [], uploadIds: [])
+        Task {
+            do {
+                try await Outbox.queue(order, through: client)
+                Outbox.kick(app, composed: true)
+            } catch {
+                // Could not even be queued (too long, the outbox is full, the cache was just taken):
+                // the text goes back to this conversation's composer.
+                draft = Compose.givenBack(order.text, to: draft)
+                replyingTo = replyTarget; editing = editTarget
+                if editTarget == nil, let key { chat.keepDraft(Compose.givenBack(order.text, to: chat.draft(for: key)), for: key) }
+                sendError = sendFailureText(error)
             }
-            Outbox.kick(app, composed: true)
-        } catch {
-            // Could not even be queued (too long, or the outbox is full): give the text back.
-            draft = draft.isEmpty ? text : "\(text)\n\(draft)"
-            replyingTo = replyTarget; editing = editTarget
-            sendError = sendFailureText(error)
+        }
+        return true
+    }
+
+    private func sendMusic(_ track: MusicTrack) {
+        guard ready(), let client = Outbox.client(of: home, app), let home else { return }
+        let order: SendOrder
+        do { order = SendOrder(workspaceId: home, place: .channel(space.channelId), text: try AttachmentService.musicBody(track).body) }
+        catch { sendError = sendFailureText(error); return }
+        Task {
+            do {
+                try await Outbox.queue(order, through: client)
+                Outbox.kick(app, composed: true)
+            } catch { sendError = sendFailureText(error) }
+        }
+    }
+
+    /// A file or photo: encrypted file-to-file, queued, uploaded in resumable chunks by the outbox
+    /// (`StreamedUpload`). In a channel the server links the blob to the message when the queued send
+    /// goes out, which is what lets members download it.
+    private func sendAttachment(_ source: StreamedUpload.Source) {
+        guard ready(), let client = Outbox.client(of: home, app), let home else { return }
+        let target = StreamedUpload.Target.channel(channelId: space.channelId)
+        uploading = true; sendError = nil
+        Task {
+            do { try await StreamedUpload.queue(source, to: target, through: client, workspace: home, app: app) }
+            catch { sendError = sendFailureText(error) }
+            uploading = false
         }
     }
 
@@ -645,12 +682,13 @@ struct SpaceChannelView: View {
         return nil
     }
 
-    private func toggleReaction(_ msg: ChatMessage, _ emoji: String) async {
-        guard let client = app.client else { return }
+    private func toggleReaction(_ msg: ChatMessage, _ emoji: String) {
+        guard ready(), let client = Outbox.client(of: home, app) else { return }
+        let channelId = space.channelId
         let mineAlready = msg.reactionPills.first(where: { $0.emoji == emoji })?.mine ?? false
-        do {
+        Task { do {
             // The core seals the emoji under the space key; the server only gets a keyed tag.
-            try await client.queueReaction(channelId: space.channelId, messageId: msg.id, emoji: emoji, remove: mineAlready)
+            try await client.queueReaction(channelId: channelId, messageId: msg.id, emoji: emoji, remove: mineAlready)
             // Shown at once; the next sync confirms it.
             var pills = reactionsByMessage[msg.id] ?? []
             if let i = pills.firstIndex(where: { $0.emoji == emoji }) {
@@ -664,42 +702,58 @@ struct SpaceChannelView: View {
             messages = map(allRows)
             await Outbox.flush(app)
             await refresh()
-        } catch { sendError = sendFailureText(error) }
+        } catch { sendError = sendFailureText(error) } }
     }
 
-    private func deleteMessage(_ msg: ChatMessage) async {
-        guard let client = app.client else { return }
-        do {
-            try await client.queueChannelDelete(channelId: space.channelId, messageId: msg.id)
+    private func deleteMessage(_ msg: ChatMessage) {
+        guard ready(), let client = Outbox.client(of: home, app) else { return }
+        let channelId = space.channelId
+        Task { do {
+            try await client.queueChannelDelete(channelId: channelId, messageId: msg.id)
             Outbox.kick(app)
-        } catch { sendError = sendFailureText(error) }
+        } catch { sendError = sendFailureText(error) } }
     }
 
     /// Forward a message's text to another channel (a fresh, queued send in the target).
-    private func forward(_ msg: ChatMessage, to target: RealSpace) async {
-        guard let client = app.client else { return }
-        let body = msg.body.isEmpty ? "(forwarded message)" : msg.body
-        do {
-            _ = try await client.queueChannelMessage(channelId: target.channelId, text: body, replyToId: nil, blobIds: [], uploadIds: [])
-            Outbox.kick(app)
-        } catch { sendError = "Couldn't forward: " + sendFailureText(error) }
+    private func forward(_ msg: ChatMessage, to target: RealSpace) {
         forwarding = nil
+        // (The picker lists the channels of the skwod that is shown.)
+        guard ready(), chat.spacesWorkspaceId == home, let home, let client = Outbox.client(of: home, app) else { return }
+        let body = msg.body.isEmpty ? "(forwarded message)" : msg.body
+        let order = SendOrder(workspaceId: home, place: .channel(target.channelId), text: body)
+        Task { do {
+            try await Outbox.queue(order, through: client)
+            Outbox.kick(app)
+        } catch { sendError = "Couldn't forward: " + sendFailureText(error) } }
     }
 
     /// Catch the channel up (cursor-driven: everything that changed since the last call — new
     /// messages, edits, deletes — and cheap when nothing did) and redraw. Called when the relay
     /// reports an event for this channel, on (re)connect, after our own actions and on the slow
     /// safety timer. A burst of events makes one pass, then one more.
-    private func refresh() async {
+    /// `force` (pull-to-refresh): wait for a catch-up already running instead of only queuing one.
+    private func refresh(force: Bool = false) async {
         guard let client = app.client, let me = app.session?.userId else { return }
-        if refreshing { refreshAgain = true; return }
+        if refreshing {
+            refreshAgain = true
+            if force { while refreshing { try? await Task.sleep(for: .milliseconds(100)) } }
+            return
+        }
         refreshing = true
         defer { refreshing = false }
         let channelId = space.channelId
         let asked = app.bindTicket()
         repeat {
             refreshAgain = false
-            guard let hist = try? await client.fetchChannelMessages(channelId: channelId, myUserId: me) else { break }
+            let hist: [Message]
+            do { hist = try await client.fetchChannelMessages(channelId: channelId, myUserId: me) } catch {
+                if let asked, app.holds(asked) { chat.noteRead(space, refusedWith: error) }
+                // Never a silent stale list: say so, and try again with backoff (`FetchRetryRule`).
+                if channelId == space.channelId, let asked, app.holds(asked) { noteFetchFailed() }
+                break
+            }
+            if let asked, app.holds(asked) { chat.noteRead(space, refusedWith: nil) }
+            if channelId == space.channelId { fetchFailures = 0; retryTask?.cancel(); retryTask = nil }
             // What one skwod's server answered is shown (and its avatars kept) only there.
             guard let asked, app.holds(asked) else { return }
             // The fetch may have drained direct messages from the mailbox on its way.
@@ -716,6 +770,20 @@ struct SpaceChannelView: View {
             latestRows = hist
             messages = map(allRows)
         } while refreshAgain
+    }
+
+    /// A catch-up of this channel failed: retry after `FetchRetryRule`'s backoff, a bounded number
+    /// of times; after that the list says "Couldn't load new messages · Retry".
+    private func noteFetchFailed() {
+        fetchFailures += 1
+        retryTask?.cancel()
+        guard let wait = FetchRetryRule.delay(afterFailure: fetchFailures) else { return }
+        let channelId = space.channelId
+        retryTask = Task {
+            try? await Task.sleep(for: .seconds(wait))
+            guard !Task.isCancelled, channelId == space.channelId else { return }
+            await refresh()
+        }
     }
 
     /// Group the channel's reactions (one cache read for the whole channel) into pills per
@@ -794,7 +862,7 @@ private struct MembersColumn: View {
     private var live: [PresenceMember] {
         members.map { m in
             var m = m
-            m.status = app.realtime.liveStatus(userId: m.userId, polled: m.status)
+            m.status = app.realtime.status(userId: m.userId)
             return m
         }
     }
@@ -803,8 +871,10 @@ private struct MembersColumn: View {
         let held = Set(app.waiting.waiting(in: serverId).map(\.userId))
         return live.filter { !held.contains($0.userId) }
     }
-    private var online: [PresenceMember] { accepted.filter { $0.status != "offline" } }
-    private var offline: [PresenceMember] { accepted.filter { $0.status == "offline" } }
+    private var groups: PresenceRoster.Groups<PresenceMember> { PresenceRoster.groups(accepted, live: app.realtime.isLive) { $0.status } }
+    private var online: [PresenceMember] { groups.online }
+    private var offline: [PresenceMember] { groups.offline }
+    private var unknown: [PresenceMember] { groups.unknown }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -818,6 +888,10 @@ private struct MembersColumn: View {
                     if !offline.isEmpty {
                         groupHeader("Offline — \(offline.count)")
                         ForEach(offline) { m in memberRow(m).opacity(0.45) }
+                    }
+                    if !unknown.isEmpty {
+                        groupHeader(PresenceRoster.unknownTitle(unknown.count))
+                        ForEach(unknown) { m in memberRow(m) }
                     }
                 }
                 .padding(8).padding(.top, 8)
@@ -890,7 +964,7 @@ private struct MembersColumn: View {
     private func memberRow(_ m: PresenceMember) -> some View {
         let shown = app.contacts.display(m.userId, claimedName: m.username)
         let isMe = m.userId == app.session?.userId
-        return MemberRow(username: isMe ? m.username : shown.label(for: .memberRow), userId: m.userId, status: m.status,
+        return MemberRow(username: isMe ? m.username : shown.label(for: .memberRow), userId: m.userId, status: app.realtime.dot(userId: m.userId),
                          badge: isMe ? nil : shown.badge)
             .contextMenu {
                 if !roles.isEmpty {
@@ -934,10 +1008,13 @@ private struct MembersColumn: View {
               let token = app.session?.token, let base = URL(string: app.serverURL) else { return }
         var req = URLRequest(url: base.appendingPathComponent("api/servers/\(serverId)/members"))
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+        let askedAt = PresenceClock.now
+        guard let (data, resp) = try? await RawSink.data(for: req),
               (resp as? HTTPURLResponse)?.statusCode == 200,
-              let parsed = try? JSONDecoder().decode(PresenceMemberList.self, from: data) else { return }
+              let parsed = try? JSONDecoder().decode(PresenceMemberList.self, from: data) else { app.realtime.presenceUnheard(); return }
         members = parsed.members
+        app.realtime.seedPresence(parsed.statuses, askedAt: askedAt)
+        app.contacts.checkSoon(parsed.members.map { ($0.userId, $0.username) })
         await app.waiting.refresh(serverId: serverId)
         if let client = app.client {
             roles = (try? await client.listRoles(serverId: serverId)) ?? []
@@ -970,7 +1047,7 @@ private struct MembersColumn: View {
         var req = URLRequest(url: base.appendingPathComponent(path))
         req.httpMethod = method
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        let code = ((try? await URLSession.shared.data(for: req))?.1 as? HTTPURLResponse)?.statusCode ?? 0
+        let code = ((try? await RawSink.data(for: req))?.1 as? HTTPURLResponse)?.statusCode ?? 0
         status = code == 200 ? "" : failure
         // Removing a member must immediately rotate EVERY channel's sender key on this server, so
         // the removed member can't decrypt anything sent after this point (chat or voice). Other
@@ -995,13 +1072,13 @@ private struct MemberRow: View {
         HStack(spacing: 9) {
             ZStack(alignment: .bottomTrailing) {
                 AvatarImage(key: userId.map(AvatarStore.userKey), name: username, size: 28)
-                // Always show the dot: green online / yellow away / red offline+DND.
+                // Always show the dot (`PresenceStyle.color`).
                 Circle().fill(PresenceStyle.color(status)).frame(width: 9, height: 9)
                     .overlay(Circle().strokeBorder(.black.opacity(0.7), lineWidth: 1.5))
                     .offset(x: 1, y: 1)
             }
             Text(username).font(.system(size: 13)).foregroundStyle(.white.opacity(0.85)).lineLimit(1)
-            if let badge { TrustBadge(badge: badge, compact: true) }
+            if let badge, let userId { TrustBadgeButton(userId: userId, name: username, badge: badge) }
             Spacer(minLength: 0)
         }
         .padding(.horizontal, 8).padding(.vertical, 5)
@@ -1031,6 +1108,7 @@ struct PresenceMember: Decodable, Identifiable {
 
 struct PresenceMemberList: Decodable {
     let members: [PresenceMember]
+    var statuses: [String: String] { Dictionary(members.map { ($0.userId, $0.status) }, uniquingKeysWith: { first, _ in first }) }
 }
 
 /// The member roster as a sheet — the iOS peer of the macOS `MembersColumn`. Online/Offline groups
@@ -1058,7 +1136,7 @@ struct MembersSheetView: View {
     private var live: [PresenceMember] {
         members.map { m in
             var m = m
-            m.status = app.realtime.liveStatus(userId: m.userId, polled: m.status)
+            m.status = app.realtime.status(userId: m.userId)
             return m
         }
     }
@@ -1067,8 +1145,10 @@ struct MembersSheetView: View {
         let held = Set(app.waiting.waiting(in: serverId).map(\.userId))
         return live.filter { !held.contains($0.userId) }
     }
-    private var online: [PresenceMember] { accepted.filter { $0.status != "offline" } }
-    private var offline: [PresenceMember] { accepted.filter { $0.status == "offline" } }
+    private var groups: PresenceRoster.Groups<PresenceMember> { PresenceRoster.groups(accepted, live: app.realtime.isLive) { $0.status } }
+    private var online: [PresenceMember] { groups.online }
+    private var offline: [PresenceMember] { groups.offline }
+    private var unknown: [PresenceMember] { groups.unknown }
 
     var body: some View {
         NavigationStack {
@@ -1085,6 +1165,9 @@ struct MembersSheetView: View {
                     }
                     if !offline.isEmpty {
                         Section("Offline — \(offline.count)") { ForEach(offline) { row($0).opacity(0.5) } }
+                    }
+                    if !unknown.isEmpty {
+                        Section(PresenceRoster.unknownTitle(unknown.count)) { ForEach(unknown) { row($0) } }
                     }
                 }
                 .scrollContentBackground(.hidden)
@@ -1133,6 +1216,7 @@ struct MembersSheetView: View {
                 Divider()
             }
             if m.userId != app.session?.userId {
+                if let why = ContactTrust.explanation(app.contacts.display(m.userId, claimedName: m.username).badge) { Section { Text(why) } }
                 Button { verifying = m } label: { Label("Verify safety number…", systemImage: "checkmark.shield") }
                 SafetyMenuItems(userId: m.userId, name: m.username, serverId: serverId, blocking: $blocking, reporting: $reporting)
                 Divider()
@@ -1145,7 +1229,7 @@ struct MembersSheetView: View {
                 ZStack(alignment: .bottomTrailing) {
                     Circle().fill(Color.seeded(m.username)).frame(width: 32, height: 32)
                         .overlay(Text(m.username.prefix(1).uppercased()).font(.caption.bold()).foregroundStyle(.white))
-                    Circle().fill(PresenceStyle.color(m.status)).frame(width: 11, height: 11)
+                    Circle().fill(PresenceStyle.color(app.realtime.dot(userId: m.userId))).frame(width: 11, height: 11)
                         .overlay(Circle().strokeBorder(.black.opacity(0.6), lineWidth: 2))
                 }
                 // A member-list name is the server's claim: marked unless the user knows them.
@@ -1163,11 +1247,14 @@ struct MembersSheetView: View {
               let token = app.session?.token, let base = URL(string: app.serverURL) else { return }
         var req = URLRequest(url: base.appendingPathComponent("api/servers/\(serverId)/members"))
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        if let (data, resp) = try? await URLSession.shared.data(for: req),
+        let askedAt = PresenceClock.now
+        if let (data, resp) = try? await RawSink.data(for: req),
            (resp as? HTTPURLResponse)?.statusCode == 200,
            let parsed = try? JSONDecoder().decode(PresenceMemberList.self, from: data) {
             members = parsed.members
-        }
+            app.realtime.seedPresence(parsed.statuses, askedAt: askedAt)
+            app.contacts.checkSoon(parsed.members.map { ($0.userId, $0.username) })
+        } else { app.realtime.presenceUnheard() }
         await app.waiting.refresh(serverId: serverId)
         if let client = app.client { roles = (try? await client.listRoles(serverId: serverId)) ?? [] }
     }
@@ -1196,7 +1283,7 @@ struct MembersSheetView: View {
         var req = URLRequest(url: base.appendingPathComponent(path))
         req.httpMethod = method
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        let code = ((try? await URLSession.shared.data(for: req))?.1 as? HTTPURLResponse)?.statusCode ?? 0
+        let code = ((try? await RawSink.data(for: req))?.1 as? HTTPURLResponse)?.statusCode ?? 0
         // Same rotation-on-removal as the macOS panel: fresh sender keys the moment someone is out.
         if code == 200, let client = app.client, let me = app.session?.userId {
             _ = try? await client.syncServerMembership(serverId: serverId, myUserId: me)

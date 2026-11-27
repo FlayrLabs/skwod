@@ -101,7 +101,8 @@ fun DmHomeView(chat: AppChat) {
                 }
                 items(dms, key = { it.key }) { d ->
                     // Live presence dot + label (reads realtime.presence state → auto-recomposes).
-                    val status = model.realtime.status(d.peerUserId)
+                    model.realtime.unheard.value
+                    val status = model.realtime.dot(d.peerUserId)
                     // The name comes from the contact book, never straight from the server's list.
                     val shown = model.contacts.shown(d.peerUserId, d.name)
                     ListItem(
@@ -116,8 +117,8 @@ fun DmHomeView(chat: AppChat) {
                                 shown.impersonation -> Text("Looks like someone you know, but is a different account", color = Color(0xFFF87171))
                                 shown.strong -> Text("Don't rely on this name", color = Color(0xFFF87171))
                                 d.isSplit -> Text("Arrived inside someone else's conversation", color = Color(0xFFFFA726))
-                                else -> Text(if (status == "offline") "encrypted" else presenceLabel(status),
-                                    color = if (status == "offline") SkAccentWash else presenceColor(status))
+                                else -> Text(if (status == "offline" || status == "unknown") "encrypted" else presenceLabel(status),
+                                    color = if (status == "offline" || status == "unknown") SkAccentWash else presenceColor(status))
                             }
                         },
                         leadingContent = {
@@ -194,6 +195,7 @@ fun GroupChatView(group: GroupConversation, onBack: () -> Unit) {
     DmChatView(DMConversation("", "", "", group.conversationId), onBack, group)
 }
 
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
 fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation? = null) {
     val model = AppModel.get(LocalContext.current)
@@ -201,8 +203,23 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
     val scope = rememberCoroutineScope()
     val messages = remember { mutableStateListOf<Message>() }
     val listState = rememberLazyListState()
+    // Build 51: failed catch-ups in a row; at the bottom before the newest row arrived; just sent.
+    var fetchFailures by remember(dm.conversationId) { mutableStateOf(0) }
+    var refreshingByPull by remember { mutableStateOf(false) }
+    var dmJustSent by remember(dm.conversationId) { mutableStateOf(false) }
+    var dmAtBottom by remember { mutableStateOf(true) }
+    var dmFollowing by remember { mutableStateOf(false) }
+    LaunchedEffect(listState) {
+        snapshotFlow { !listState.canScrollForward to listState.isScrollInProgress }.collect { (atEnd, scrolling) ->
+            if (atEnd) dmFollowing = false
+            dmAtBottom = if (dmFollowing) true else ChatScrollRule.stillAtBottom(dmAtBottom, scrolling, atEnd)
+        }
+    }
     val ctx = LocalContext.current
-    var draft by remember { mutableStateOf("") }
+    /** The skwod this conversation is in: what is sent here goes through its cache, or nowhere ([Compose]). */
+    val home = remember { model.chat.spacesWorkspaceId }
+    val composedIn = remember { Compose.directKey(home, dm.conversationId) }
+    var draft by remember { mutableStateOf(model.chat.draft(composedIn)) }
     var sending by remember { mutableStateOf(false) }
     var error by remember { mutableStateOf<String?>(null) }
     var showVerify by remember { mutableStateOf(false) }
@@ -238,6 +255,7 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
     val reactionsByMsg = remember(dm.conversationId) { mutableStateMapOf<String, List<ReactionPill>>() }
     var replyingTo by remember(dm.conversationId) { mutableStateOf<Message?>(null) }
     var editing by remember(dm.conversationId) { mutableStateOf<Message?>(null) }
+    SideEffect { if (editing == null) model.chat.keepDraft(composedIn, draft) }
     // @mentions (build 46): who was picked in the composer (user id → the "@name" inserted); they
     // ride inside the encrypted text ([Mentions]). No @everyone in a direct or group conversation.
     val mentionPicks = remember(dm.conversationId) { mutableStateListOf<Pair<String, String>>() }
@@ -297,14 +315,15 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
 
     /** Queue a DM write (shown at once), then let the outbox deliver it to every device of both people. */
     fun queue(failure: String, write: suspend (uniffi.skwod_core.SkwodClient) -> Unit) {
-        val c = model.client ?: run { error = "Not connected — try again in a moment."; return }
-        scope.launch {
+        val c = Compose.sender(model.bound, home)?.client ?: run { error = Compose.OPENING; return }
+        // (Not this screen's scope: leaving it must not take back what was sent.)
+        model.launchJob {
             try {
-                withContext(Dispatchers.IO) { write(c) }
-                reload()
+                write(c)
+                withContext(Dispatchers.Main) { try { reload() } catch (_: Exception) {} }
                 Outbox.kick(model)
             } catch (e: Exception) {
-                error = OutboxPolicy.queueError((e as? uniffi.skwod_core.CoreException.Invalid)?.detail, failure)
+                withContext(Dispatchers.Main) { error = OutboxPolicy.queueError((e as? uniffi.skwod_core.CoreException.Invalid)?.detail, failure) }
             }
         }
     }
@@ -322,6 +341,7 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
     suspend fun refreshStatus() {
         if (group != null) return       // trust is per person: "People" shows each member's
         val asked = model.client ?: return
+        val wid = model.bound?.workspaceId ?: return
         val st = try { withContext(Dispatchers.IO) { asked.contactStatus(dm.peerUserId) } } catch (_: Exception) { null } ?: return
         // This workspace's answer is only for this workspace's contact book.
         if (model.client !== asked) return
@@ -336,7 +356,7 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
         // The contact book follows the safety-number state: verifying promotes to VERIFIED,
         // losing it falls back to KNOWN.
         // A read: only demotes (raising happens in the safety-number screen, on an explicit verify).
-        model.contacts.noteStatusRead(dm.peerUserId, st.verified)
+        model.contacts.noteStatusRead(wid, dm.peerUserId, st.verified)
     }
 
     // "I'm typing" at most every few seconds, never for an empty composer ([TypingState]).
@@ -351,28 +371,33 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
     /** Send, reply or edit — queued in the core (shown at once as "Sending…"). */
     fun sendDraft() {
         val typed = draft.trim(); if (typed.isEmpty()) return
+        // (Nothing is taken from the composer unless it can be handed over now.)
+        val from = Compose.sender(model.bound, home) ?: run { error = Compose.OPENING; return }
         val text = Mentions.encode(typed, Mentions.locate(typed, mentionPicks.toList()))
         mentionPicks.clear()
         lastTyping = 0L
         val replyTarget = replyingTo; val editTarget = editing
         error = null; draft = ""; replyingTo = null; editing = null
-        val c = model.client
-        scope.launch {
+        val sealedTo = peers
+        dmJustSent = true
+        // (Not this screen's scope: leaving it must not take back what was sent.)
+        model.launchJob {
             try {
-                if (c == null) throw IllegalStateException()
-                withContext(Dispatchers.IO) {
-                    if (editTarget != null) c.queueDmEdit(dm.conversationId, peers, editTarget.messageId, text)
-                    else c.queueDm(dm.conversationId, peers, text, replyTarget?.messageId, emptyList())
-                }
+                if (editTarget != null) from.client.queueDmEdit(dm.conversationId, sealedTo, editTarget.messageId, text)
+                else from.client.queueDm(dm.conversationId, sealedTo, text, replyTarget?.messageId, emptyList())
                 // Writing in a conversation is the user taking it: it now claims its id.
-                model.chat.claimDM(dm)
-                reload()
+                if (model.chat.spacesWorkspaceId == from.workspaceId) model.chat.claimDM(dm)
+                withContext(Dispatchers.Main) { try { reload() } catch (_: Exception) {} }
                 Outbox.kick(model, composed = true)
             } catch (e: Exception) {
-                // Could not even be queued: give the text back without clobbering anything typed meanwhile.
-                draft = if (draft.isEmpty()) text else "$text\n$draft"
-                replyingTo = replyTarget; editing = editTarget
-                error = OutboxPolicy.queueError((e as? uniffi.skwod_core.CoreException.Invalid)?.detail)
+                // Could not even be queued: give the text back to this conversation's composer, without
+                // clobbering anything typed meanwhile.
+                withContext(Dispatchers.Main) {
+                    draft = Compose.givenBack(text, draft)
+                    replyingTo = replyTarget; editing = editTarget
+                    if (editTarget == null) model.chat.keepDraft(composedIn, Compose.givenBack(text, model.chat.draft(composedIn)))
+                    error = OutboxPolicy.queueError((e as? uniffi.skwod_core.CoreException.Invalid)?.detail)
+                }
             }
         }
     }
@@ -384,41 +409,52 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
     val clipHasImage = rememberClipboardHasImage()
 
     /** Prepare a file (picked, or a pasted picture) and queue it in this conversation. */
-    fun sendFile(make: suspend () -> Uploads.Prepared) {
+    fun sendFile(make: suspend (BoundClient<uniffi.skwod_core.SkwodClient>) -> Uploads.Prepared) {
+        val from = Compose.sender(model.bound, home) ?: run { error = Compose.OPENING; return }
+        val sealedTo = peers
         uploading = true; error = null
-        scope.launch {
+        model.launchJob {
             var prepared: Uploads.Prepared? = null
             try {
                 // Encrypted file-to-file by the core (nothing is uploaded yet), then queued WITH
                 // the upload: it goes out — and resumes — whenever the connection allows. A DM
                 // leaves nothing on the server that access to the blob could hang on, so the
                 // descriptor carries a download token: whoever can read the message can fetch the file.
-                val up = make()
+                val up = make(from)
                 prepared = up
-                withContext(Dispatchers.IO) { model.client!!.queueDm(dm.conversationId, peers, up.body, null, listOf(up.uploadId)) }
-                model.chat.claimDM(dm)
+                from.client.queueDm(dm.conversationId, sealedTo, up.body, null, listOf(up.uploadId))
+                if (model.chat.spacesWorkspaceId == from.workspaceId) model.chat.claimDM(dm)
                 prepared = null
-                reload()
+                withContext(Dispatchers.Main) { try { reload() } catch (_: Exception) {} }
                 Uploads.watch(model)
                 Outbox.kick(model, composed = true)
-            } catch (_: uniffi.skwod_core.CoreException.IdentityChanged) {
-                failedHeld = true; error = "Not delivered — ${peerName}'s security key changed. Accept or verify it, then attach the file again."
-            } catch (e: AttachmentException) { error = e.message
-            } catch (e: uniffi.skwod_core.CoreException.Invalid) { error = HistoryWindow.sendError(e.detail, "Couldn't send the file.")
-            } catch (_: Exception) { error = "Couldn't send the file." }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    if (e is uniffi.skwod_core.CoreException.IdentityChanged) failedHeld = true
+                    error = when (e) {
+                        is uniffi.skwod_core.CoreException.IdentityChanged -> "Not delivered — ${peerName}'s security key changed. Accept or verify it, then attach the file again."
+                        is AttachmentException -> e.message
+                        is uniffi.skwod_core.CoreException.Invalid -> HistoryWindow.sendError(e.detail, "Couldn't send the file.")
+                        else -> "Couldn't send the file."
+                    }
+                }
+            }
             // Prepared but never queued: nobody holds its key, so drop it (and what reached the host).
-            prepared?.let { Uploads.release(model, it.uploadId) }
-            uploading = false
+            prepared?.let { Uploads.release(from.client, it.uploadId) }
+            withContext(Dispatchers.Main) { uploading = false }
         }
     }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        if (uri != null) sendFile { Uploads.prepare(ctx, model, uri, forDm = true) }
+        if (uri != null) sendFile { from -> Uploads.prepare(ctx, model, from, uri, forDm = true) }
     }
 
-    LaunchedEffect(dm.conversationId) {
+    // Build 51: keyed on the client too — opened before it was up, or kept across a re-bind,
+    // the conversation reloads from (and catches up through) the client that is up now.
+    LaunchedEffect(dm.conversationId, model.clientTurn.intValue) {
         val c = model.client ?: return@LaunchedEffect
         reload()
+        fetchFailures = 0
         // The relay's `sealed` event (something is in our mailbox) drives this, plus a slow
         // safety timer and a pass on reconnect — the mailbox is no longer polled every 2 s.
         model.realtime.refreshLoop(45_000, match = { it.event == "sealed" || it.topic == scopeName }) {
@@ -433,7 +469,14 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
                     messages.clear(); messages.addAll(fresh)
                     loadOverlays()
                 }
-            } catch (e: Exception) { model.routeIfDeviceError(e) }
+                fetchFailures = 0
+            } catch (e: kotlinx.coroutines.CancellationException) { throw e
+            } catch (e: Exception) {
+                model.routeIfDeviceError(e)
+                // Never a silent stale list: say so; the next pass (event, catch-up, timer) or
+                // Retry tries again ([FetchRetryRule]).
+                fetchFailures++
+            }
             // That sync may have brought DMs of OTHER conversations: list and announce them.
             model.drainDmEvents()
             refreshStatus()
@@ -460,15 +503,26 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
         else (!m.isSystem && a == dm.peerUserId) || (!dm.isSplit && (own || m.isSystem))
     }
     val newestId = all.lastOrNull()?.messageId
+    // Build 51: lands at the newest; follows an arrival only for a reader at the bottom (or my
+    // own / just sent) — someone reading history is not yanked down ([ChatScrollRule]).
+    var openedAt by remember(dm.conversationId) { mutableStateOf(false) }
     LaunchedEffect(newestId) {
-        if (newestId != null) listState.animateScrollToItem(all.size)
+        if (newestId == null) return@LaunchedEffect
+        val mine = all.lastOrNull()?.let { it.authorId == "__me__" || it.authorId == me } == true
+        val arrival = ChatScrollRule.onArrival(!openedAt || dmAtBottom, mine, dmJustSent, 1)
+        if (arrival == ChatScrollRule.Arrival.FOLLOW) {
+            dmJustSent = false; dmFollowing = true
+            try { listState.animateScrollToItem(all.size) } finally { dmFollowing = false }
+            dmAtBottom = true
+        }
+        openedAt = true
     }
 
     if (showMusic) MusicSearchDialog(
         onPick = { track ->
             showMusic = false
             // The same music card the feed and the Apple app send.
-            queue("Couldn't share that song — try again.") { c -> c.queueDm(dm.conversationId, peers, ChatTags.MUSIC + track.toJson(), null, emptyList()); model.chat.claimDM(dm) }
+            queue("Couldn't share that song — try again.") { c -> c.queueDm(dm.conversationId, peers, ChatTags.MUSIC + track.toJson(), null, emptyList()); if (model.chat.spacesWorkspaceId == home) model.chat.claimDM(dm) }
         },
         onClose = { showMusic = false })
     if (showPeople && group != null) GroupPeopleDialog(group, onClose = { showPeople = false })
@@ -515,12 +569,19 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
                     TextButton(onClick = { showVerify = true }) { Text("View safety number", color = tone) }
                     // Vouching is the user's own act — and is refused for a name that imitates a known contact.
                     if (shown.flag == ContactTrust.Flag.NONE && shown.name != ContactTrust.UNKNOWN) {
-                        TextButton(onClick = { model.contacts.markKnown(dm.peerUserId, shown.name) }) { Text("I know them — accept") }
+                        TextButton(onClick = { model.contacts.markKnown(model.bound?.workspaceId ?: "", dm.peerUserId, shown.name) }) { Text("I know them — accept") }
                     }
                 }
             }
         }
-        LazyColumn(Modifier.weight(1f).dismissKeyboardOnTapOrDrag(listState), state = listState) {
+        Box(Modifier.weight(1f)) {
+        // Build 51: pull down to catch up by hand.
+        androidx.compose.material3.pulltorefresh.PullToRefreshBox(
+            isRefreshing = refreshingByPull,
+            onRefresh = { scope.launch { refreshingByPull = true; try { model.realtime.catchUps.tryEmit(Unit); model.syncDmsNow(); reload() } catch (_: Exception) {} finally { refreshingByPull = false } } },
+            modifier = Modifier.fillMaxSize(),
+        ) {
+        LazyColumn(Modifier.fillMaxSize().dismissKeyboardOnTapOrDrag(listState), state = listState) {
             item {
                 Box(Modifier.fillMaxWidth().padding(vertical = 4.dp), contentAlignment = Alignment.Center) {
                     if (reachedStart) Text(if (group != null) "This is the beginning of this group" else "This is the beginning of your conversation with ${peerName}", color = Color.White.copy(alpha = 0.4f),
@@ -587,6 +648,11 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
                     mentionsMe = mentionsMe, mentionName = mentionName)
             }
         }
+        }
+        SyncStatusChip(FetchRetryRule.status(fetchFailures, connectionStripShowing(model)), Modifier.align(Alignment.TopCenter).padding(top = 6.dp)) {
+            fetchFailures = 0; model.realtime.catchUps.tryEmit(Unit)
+        }
+        }
         // Replying to / editing a message: say so, with a way out.
         (editing ?: replyingTo)?.let { target ->
             Row(Modifier.fillMaxWidth().padding(vertical = 4.dp), verticalAlignment = Alignment.CenterVertically) {
@@ -618,7 +684,8 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
                         scope.launch {
                             // Continue without verifying: accept the devices listed now (the
                             // contact becomes unverified), then send again what was not delivered.
-                            val c = model.client
+                            val c = Compose.sender(model.bound, home)?.client
+                            val waiting = draft
                             // Exactly the set the banner was drawn for (audit L2).
                             val shown = status?.acceptFingerprint ?: ""
                             var changed = false
@@ -632,7 +699,8 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
                             if (ok) {
                                 error = null; failedHeld = false
                                 Outbox.retryAll(model, IdentityHold.toRetry(sendStates))
-                                if (draft.isNotBlank()) sendDraft()
+                                // What was waiting when the user decided, and nothing typed since.
+                                if (waiting.isNotBlank() && draft == waiting) sendDraft()
                             }
                         }
                     }) { Text(if (draft.isBlank()) "Accept" else "Accept & send") }
@@ -652,7 +720,7 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
             onPick = { uid, label -> draft = Mentions.complete(draft, label); mentionPicks.add(uid to label) })
         // Only this conversation's other people can show as typing here.
         TypingLine(scopeName, accept = { uid -> if (group != null) uid in group.others else uid == dm.peerUserId },
-            nameOf = { uid -> shownAuthor(uid).label })
+            nameOf = { uid -> MemberLabel.of(shownAuthor(uid), uid) })
         pasted?.let { p -> PastedImagePreview(p, onRemove = { pasted = null }) }
             ?: run { if (clipHasImage && !uploading && editing == null) PasteImageChip {
                 // Tagged with the conversation it started in: a picture read after a switch is dropped.
@@ -682,7 +750,7 @@ fun DmChatView(dm: DMConversation, onBack: () -> Unit, group: GroupConversation?
                 // A pasted picture goes exactly like one picked with + (stripped, encrypted, queued).
                 pasted?.takeIf { editing == null }?.let { pic ->
                     pasted = null
-                    sendFile { Uploads.prepareImage(ctx, model, pic.bytes, forDm = true) }
+                    sendFile { from -> Uploads.prepareImage(ctx, from, pic.bytes, forDm = true) }
                 }
                 sendDraft()
             }, enabled = !sending && (draft.isNotBlank() || (pasted != null && editing == null && !uploading)), shape = RoundedCornerShape(50)) {

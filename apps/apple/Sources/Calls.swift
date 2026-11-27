@@ -184,6 +184,8 @@ final class CallCoordinator {
     /// sent the wake, and then only that skwod's ring counts. Without one, a single ring is
     /// used and several are put to the user ("Who's calling?") — never auto-joined.
     func findRingAfterWake(tag: String? = nil, answered: Bool = false) async {
+        // (Started by the push: the app's state may not be there yet.)
+        for _ in 0..<40 where app == nil { try? await Task.sleep(for: .milliseconds(250)) }
         guard let app else { return }
         for _ in 0..<40 where app.restoring {
             try? await Task.sleep(for: .milliseconds(250))
@@ -239,14 +241,16 @@ final class CallCoordinator {
     /// so a server cannot ring as "Mom" — and with app lock on or previews off the call screen
     /// (shown on the lock screen) names nobody (`CallLabel`).
     private func label(serverId: String, from: String) async -> String {
-        guard let app, let asked = app.bindTicket() else { return CallLabel.generic }
+        // (With no client — behind the front, before the call is answered — by what is in memory.)
+        guard let app, let workspaceId = app.current?.id else { return CallLabel.generic }
+        let asked = app.bindTicket()
         let server = app.chatModel?.spaces.first(where: { $0.serverId == serverId })?.name
         var claimed: String?
         if let members = try? await app.client?.listMembers(serverId: serverId) {
             claimed = members.first(where: { $0.userId == from })?.username
         }
         // Asked of one skwod: never used to label a call after a switch to another.
-        guard app.holds(asked) else { return CallLabel.generic }
+        guard app.current?.id == workspaceId, asked.map(app.holds) ?? true else { return CallLabel.generic }
         let who = from.isEmpty ? nil : app.contacts.authorLabel(from, claimedName: claimed)
         #if os(iOS)
         // The system's call screen is outside the app's gate.
@@ -278,6 +282,10 @@ final class CallCoordinator {
         pushTag = nil
         app?.ringChoices = []
         app?.incomingCall = nil
+        #if os(iOS)
+        // The socket was brought back from behind for the ring alone (a `ring_cancel`).
+        if let app, app.store.phase != .active, app.activeCall == nil, !CallManager.shared.isAnswered { app.realtime.suspend() }
+        #endif
     }
 
     func decline() {

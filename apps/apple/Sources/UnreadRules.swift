@@ -50,6 +50,18 @@ enum UnreadRule {
         return items[afterMine...].firstIndex(where: counts)
     }
 
+    /// Build 51: what was unread when the conversation was OPENED — against the marker as it was
+    /// then, counting only rows written before that moment. Rows a catch-up brings in after the
+    /// list was already showing (a cold launch opens on the cache first) were still written while
+    /// the reader was away: they belong to the bar and the divider, not to "read on arrival".
+    /// Returns the first such row's index and how many there are (nil: nothing).
+    static func atOpen(_ items: [UnreadItem], markerAtOpen: ReadMarker?, openedAt: Int64) -> (first: Int, count: Int)? {
+        let before = items.enumerated().filter { $0.element.createdAt <= openedAt }
+        let rows = before.map(\.element)
+        guard let first = firstUnreadIndex(rows, marker: markerAtOpen) else { return nil }
+        return (before[first].offset, unreadCount(rows, marker: markerAtOpen))
+    }
+
     /// How many rows are unread (from `firstUnreadIndex` on, mine and system lines excluded).
     static func unreadCount(_ items: [UnreadItem], marker: ReadMarker?) -> Int {
         guard let first = firstUnreadIndex(items, marker: marker) else { return 0 }

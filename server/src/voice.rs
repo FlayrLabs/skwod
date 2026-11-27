@@ -40,7 +40,7 @@ pub fn routes() -> Router<AppState> {
         // WebSocket is up).
         .route("/rings", get(list_rings))
         // Voice/video setup: the instance owner (host) supplies LiveKit creds; any member reads status.
-        .route("/voice/config", get(get_voice_config).put(set_voice_config))
+        .route("/voice/config", get(get_voice_config).put(set_voice_config).delete(clear_voice_config))
 }
 
 /// The configured LiveKit ws URL (`wss://…`), if voice is set up on this instance.
@@ -53,10 +53,19 @@ async fn livekit_url(state: &AppState) -> Result<Option<String>, ApiError> {
 
 /// Public-to-members status: is voice/video set up, and (if so) the SFU URL clients connect to.
 /// Never returns the API secret — that stays server-side for token minting.
+///
+/// `status` (`on` / `starting` / `off`) and the short `reason` code are live (`livekit::status`).
+/// `bundled`: this skwod runs its own call server, so there is nothing to set up. `external`: the
+/// owner saved another one (and may clear it). A 0.50 app reads `configured` and `url` only.
 async fn get_voice_config(State(state): State<AppState>, _auth: AuthUser) -> Result<Json<Value>, ApiError> {
     let url = livekit_url(&state).await?;
     let configured = url.is_some() && livekit_creds(&state).await?.is_some();
-    Ok(Json(json!({ "configured": configured, "url": if configured { url } else { None } })))
+    let status = crate::livekit::status(&state).await;
+    let external = crate::livekit::external_url(&state).await.is_some();
+    Ok(Json(json!({
+        "configured": configured, "url": if configured { url } else { None },
+        "status": status.phase.as_str(), "reason": status.reason.code(), "bundled": status.bundled, "external": external,
+    })))
 }
 
 #[derive(Deserialize)]
@@ -94,6 +103,13 @@ async fn set_voice_config(
     // token (audit M-3).
     let payload = skwod_crypto::link::op_payload(&[url.as_bytes(), key.as_bytes(), secret.as_bytes()]);
     crate::keydir::destructive_authority(&state, &auth, &headers, "voice-config", "", &payload).await?;
+    let _settings = state.voice.settings().await;
+    // This skwod runs its own call server, and one saved here would silently keep that off on
+    // every start. Changing one that IS saved stays possible, and so does clearing it.
+    if state.voice.get().bundled && crate::livekit::external_url(&state).await.is_none() {
+        return Err(ApiError::Conflict("this skwod has its own call server: there is nothing to set up"));
+    }
+    let mut tx = state.db.begin().await?;
     for (name, value) in [("livekit_url", url), ("livekit_api_key", key), ("livekit_api_secret", secret)] {
         sqlx::query(
             "INSERT INTO instance_secrets (name, value, created_at) VALUES ($1, $2, $3)
@@ -102,10 +118,33 @@ async fn set_voice_config(
         .bind(name)
         .bind(value.as_bytes())
         .bind(now_ms())
-        .execute(&state.db)
+        .execute(&mut *tx)
         .await?;
     }
+    // From here on it is the owner's, whatever was advertised before.
+    sqlx::query("DELETE FROM instance_secrets WHERE name = 'livekit_managed'").execute(&mut *tx).await?;
+    tx.commit().await?;
+    state.voice.settings_changed();
+    tracing::info!("voice: the owner saved another call server");
     Ok(Json(json!({ "configured": true, "url": url })))
+}
+
+/// Owner only, device-signed like saving one: forget the saved call server, its key and its
+/// secret. Where the skwod has a bundled call server, that one starts (no restart needed). The
+/// bundled server's own settings are never cleared from here.
+async fn clear_voice_config(State(state): State<AppState>, auth: AuthUser, headers: axum::http::HeaderMap) -> Result<Json<Value>, ApiError> {
+    require_instance_owner(&state, &auth.user_id).await?;
+    crate::keydir::destructive_authority(&state, &auth, &headers, "voice-config-clear", "", b"").await?;
+    let _settings = state.voice.settings().await;
+    if crate::livekit::external_url(&state).await.is_none() {
+        return Ok(Json(json!({ "cleared": false })));
+    }
+    // The key and secret are the OTHER server's: left behind, the bundled one would be started
+    // with them.
+    sqlx::query("DELETE FROM instance_secrets WHERE name IN ('livekit_url', 'livekit_api_key', 'livekit_api_secret')").execute(&state.db).await?;
+    state.voice.settings_changed();
+    tracing::info!("voice: the owner cleared the saved call server");
+    Ok(Json(json!({ "cleared": true })))
 }
 
 /// LiveKit API key + secret, if this instance has voice configured.
@@ -160,9 +199,6 @@ async fn voice_token(
     p2p_peer: Option<axum::Extension<crate::client_key::P2pPeer>>,
     Path(channel_id): Path<String>,
 ) -> Result<Json<Value>, ApiError> {
-    // Fail closed: no LiveKit config → no token, ever.
-    let (api_key, api_secret) = livekit_creds(&state).await?.ok_or(ApiError::Forbidden)?;
-
     // Must be a voice channel the caller may connect to.
     let kind: Option<String> =
         sqlx::query_scalar("SELECT type FROM channels WHERE id = $1").bind(&channel_id).fetch_optional(&state.db).await?;
@@ -176,13 +212,19 @@ async fn voice_token(
     }
     let can_publish = perms::has_permission(p, perms::SPEAK_VOICE);
 
+    // Fail closed: no call server → no token, ever. Said as what it is (503 + code), and only to
+    // someone who may join: a 403 here means "you may not", nothing else.
+    let (Some((api_key, api_secret)), Some(url)) = (livekit_creds(&state).await?, livekit_url(&state).await?) else {
+        let status = crate::livekit::status(&state).await;
+        return Err(ApiError::VoiceOff { starting: status.phase == crate::livekit::VoicePhase::Starting, reason: status.reason.code() });
+    };
+
     let room = format!("{ROOM_PREFIX}{channel_id}");
     let now_secs = now_ms() / 1000;
     let token = sign_jwt(&api_key, &api_secret, &room, &auth.user_id, now_secs, can_publish);
     // Someone is about to join: the voice-state list looks at the room now (`voice_state.rs`).
     state.voice_states.token_minted(now_ms());
-    // Include the SFU URL so the client knows where to connect (it isn't surfaced anywhere else).
-    let url = livekit_url(&state).await?;
+    // The SFU URL is included so the client knows where to connect (it isn't surfaced anywhere else).
     // `tunnel`: the caller is on the p2p transport and the SFU is the host's local one — it must
     // reach LiveKit THROUGH its p2p connection (the client core swaps in its loopback URL); `url`
     // is the host-local address and is not dialable from the member's device.

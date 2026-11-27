@@ -59,6 +59,9 @@ pub enum ApiError {
     FileTooLarge { max_upload_bytes: u64 },
     /// The host is out of room (507). The message is shown to the user verbatim.
     InsufficientStorage(&'static str),
+    /// No call server is running right now (503): `starting` = one is on its way. Typed, so an
+    /// app can say "voice is off" instead of "check your connection". `reason` is a short code.
+    VoiceOff { starting: bool, reason: &'static str },
     /// Too many requests in the window.
     RateLimited,
     /// An unauthenticated p2p request arrived without a valid proof-of-work stamp
@@ -87,6 +90,10 @@ impl From<sqlx::Error> for ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        if let ApiError::VoiceOff { starting, reason } = self {
+            let (error, code) = if starting { ("voice is starting on this skwod", "voice_starting") } else { ("voice is off on this skwod", "voice_off") };
+            return (StatusCode::SERVICE_UNAVAILABLE, Json(json!({ "error": error, "code": code, "reason": reason }))).into_response();
+        }
         if let ApiError::ResetPending(completes_at) = self {
             return (StatusCode::FORBIDDEN, Json(json!({ "error": "device reset pending", "completes_at": completes_at }))).into_response();
         }
@@ -133,7 +140,7 @@ impl IntoResponse for ApiError {
             ApiError::Conflict(m) => (StatusCode::CONFLICT, m),
             ApiError::UpgradeRequired(m) => (StatusCode::UPGRADE_REQUIRED, m),
             ApiError::LinkRequired => (StatusCode::FORBIDDEN, "device link required"),
-            ApiError::ResetPending(_) | ApiError::RecoveryPending(..) | ApiError::PinIncorrect { .. } | ApiError::FileTooLarge { .. } => unreachable!("handled above"),
+            ApiError::VoiceOff { .. } | ApiError::ResetPending(_) | ApiError::RecoveryPending(..) | ApiError::PinIncorrect { .. } | ApiError::FileTooLarge { .. } => unreachable!("handled above"),
             ApiError::PinRequired => (StatusCode::FORBIDDEN, "registration pin required"),
             ApiError::DeviceSuperseded => (StatusCode::CONFLICT, "device superseded"),
             ApiError::DeviceRemoved => (StatusCode::FORBIDDEN, "device removed"),

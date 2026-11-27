@@ -104,8 +104,8 @@ struct MessageExtras {
     /// Who may be @mentioned here: (user id, shown name, username — what the token says).
     var mentionable: [MentionCandidate] = []
     /// Who may show as typing here (`TypingAudience`): the DM's peer, the group's held members,
-    /// the channel's server members. Empty = nobody.
-    var typingFrom: Set<String> = []
+    /// the channel's server members — with the name claimed for each. Empty = nobody.
+    var typingFrom: [String: String] = [:]
 }
 
 private struct MessageExtrasKey: EnvironmentKey {

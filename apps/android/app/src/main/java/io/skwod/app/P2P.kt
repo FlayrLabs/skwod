@@ -7,8 +7,14 @@ import android.net.NetworkCapabilities
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.ui.graphics.Color
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
+import uniffi.skwod_core.P2pHealth
 import uniffi.skwod_core.P2pSession
 import kotlinx.coroutines.withTimeoutOrNull
 import uniffi.skwod_core.p2pConnectHinted
@@ -24,7 +30,7 @@ sealed class ConnectionQuality {
     data class Direct(val rttMs: Int) : ConnectionQuality()
     /** Through a relay, because no direct route exists right now. */
     data class Relayed(val rttMs: Int) : ConnectionQuality()
-    /** We had a connection and lost it; the next request re-dials. */
+    /** We had a connection and lost it; it is being re-dialed ([SessionHealthRule]). */
     data object Reconnecting : ConnectionQuality()
     /** The host could not be reached at all (their machine is off, asleep or offline). */
     data object Offline : ConnectionQuality()
@@ -84,6 +90,31 @@ sealed class ConnectionQuality {
 /** The host could not be reached in time (the app's backstop; the core normally fails first). */
 class P2PConnectTimeout : Exception("could not reach the host: timed out")
 
+/** A dial that finished after the relay setting changed: it is not used. */
+class P2PStaleDial : Exception("dialed under a relay setting that has changed")
+
+/**
+ * Build 51: THE one check every raw request of the app passes ("may I send to this base right
+ * now?") — never a retired front URL, never a SUSPECT front — and the in-flight raw requests of a
+ * base whose front moved are cut ([cancel]).
+ */
+object RawSink {
+    fun allows(base: String?): Boolean {
+        if (base.isNullOrEmpty()) return false
+        return try { !uniffi.skwod_core.isRetiredBase(base) && !uniffi.skwod_core.isFrontSuspect(base) } catch (_: Throwable) { false }
+    }
+
+    private val live = java.util.WeakHashMap<java.net.HttpURLConnection, String>()
+    fun track(c: java.net.HttpURLConnection, base: String) = synchronized(live) { live[c] = base; Unit }
+
+    /** Cut every tracked request to [base]. */
+    fun cancel(base: String?) {
+        if (base.isNullOrEmpty()) return
+        val cut = synchronized(live) { live.entries.filter { UrlScope.isUnder(it.value, base) }.map { it.key } }
+        for (c in cut) try { c.disconnect() } catch (_: Exception) {}
+    }
+}
+
 object P2PManager {
     /** Connection state per host key, for the indicator. */
     val quality = mutableStateOf<Map<String, ConnectionQuality>>(emptyMap())
@@ -106,77 +137,272 @@ object P2PManager {
         }
     }
 
-    /** The loopback base URL for `nodeId` if a session is already up. */
-    fun liveBase(nodeId: String): String? = synchronized(sessions) { sessions[nodeId] }?.baseUrl()
+    // Build 51: one stable loopback FRONT per (host, account) — keyed by the workspace id once
+    // there is one (by the host's node id before sign-in, until a workspace adopts it). Its port
+    // and base URL never change while the app runs: a dead connection is replaced INSIDE the core
+    // ([P2pSession.reconnect]) and a listener the OS took away comes back ([ensureFront]). The
+    // token never crosses loopback: clients present the credential [P2pSession.signIn] hands out.
 
-    fun session(nodeId: String): P2pSession? = synchronized(sessions) { sessions[nodeId] }
+    /** The front's base URL for [key] if one is up. */
+    fun liveBase(key: String, nodeId: String? = null): String? = session(key, nodeId)?.baseUrl()
+
+    /** The front of [key] — only if it is for [nodeId] (when given): never another host's. */
+    fun session(key: String, nodeId: String? = null): P2pSession? {
+        val s = synchronized(sessions) { sessions[key] } ?: return null
+        return if (nodeId == null || (try { s.nodeId() } catch (_: Exception) { null }) == nodeId) s else null
+    }
+
+    /** Sign-out: out of the map AT ONCE (a new sign-in dials its own front); the caller ends it.
+     *  A dial in flight for [key] is invalidated (its key generation moves on). */
+    fun detach(key: String): P2pSession? {
+        synchronized(probeFailures) { probeFailures.remove(key) }
+        setQuality(key, null)
+        return synchronized(sessions) { keyGen[key] = (keyGen[key] ?: 0) + 1; sessions.remove(key) }
+    }
+
+    @Volatile private var relayGateSet = false
+    /** The core refuses relay-allowed dials until it knows the stored setting; every dial of the
+     *  app goes through [connect], and every change of it through [applyRelaySetting]. */
+    private fun relayGate(ctx: Context) = synchronized(sessions) {
+        if (!relayGateSet) { uniffi.skwod_core.p2pRelaysInit(AppSettings.get(ctx).publicFallback); relayGateSet = true }
+    }
+
+    /** Per key: bumped by [detach]/[disconnect] (under the `sessions` lock). */
+    private val keyGen = HashMap<String, Int>()
+
+    /** A workspace takes over the pre-sign-in front of its host, unless it has its own already. */
+    fun adopt(nodeId: String, key: String) {
+        if (key == nodeId) return
+        synchronized(sessions) {
+            if (sessions[key] != null) return
+            if ((try { sessions[nodeId]?.nodeId() } catch (_: Exception) { null }) != nodeId) return
+            val s = sessions.remove(nodeId) ?: return
+            sessions[key] = s
+        }
+        quality.value[nodeId]?.let { q -> setQuality(nodeId, null); setQuality(key, q) }
+    }
+
+    /** Bumped by [applyRelaySetting]: a dial started before it is never used ([DialRule]). */
+    @Volatile private var dialGeneration = 0
 
     /**
-     * Dial the host (or reuse the live session) and return the loopback base URL to use wherever a
+     * Dial the host for [key] (or reuse its front) and return the base URL to use wherever a
      * server URL goes. Concurrent callers share one dial. Throws when the host can't be reached.
      */
-    suspend fun connect(ctx: Context, nodeId: String, retry: Boolean = false): String {
-        liveBase(nodeId)?.let { return it }
+    suspend fun connect(ctx: Context, nodeId: String, retry: Boolean = false, key: String = nodeId): String {
+        session(key)?.let { s ->
+            if ((try { s.nodeId() } catch (_: Exception) { null }) == nodeId) return s.baseUrl()
+            // The workspace now names another host: its old front is closed first (its token is
+            // forgotten here only — nothing is ended on any host).
+            detach(key)
+            try { s.disconnect() } catch (_: Exception) {}
+            try { s.close() } catch (_: Exception) {}
+        }
         val (deferred, owner) = lock.withLock {
-            liveBase(nodeId)?.let { return it }
-            inflight[nodeId]?.let { it to false } ?: (CompletableDeferred<P2pSession>().also { inflight[nodeId] = it } to true)
+            liveBase(key)?.let { return it }
+            inflight[key]?.let { it to false } ?: (CompletableDeferred<P2pSession>().also { inflight[key] = it } to true)
         }
         if (!owner) return deferred.await().baseUrl()
-        val before = quality.value[nodeId]
-        // A background retry of a host that is known to be offline keeps saying "offline"
-        // instead of flickering to "connecting" every few seconds.
-        if (before == null || (before == ConnectionQuality.Offline && !retry)) setQuality(nodeId, ConnectionQuality.Connecting)
+        relayGate(ctx)
+        val (generation, kg) = synchronized(sessions) { dialGeneration to (keyGen[key] ?: 0) }
+        val fallback = AppSettings.get(ctx).publicFallback
+        val before = quality.value[key]
+        if (before == null || (before == ConnectionQuality.Offline && !retry)) setQuality(key, ConnectionQuality.Connecting)
         try {
-            // The home relay from the invite (if any) lets the first dial skip the lookup. The
-            // core gives up after ~20 s; this is the app's backstop, so a login can never spin
-            // forever.
-            // withTimeoutOrNull, not withTimeout: a CancellationException would be swallowed by
-            // waiters instead of shown as "couldn't reach your host".
             val session = withTimeoutOrNull((p2pConnectTimeoutSecs().toLong() + 5) * 1000) {
-                p2pConnectHinted(nodeId, AppSettings.get(ctx).publicFallback, RelayHints.get(nodeId))
+                p2pConnectHinted(nodeId, fallback, RelayHints.get(nodeId), routes?.load(key))
             } ?: throw P2PConnectTimeout()
-            synchronized(sessions) { sessions[nodeId] = session }
-            lock.withLock { inflight.remove(nodeId) }
+            // Dialed under a relay setting that no longer holds (relays turned off meanwhile): never used.
+            // …or for a key signed out meanwhile. The check and the insert are under the lock the
+            // generations are bumped under: nothing slips in between.
+            val inserted = synchronized(sessions) {
+                DialRule.usable(generation, dialGeneration, fallback, AppSettings.get(ctx).publicFallback, kg, keyGen[key] ?: 0)
+                    .also { if (it) sessions[key] = session }
+            }
+            if (!inserted) {
+                Thread { try { kotlinx.coroutines.runBlocking { session.disconnect() } } catch (_: Exception) {}; try { session.close() } catch (_: Exception) {} }.start()
+                throw P2PStaleDial()
+            }
+            watchProxy(session, key)
+            lock.withLock { if (inflight[key] === deferred) inflight.remove(key) }
             deferred.complete(session)
-            refresh(nodeId)
+            refresh(key)
             return session.baseUrl()
         } catch (e: Exception) {
-            lock.withLock { inflight.remove(nodeId) }
-            setQuality(nodeId, ConnectionQuality.Offline)
+            lock.withLock { if (inflight[key] === deferred) inflight.remove(key) }
+            setQuality(key, ConnectionQuality.Offline)
             deferred.completeExceptionally(e)
             throw e
         }
     }
 
-    /** Re-read direct/relayed + latency for one host (cheap; local only). */
-    suspend fun refresh(nodeId: String) {
-        val s = session(nodeId) ?: return
+    /** Re-read direct/relayed + latency for one front (cheap; local only). */
+    suspend fun refresh(key: String) {
+        val s = session(key) ?: return
+        routes?.takeIf { it.mayKeep(key) }?.let { kept -> (try { s.takeRoutes() } catch (_: Exception) { null })?.let { kept.save(key, it) } }
+        // The host did not answer the last probe: "Reconnecting…" until it answers again.
+        if (synchronized(probeFailures) { probeFailures[key] ?: 0 } > 0) { setQuality(key, ConnectionQuality.Reconnecting); return }
         val p = try { s.path() } catch (_: Exception) { return }
-        setQuality(nodeId, when (p.kind) {
+        setQuality(key, when (p.kind) {
             "direct" -> ConnectionQuality.Direct(p.rttMs.toInt())
             "relay" -> ConnectionQuality.Relayed(p.rttMs.toInt())
             else -> ConnectionQuality.Reconnecting
         })
     }
 
-    /** Wi-Fi ↔ cellular, or back from the background: tell every session so it re-probes its path. */
-    suspend fun networkChanged() {
-        val all = synchronized(sessions) { sessions.toMap() }
-        for ((id, s) in all) {
-            try { s.networkChanged() } catch (_: Exception) {}
-            refresh(id)
+    private val probeFailures = HashMap<String, Int>()
+    private val probing = HashSet<String>()
+
+    /** What a health check did: nothing the app has to do, or the front moved (re-bind). */
+    sealed class HealthOutcome {
+        data object Unchanged : HealthOutcome()
+        data class Moved(val base: String, val credential: String?) : HealthOutcome()
+        /** Not proved ours, or being checked right now: never "healthy" ([FrontProof]). */
+        data object Unproved : HealthOutcome()
+    }
+
+    /**
+     * Is the front for [key] still usable? [P2pSession.check] answers two things: the front's
+     * listener alive and PROVED ours (in process) — if not, it listens again ([ensureFront]); and
+     * the host answering over the connection — if not (one failure when urgent, two in a row
+     * otherwise, [SessionHealthRule]) the connection is replaced inside the core, paced there.
+     * Neither changes the base URL, except a move. Errors count as failures (fail closed).
+     */
+    /** [callActive]: only DELAYS a re-key ([ensureFront]); a proof that failed leaves the front suspect. */
+    suspend fun checkHealth(key: String, urgent: Boolean, callActive: Boolean = false): HealthOutcome {
+        val s = session(key) ?: return HealthOutcome.Unchanged
+        if (!synchronized(probing) { probing.add(key) }) return HealthOutcome.Unproved
+        try {
+            // Still SUSPECT (back from the background): proved ours — or re-keyed — first.
+            if (try { uniffi.skwod_core.isFrontSuspect(s.baseUrl()) } catch (_: Throwable) { true }) {
+                val r = ensureFront(key, callActive)
+                if (r != HealthOutcome.Unchanged) return r
+            }
+            val health = try {
+                if (s.proxyClosed()) P2pHealth(proxyOk = false, upstreamOk = false)
+                else s.check(SessionHealthRule.PROBE_TIMEOUT_MS.toUInt())
+            } catch (_: Exception) { P2pHealth(proxyOk = false, upstreamOk = false) }
+            if (session(key) !== s) return HealthOutcome.Unchanged
+            if (!health.proxyOk) {
+                // (SUSPECT already, in the core. The host was not asked: the check stopped here.)
+                val r = ensureFront(key, callActive)
+                return if (r == HealthOutcome.Unchanged) HealthOutcome.Unproved else r
+            }
+            val (failures, outcome) = SessionHealthRule.next(synchronized(probeFailures) { probeFailures[key] ?: 0 }, true, health.upstreamOk, urgent)
+            synchronized(probeFailures) { probeFailures[key] = failures }
+            when (outcome) {
+                SessionHealthRule.Outcome.HEALTHY -> refresh(key)
+                SessionHealthRule.Outcome.DEGRADED -> setQuality(key, ConnectionQuality.Reconnecting)
+                SessionHealthRule.Outcome.REPLACE -> {
+                    setQuality(key, ConnectionQuality.Reconnecting)
+                    val ok = try { s.reconnect(null); true } catch (_: Exception) { false }
+                    if (ok) { synchronized(probeFailures) { probeFailures[key] = 0 }; refresh(key) }
+                }
+            }
+            return HealthOutcome.Unchanged
+        } finally {
+            synchronized(probing) { probing.remove(key) }
         }
     }
 
-    /** Close one session (leaving a skwod). */
-    suspend fun disconnect(nodeId: String) {
-        val s = synchronized(sessions) { sessions.remove(nodeId) }
-        try { s?.disconnect() } catch (_: Exception) {}
-        try { s?.close() } catch (_: Exception) {}
-        setQuality(nodeId, null)
+    /**
+     * Prove the front ours, or re-key it. [HealthOutcome.Unchanged] only when it IS proved.
+     * [callActive]: a challenge merely unanswered waits with the re-key (and stays suspect); a
+     * port that is not ours re-keys all the same.
+     */
+    suspend fun ensureFront(key: String, callActive: Boolean = false): HealthOutcome {
+        val s = session(key) ?: return HealthOutcome.Unchanged
+        val state = try { if (callActive) s.ensureFrontDeferring() else s.ensureFront() } catch (_: Exception) { return HealthOutcome.Unproved }
+        if (session(key) !== s) return HealthOutcome.Unproved
+        val suspect = try { uniffi.skwod_core.isFrontSuspect(s.baseUrl()) } catch (_: Throwable) { true }
+        return when (FrontProof.of(state.relistened, state.failed, suspect)) {
+            FrontProof.PROVED -> HealthOutcome.Unchanged
+            FrontProof.MOVED -> HealthOutcome.Moved(state.baseUrl, state.credential)
+            FrontProof.UNPROVED -> HealthOutcome.Unproved
+        }
     }
 
-    /** Close everything (sign-out, or the relay setting changed and sessions must be re-dialed). */
+    /** Going to the background, and back in front: every front is SUSPECT until [ensureFront]
+     *  proves it ours. [except]: [ForegroundRule.exempt]. */
+    fun suspendAll(except: String? = null) {
+        for ((key, s) in synchronized(sessions) { sessions.toMap() }) if (key != except) try { s.suspend() } catch (_: Exception) {}
+    }
+
+    /**
+     * The relay setting changed: every connection is replaced under the new setting behind its
+     * front (turning relays off closes the relayed ones at once, in the core). Dials in flight
+     * were started under the old setting: their waiters fail, and they are discarded.
+     */
+    /** False: turning relays off failed in the core — every session is disconnected (fail closed).
+     *  Off takes effect at once; the rest is in order ([RelayRuns]). */
+    suspend fun applyRelaySetting(ctx: Context): Boolean = withContext(NonCancellable) {
+        relayGate(ctx)
+        synchronized(sessions) { ++dialGeneration }
+        val dials = lock.withLock { inflight.values.toList().also { inflight.clear() } }
+        for (d in dials) d.completeExceptionally(P2PStaleDial())
+        relayRuns.changed(
+            setting = { AppSettings.get(ctx).publicFallback },
+            revoke = { uniffi.skwod_core.p2pRelaysRevoke() },
+            turnOn = { uniffi.skwod_core.p2pRelaysOn() },
+            // Confirmed by the core: nothing in this process may use a relay any more.
+            turnOff = { uniffi.skwod_core.p2pRelaysOff() },
+            // Every session at once, and not cancellable: a caller going away does not leave one
+            // session on the old setting.
+            redial = { fallback ->
+                coroutineScope {
+                    synchronized(sessions) { sessions.toMap() }.map { (key, s) ->
+                        async {
+                            setQuality(key, ConnectionQuality.Reconnecting)
+                            try { s.reconnect(fallback) } catch (_: Exception) {}
+                            refresh(key)
+                        }
+                    }.awaitAll()
+                }
+            },
+            disconnectAll = {
+                for (s in synchronized(sessions) { sessions.values.toList() }) RawSink.cancel(try { s.baseUrl() } catch (_: Exception) { null })
+                disconnectAll()
+            },
+        )
+    }
+    private val relayRuns = RelayRuns()
+
+    /** Told (with the front's key) the moment a front's listener fails for good. */
+    @Volatile var onProxyClosed: ((String) -> Unit)? = null
+
+    /** Build 51: where a skwod's host was last reached directly (the core's, opaque), for dialing it with
+     *  relays off. It says where the host is: the encrypted store only, and only while signed in. */
+    class DirectRoutes(val mayKeep: (String) -> Boolean, private val get: (String) -> String?, private val put: (String, String) -> Unit) {
+        fun load(key: String): String? = if (mayKeep(key)) get(LocalData.routesName(key)) else null
+        fun save(key: String, blob: String) = put(LocalData.routesName(key), blob)
+    }
+    @Volatile var routes: DirectRoutes? = null
+
+    private fun watchProxy(s: P2pSession, key: String) {
+        Thread {
+            try { kotlinx.coroutines.runBlocking { s.waitProxyClosed() } } catch (_: Exception) { return@Thread }
+            if (session(key) === s) onProxyClosed?.invoke(key)
+        }.apply { isDaemon = true; name = "skwod-proxy-watch" }.start()
+    }
+
+    /** Wi-Fi ↔ cellular, or back from the background: tell every session so it re-probes its path. */
+    suspend fun networkChanged() {
+        for ((key, s) in synchronized(sessions) { sessions.toMap() }) {
+            try { s.networkChanged() } catch (_: Exception) {}
+            refresh(key)
+        }
+    }
+
+    /** Close one front (leaving a skwod, signing out — after its logout went out). */
+    suspend fun disconnect(key: String) {
+        val s = synchronized(sessions) { keyGen[key] = (keyGen[key] ?: 0) + 1; sessions.remove(key) }
+        synchronized(probeFailures) { probeFailures.remove(key) }
+        try { s?.disconnect() } catch (_: Exception) {}
+        try { s?.close() } catch (_: Exception) {}
+        setQuality(key, null)
+    }
+
+    /** Close everything (sign-out of every skwod). */
     suspend fun disconnectAll() {
         for (id in synchronized(sessions) { sessions.keys.toList() }) disconnect(id)
     }

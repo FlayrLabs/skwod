@@ -250,7 +250,8 @@ final class FeedModel: ObservableObject {
     /// Post a comment on `postId` — a real E2EE channel message, synced to every member.
     func comment(on postId: String, text: String) async {
         let t = text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard let app, let client = app.client, !t.isEmpty else { return }
+        // (The skwod this feed was read from, at the tap.)
+        guard let app, !t.isEmpty, let client = Outbox.client(of: chat?.spacesWorkspaceId, app) else { if !t.isEmpty { error = Compose.opening }; return }
         guard let cid = posts.first(where: { $0.id == postId })?.channelId, !cid.isEmpty else {
             error = "That post isn't available any more."
             return
@@ -350,11 +351,16 @@ final class FeedModel: ObservableObject {
         let tag = draft.isStory ? STORY_TAG : FEED_TAG
         // One at a time: a second tap while the first is still uploading posts nothing.
         guard !posting else { return false }
-        guard let app, let client = app.client, let chat else {
+        // Where it goes and through what is settled here, at the tap.
+        guard let app, let chat, let client = Outbox.client(of: chat.spacesWorkspaceId, app) else {
             error = "Not connected — your \(what) wasn't sent."
             failedDraft = draft
             return false
         }
+        let asked = app.bindTicket()
+        let store = BlobStore(app: app)
+        let target = serverId ?? chat.currentServer?.serverId ?? chat.serverGroups.first?.serverId ?? ""
+        let known = sources.first(where: { $0.serverId == target })?.channelId
         posting = true
         sendingStory = draft.isStory
         sendPhase = photo == nil ? .sending : .encrypting
@@ -362,8 +368,7 @@ final class FeedModel: ObservableObject {
         error = nil
         failedDraft = nil
         await UploadLimitSync.refresh(app)
-        if chat.feedChannels.isEmpty { await chat.resolveFeedChannels() }
-        let target = serverId ?? chat.currentServer?.serverId ?? chat.serverGroups.first?.serverId ?? ""
+        if let asked, app.holds(asked), chat.feedChannels.isEmpty { await chat.resolveFeedChannels() }
         // Ask the core for this server's feed channel now (the owner's app creates it on first
         // use) rather than trusting a value resolved a while ago.
         let cid: String
@@ -371,7 +376,7 @@ final class FeedModel: ObservableObject {
         catch {
             // Offline: the feed channel this device already knows for that server will do —
             // the post is queued and goes out later.
-            guard let known = sources.first(where: { $0.serverId == target })?.channelId, !known.isEmpty else {
+            guard let known, !known.isEmpty else {
                 self.error = "Your \(what) wasn't sent: couldn't find this server's feed. " + sendFailureText(error)
                 failedDraft = draft
                 return false
@@ -381,7 +386,6 @@ final class FeedModel: ObservableObject {
         var payload = FeedPayload(text: text.isEmpty ? nil : text, music: music, photoB64: nil, att: nil, clip: draft.clip,
                                   ts: Int64(Date().timeIntervalSince1970 * 1000))
         var blobIds: [String] = []
-        let store = BlobStore(app: app)
         do {
             if let photo {
                 guard let store else { throw AttachmentError.notSignedIn }

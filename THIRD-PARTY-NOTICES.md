@@ -43,7 +43,7 @@ trademark of Signal Messenger, LLC.
 |---|---|---|
 | iroh (`iroh`, `iroh-base`, `iroh-relay`, `iroh-dns`, `iroh-mainline-address-lookup`) — n0, inc. | 1.4.1 | MIT OR Apache-2.0 |
 | noq (QUIC; `noq`, `noq-proto`, `noq-udp`) — n0, inc. | 1.4.0 | MIT OR Apache-2.0 |
-| `n0-mainline` (BitTorrent Mainline DHT client) | 0.7.2 | MIT OR Apache-2.0 |
+| `n0-mainline` (BitTorrent Mainline DHT client), **modified**: `core/vendor/n0-mainline-0.7.2.patch` | 0.7.2 | MIT OR Apache-2.0 |
 | `portmapper`, `netwatch` — n0, inc. | 0.19.3 | MIT OR Apache-2.0 |
 | `swarm-discovery` (mDNS, opt-in LAN discovery) | 0.6.6 | Apache-2.0 |
 | `igd-next` (UPnP), `simple-dns` | 0.17.1, 0.12.0 | MIT |

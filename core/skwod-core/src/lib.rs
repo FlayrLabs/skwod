@@ -22,6 +22,7 @@ use skwod_sync::{ApiClient, Engine, EngineError, LoadOutcome, PeerId};
 
 uniffi::setup_scaffolding!();
 
+mod cache_lease;
 mod content;
 mod outbox;
 mod upload;
@@ -40,6 +41,10 @@ pub enum CoreError {
     Engine { detail: String },
     #[error("invalid argument: {detail}")]
     Invalid { detail: String },
+    /// NOT sent: this client's sign-in on its front was replaced (`ClientError::StaleCredential`,
+    /// and nothing else — never made from anything a host says). The app binds again.
+    #[error("{detail}")]
+    SignInReplaced { detail: String },
     /// The app and the server speak different E2EE protocol generations. `detail` is a
     /// user-facing sentence ("update required: …"); show it and offer the update.
     #[error("{detail}")]
@@ -88,6 +93,50 @@ pub enum CoreError {
     /// open cache (that is `Cache`).
     #[error("no cache attached: {detail}")]
     NoCache { detail: String },
+    /// Joining a call failed, and where (build 51). `code`, for the apps' own fixed sentences —
+    /// nothing a host wrote is ever in it:
+    /// `off` / `starting` (the host runs no call server right now), `no_access` (may not join this
+    /// channel), `unreachable` (the host did not answer), `unavailable` (the host refused the
+    /// voice tunnel), `port_taken` (another call holds this device's media port).
+    #[error("voice: {code}")]
+    Voice { code: String },
+}
+
+/// What a failed voice request means for the person joining ([`CoreError::Voice`]). `None`: it is
+/// not about voice (an update, a replaced sign-in, a removed device…) and stays what it was.
+fn voice_code(e: &skwod_sync::ClientError) -> Option<&'static str> {
+    use skwod_sync::ClientError;
+    let said = |body: &str, field: &str| serde_json::from_str::<serde_json::Value>(body).ok().and_then(|v| v[field].as_str().map(str::to_string));
+    match e {
+        // Only these codes are read: a host's words are never shown.
+        ClientError::Status { status: 503, body } => Some(match said(body, "code").as_deref() {
+            Some("voice_starting") => "starting",
+            Some("voice_off") => "off",
+            _ => "unreachable", // the host is stopped, or a gateway answered for it
+        }),
+        ClientError::Status { status: 403 | 404, body } => {
+            matches!(said(body, "error").as_deref(), Some("forbidden" | "not found" | "waiting for approval")).then_some("no_access")
+        }
+        ClientError::Status { status: 502 | 504, .. } | ClientError::Transport(_) => Some("unreachable"),
+        _ => None,
+    }
+}
+
+fn voice_client_error(e: skwod_sync::ClientError) -> CoreError {
+    match voice_code(&e) {
+        Some(code) => CoreError::Voice { code: code.into() },
+        None => e.into(),
+    }
+}
+
+fn voice_engine_error(e: EngineError) -> CoreError {
+    match &e {
+        EngineError::Client(c) => match voice_code(c) {
+            Some(code) => CoreError::Voice { code: code.into() },
+            None => e.into(),
+        },
+        _ => e.into(),
+    }
 }
 
 impl From<skwod_sync::CacheError> for CoreError {
@@ -98,6 +147,7 @@ impl From<skwod_sync::CacheError> for CoreError {
 impl From<EngineError> for CoreError {
     fn from(e: EngineError) -> Self {
         match e {
+            EngineError::Client(skwod_sync::ClientError::StaleCredential) => CoreError::from(skwod_sync::ClientError::StaleCredential),
             EngineError::UpdateRequired(detail) => CoreError::UpdateRequired { detail },
             EngineError::IdentityChanged(_) => CoreError::IdentityChanged { detail: e.to_string() },
             EngineError::LinkRequired => CoreError::LinkRequired { detail: e.to_string() },
@@ -121,7 +171,10 @@ impl From<EngineError> for CoreError {
 }
 impl From<skwod_sync::ClientError> for CoreError {
     fn from(e: skwod_sync::ClientError) -> Self {
-        CoreError::Engine { detail: e.to_string() }
+        match e {
+            skwod_sync::ClientError::StaleCredential => CoreError::SignInReplaced { detail: e.to_string() },
+            e => CoreError::Engine { detail: e.to_string() },
+        }
     }
 }
 
@@ -410,7 +463,7 @@ pub struct SkwodClient {
     /// Optional on-device encrypted cache backing engine-state + message persistence.
     cache: std::sync::Arc<Mutex<Option<Cache>>>,
     /// Direct REST access for endpoints the engine doesn't own (e.g. key backup).
-    api: ApiClient,
+    api: std::sync::RwLock<ApiClient>,
     /// This account's user id once known (mirrors the engine's; refreshed whenever state is
     /// persisted). The cache treats it and [`SELF_AUTHOR`] as the same author.
     self_user: Mutex<Option<String>>,
@@ -430,8 +483,11 @@ pub struct SkwodClient {
     outbox_gate: tokio::sync::Mutex<()>,
     /// Where the attached cache lives (for "erase this device").
     cache_path: Mutex<Option<String>>,
-    /// Tests and tools only: allow registering with no cache attached.
-    ephemeral_ok: std::sync::atomic::AtomicBool,
+    /// Whether the cache may still be used, and what must not be cut short (`cache_lease.rs`).
+    cache_use: std::sync::Arc<cache_lease::CacheUse>,
+    /// Tests and tools only: allow registering with no cache attached (and take state that is
+    /// kept in memory only for stored).
+    ephemeral_ok: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// Where this install stands with the account (see `SkwodClient::device_state`).
@@ -575,17 +631,25 @@ impl SkwodClient {
     #[uniffi::constructor]
     pub fn new(base_url: String, token: String) -> std::sync::Arc<Self> {
         let api = ApiClient::new(base_url).with_token(token);
+        let cache = std::sync::Arc::new(Mutex::new(None));
+        let cache_use = std::sync::Arc::new(cache_lease::CacheUse::default());
+        let ephemeral_ok = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        // The sinks are there from the start, so there is no moment at which the engine could
+        // seal something with nowhere to store the state that sealed it (see `install_sinks`).
+        let mut engine = Engine::new(api.clone());
+        install_sinks(&mut engine, &cache, &cache_use, &ephemeral_ok);
         std::sync::Arc::new(Self {
-            engine: tokio::sync::Mutex::new(Engine::new(api.clone())),
-            cache: std::sync::Arc::new(Mutex::new(None)),
-            api,
+            engine: tokio::sync::Mutex::new(engine),
+            cache,
+            api: std::sync::RwLock::new(api),
             self_user: Mutex::new(None),
             dm_events: Mutex::new(Vec::new()),
             blocked: Mutex::new(Default::default()),
             pending_restore: Mutex::new(None),
             outbox_gate: tokio::sync::Mutex::new(()),
             cache_path: Mutex::new(None),
-            ephemeral_ok: std::sync::atomic::AtomicBool::new(false),
+            cache_use,
+            ephemeral_ok,
         })
     }
 
@@ -597,69 +661,43 @@ impl SkwodClient {
     /// `"protocol_upgraded"` notice is queued (see `take_security_notices`).
     pub async fn attach_cache(&self, path: String, key_hex: String) -> Result<bool, CoreError> {
         let key = hex_to_32(&key_hex).ok_or(CoreError::Invalid { detail: "key must be 64 hex chars".into() })?;
-        let cache = match Cache::open(&PathBuf::from(&path), &key) {
-            Ok(cache) => cache,
-            // The file is there but this key does not open it (the key was lost or replaced, or
-            // the file is damaged). Failing here on every launch is a loop the user cannot
-            // leave; registering without a cache would mint a device that forgets itself. So:
-            // move the unreadable file ASIDE (nothing is deleted — it can still be opened if
-            // its key turns up), start a fresh cache under this key, and say so. The caller
-            // sees "no device restored" and takes the normal recovery path.
-            Err(skwod_sync::CacheError::BadKey) => {
-                set_aside(&path);
-                let cache = Cache::open(&PathBuf::from(&path), &key)?;
-                let _ = cache.kv_set(CACHE_RESET_KEY, &now_ms().to_string());
-                cache
-            }
-            Err(e) => return Err(e.into()),
+        // Opening touches the file: under the slot's lock, so `CacheLease::detach` either comes
+        // first (nothing is opened) or waits for the open to end.
+        let (cache, stored) = {
+            let _opening = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            self.cache_use.refuse_if_detached()?;
+            let cache = open_or_set_aside(&path, &key)?;
+            let stored = cache.session_get(ENGINE_STATE_KEY)?;
+            (cache, stored)
         };
         *self.cache_path.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
-        let outcome = match cache.session_get(ENGINE_STATE_KEY)? {
-            Some(bytes) => {
-                let mut engine = self.engine.lock().await;
-                let outcome = engine.load_state(&bytes);
+        // Loading the state, putting the cache in the slot and installing the stores happen under
+        // ONE hold of the engine: nothing else of this client sees a restored identity before the
+        // cache it must be saved to is in place (the state and event sinks are installed in `new`
+        // and read the slot when called).
+        let outcome = {
+            let mut engine = self.engine.lock().await;
+            let outcome = match &stored {
+                Some(bytes) => engine.load_state(bytes),
+                None => LoadOutcome::Unreadable,
+            };
+            let mut slot = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = self.cache_use.refuse_if_detached() {
+                // Detached while opening: what was loaded from it must not be used either.
+                *engine = Engine::new(self.api());
+                install_sinks(&mut engine, &self.cache, &self.cache_use, &self.ephemeral_ok);
+                return Err(e);
+            }
+            *slot = Some(cache);
+            drop(slot);
+            // What was sent is kept (encrypted, ~30 days) to send again from.
+            engine.set_sent_store(Box::new(CacheSentStore(self.cache.clone())));
+            if stored.is_some() {
                 *self.self_user.lock().unwrap_or_else(|e| e.into_inner()) = engine.user_id().map(str::to_string);
                 *self.blocked.lock().unwrap_or_else(|e| e.into_inner()) = engine.blocked_users().into_iter().collect();
-                outcome
             }
-            None => LoadOutcome::Unreadable,
+            outcome
         };
-        *self.cache.lock().unwrap_or_else(|e| e.into_inner()) = Some(cache);
-        // Membership events ("X joined (approved by Y)", "X added a device") are written into the
-        // channel BEFORE the engine hands that user or device a key: the engine calls this sink
-        // and only proceeds when the row is in the cache.
-        let sink_cache = self.cache.clone();
-        self.engine.lock().await.set_event_sink(Box::new(move |e| {
-            let row = system_row(&e.scope, &e.kind, &e.user_id, &e.device_id, e.by_user_id.as_deref(), false, e.at_ms as i64);
-            match sink_cache.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                Some(cache) => cache.insert_core_row(&row).is_ok(),
-                None => false,
-            }
-        }));
-        // Before anything encrypted leaves, the state that sealed it — and the message itself —
-        // is written here in one transaction (see `skwod_sync::StateSink`).
-        let state_cache = self.cache.clone();
-        self.engine.lock().await.set_state_sink(Box::new(move |state, row| {
-            let row = row.map(|r| CachedMessage {
-                message_id: r.message_id.clone(),
-                scope: r.scope.clone(),
-                author_id: Some(SELF_AUTHOR.to_string()),
-                content: Some(r.text.clone()),
-                reply_to_id: r.reply_to_id.clone(),
-                is_edited: false,
-                is_pinned: false,
-                deleted_at: None,
-                created_at: r.created_at,
-                updated_at: r.created_at,
-                kind: skwod_sync::cache::KIND_PLAIN,
-            });
-            match state_cache.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-                Some(cache) => cache.persist_send(ENGINE_STATE_KEY, state, row.as_ref()).is_ok(),
-                None => true,
-            }
-        }));
-        // What was sent is kept (encrypted, ~30 days) to send again from.
-        self.engine.lock().await.set_sent_store(Box::new(CacheSentStore(self.cache.clone())));
         if outcome == LoadOutcome::Migrated {
             // Replace the v1 blob now, so the old key material is gone from disk and the migration
             // is not repeated on the next launch.
@@ -685,12 +723,7 @@ impl SkwodClient {
             self.apply_channel_delete(&d);
         }
         let bytes = engine.export_state();
-        let stored = match self.cache.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
-            Some(cache) => cache.session_put(ENGINE_STATE_KEY, &bytes, 0).is_ok(),
-            // No cache attached: state is memory-only by the caller's choice.
-            None => true,
-        };
-        if stored {
+        if self.store_state(&bytes) {
             let _ = engine.ack_inbox().await;
         }
     }
@@ -739,7 +772,7 @@ impl SkwodClient {
                     }
                     fresh
                 }
-                None => true,
+                None => !self.cache_use.detached(),
             };
             if fresh {
                 let mut events = self.dm_events.lock().unwrap_or_else(|e| e.into_inner());
@@ -840,6 +873,12 @@ impl SkwodClient {
         Ok(cache.kv_set(&key, &value)?)
     }
 
+    /// The right to use this client's cache, as something the holder of a cross-process lock can
+    /// end at once, from any thread (`CacheLease`). Taken before `attach_cache`.
+    pub fn cache_lease(&self) -> std::sync::Arc<cache_lease::CacheLease> {
+        cache_lease::CacheLease::new(&self.cache, self.cache_use.clone())
+    }
+
     /// Is a cache attached (`attach_cache` succeeded on this client)?
     pub fn cache_attached(&self) -> bool {
         self.cache.lock().unwrap_or_else(|e| e.into_inner()).is_some()
@@ -849,6 +888,7 @@ impl SkwodClient {
     /// account's FIRST device: once an account has a device, a session token alone cannot add
     /// another — this fails with `LinkRequired` and the device must be linked (below).
     pub async fn register_device(&self) -> Result<String, CoreError> {
+        let _whole = self.cache_use.critical();
         self.require_cache()?;
         let id = self.engine.lock().await.register().await?;
         self.persist().await;
@@ -875,6 +915,7 @@ impl SkwodClient {
     /// Poll a link started with `begin_device_link`: null until an existing device approved, then
     /// this device's new id (it is registered and verified at that point).
     pub async fn complete_device_link(&self) -> Result<Option<String>, CoreError> {
+        let _whole = self.cache_use.critical();
         self.require_cache()?;
         let result = self.engine.lock().await.complete_link().await;
         self.persist().await;
@@ -894,7 +935,7 @@ impl SkwodClient {
     /// This skwod's p2p address and current home relay (`GET /api/instance/p2p`), for the QR an
     /// existing device shows. `None` when the skwod has no p2p endpoint.
     pub async fn instance_p2p(&self) -> Result<Option<InstanceP2p>, CoreError> {
-        let v = self.api.get("/api/instance/p2p").await.map_err(|e| CoreError::Engine { detail: e.to_string() })?;
+        let v = self.api().get("/api/instance/p2p").await.map_err(|e| CoreError::Engine { detail: e.to_string() })?;
         if v["enabled"].as_bool() != Some(true) {
             return Ok(None);
         }
@@ -926,6 +967,9 @@ impl SkwodClient {
     /// the session the server issued for it (store it as for a log-in). Errors when the pairing
     /// expired, was refused, or the nonce does not match the QR.
     pub async fn pair_poll(&self, offer: pairing::PairingOffer) -> Result<PairProgress, CoreError> {
+        let _whole = self.cache_use.critical();
+        // (A poll may claim the one session and register: never with nowhere to remember it.)
+        self.require_cache()?;
         let mut engine = self.engine.lock().await;
         let polled = engine.pair_poll().await;
         let identity = engine.identity_key();
@@ -1057,6 +1101,7 @@ impl SkwodClient {
     /// one this throws `ResetPending` the first time: the reset is on hold for 7 days so any
     /// device still on the account can cancel it; call again afterwards to complete.
     pub async fn reset_devices(&self, pin: Option<String>) -> Result<String, CoreError> {
+        let _whole = self.cache_use.critical();
         self.require_cache()?;
         let result = self.engine.lock().await.register_reset(pin.as_deref()).await;
         self.persist().await;
@@ -1066,6 +1111,7 @@ impl SkwodClient {
     /// `reset_devices` when the registration-lock PIN is forgotten: no shortcut — the same
     /// cancellable 7-day hold as an account without a PIN (`ResetPending`, then call again).
     pub async fn reset_devices_forgot_pin(&self) -> Result<String, CoreError> {
+        let _whole = self.cache_use.critical();
         self.require_cache()?;
         let result = self.engine.lock().await.register_reset_forgot_pin().await;
         self.persist().await;
@@ -1153,6 +1199,42 @@ impl SkwodClient {
     /// name, new keys and a new invite — which the host has to hand out.
     pub async fn delete_account_and_ban(&self, user_id: String) -> Result<(), CoreError> {
         Ok(self.engine.lock().await.delete_account_and_ban(&user_id).await?)
+    }
+
+    /// This client was made with no way to its host (a base URL nothing answers at and no token: the
+    /// cache and the outbox are usable, and queued messages wait). The host was reached: from now on
+    /// everything goes to `base_url` presenting `token` — the same client, engine and open cache, with
+    /// nothing read again. `pinned_server_key` (the workspace's, when it has one) is applied first, as
+    /// [`Self::set_pinned_server_key`] does: if it cannot be, nothing changes — the client has no way
+    /// to any host, and asks nobody anything. The session is bound ([`Self::bind_session`]) first,
+    /// under the engine's lock (nothing else of this client asks anything meanwhile), and the new
+    /// way is kept only if that worked (`Ok`): on an error — the host not reached, this install
+    /// superseded or removed — the client keeps the way it had, and the error is that call's.
+    pub async fn go_online(&self, base_url: String, token: String, pinned_server_key: Option<String>) -> Result<bool, CoreError> {
+        let pin = pinned_server_key.as_deref().map(server_key).transpose()?;
+        let api = ApiClient::new(base_url).with_token(token);
+        let bound = {
+            let mut engine = self.engine.lock().await;
+            if let Some(pin) = pin {
+                engine.set_pinned_instance_key(pin);
+            }
+            let before = engine.saved_api();
+            engine.set_api(api.clone());
+            match engine.bind_if_registered().await {
+                Ok(bound) => {
+                    *self.api.write().unwrap_or_else(|e| e.into_inner()) = api;
+                    bound
+                }
+                Err(e) => {
+                    engine.restore_api(before);
+                    return Err(e.into());
+                }
+            }
+        };
+        if bound {
+            self.persist().await;
+        }
+        Ok(bound)
     }
 
     /// Bind this session to this install of the device, now. **Apps call this right after
@@ -1323,12 +1405,7 @@ impl SkwodClient {
     /// signed it, so the server cannot substitute a certificate authority of its own after the
     /// fact. Call right after constructing the client for a workspace that has a pin.
     pub async fn set_pinned_server_key(&self, server_public_b64: String) -> Result<(), CoreError> {
-        use base64::engine::general_purpose::STANDARD as B64;
-        use base64::Engine as _;
-        let key = B64.decode(server_public_b64.as_bytes()).map_err(|_| CoreError::Invalid { detail: "pinned key is not base64".into() })?;
-        if key.len() != 32 {
-            return Err(CoreError::Invalid { detail: "pinned key must be 32 bytes".into() });
-        }
+        let key = server_key(&server_public_b64)?;
         self.engine.lock().await.set_pinned_instance_key(key);
         self.persist().await;
         Ok(())
@@ -1658,10 +1735,10 @@ impl SkwodClient {
     /// Is this client's session still good? Tells "signed out" (401 → clear the session, show
     /// login) apart from "cannot reach the server" (keep it, retry).
     pub async fn session_state(&self) -> SessionState {
-        match self.api.get("/api/auth/me").await {
-            Ok(_) => SessionState::Valid,
-            Err(skwod_sync::ClientError::Status { status: 401, .. }) => SessionState::SignedOut,
-            Err(_) => SessionState::Unreachable,
+        match self.api().session_check().await {
+            skwod_sync::client::SessionCheck::Valid => SessionState::Valid,
+            skwod_sync::client::SessionCheck::Ended => SessionState::SignedOut,
+            skwod_sync::client::SessionCheck::Unknown => SessionState::Unreachable,
         }
     }
 
@@ -2122,11 +2199,20 @@ impl SkwodClient {
     /// Whether voice/video is set up on this instance (and the SFU URL if so). Drives the voice
     /// button: when not configured, non-owners see "ask the host", the owner sees the setup panel.
     pub async fn voice_config(&self) -> Result<VoiceConfig, CoreError> {
-        let v = self.api.get("/api/voice/config").await?;
-        Ok(VoiceConfig {
-            configured: v.get("configured").and_then(|x| x.as_bool()).unwrap_or(false),
-            url: v.get("url").and_then(|x| x.as_str()).map(str::to_string),
-        })
+        let v = self.api().get("/api/voice/config").await.map_err(voice_client_error)?;
+        Ok(VoiceConfig::from_json(&v))
+    }
+
+    /// Owner-only: forget the call server saved with [`Self::set_voice_config`]; the skwod's own
+    /// one (if it has one) starts. `false` when none was saved. Device-signed.
+    pub async fn clear_voice_config(&self) -> Result<bool, CoreError> {
+        Ok(self.engine.lock().await.clear_voice_config().await?)
+    }
+
+    /// The voice tunnel's counters, for telling why a call did not connect. `None` when this
+    /// session does not run over p2p (no tunnel). Local only.
+    pub fn voice_tunnel(&self) -> Option<P2pVoiceStats> {
+        p2p::session_for(self.api().base_url()).map(|s| s.voice_stats())
     }
 
     /// Host-only: set the LiveKit URL + API key/secret so voice/video turns on for everyone on this
@@ -2148,7 +2234,7 @@ impl SkwodClient {
     /// It is a LABEL the host supplies: apps check it (`SkwodNameRule`) and show the host key
     /// beside it.
     pub async fn instance_name(&self) -> Result<Option<String>, CoreError> {
-        match self.api.get("/api/instance/name").await {
+        match self.api().get("/api/instance/name").await {
             Ok(v) => Ok(v.get("name").and_then(|x| x.as_str()).filter(|n| !n.is_empty()).map(str::to_string)),
             Err(skwod_sync::ClientError::Status { status: 404, .. }) => Ok(None),
             Err(e) => Err(e.into()),
@@ -2218,23 +2304,39 @@ impl SkwodClient {
     /// A LiveKit room token (+ SFU URL) for a voice channel. Server-gated on CONNECT_VOICE; fails if
     /// voice isn't configured on the instance.
     pub async fn voice_token(&self, channel_id: String) -> Result<VoiceToken, CoreError> {
-        let (token, room, mut url) = self.engine.lock().await.voice_token(&channel_id).await?;
+        let got = self.engine.lock().await.voice_token(&channel_id).await.map_err(voice_engine_error);
+        let (token, room, mut url) = match got {
+            // A host before build 51 answers 403 when it runs no call server at all: then the
+            // call server is off, not this person kept out of the channel.
+            Err(CoreError::Voice { code }) if code == "no_access" && self.older_host_without_voice().await => {
+                return Err(CoreError::Voice { code: "off".into() })
+            }
+            got => got?,
+        };
         // p2p session + the host's own local SFU (plain ws://, not dialable from here): reach
         // LiveKit through the tunnel instead — signaling via the loopback proxy, media via the
         // loopback forwarder this call starts. An external SFU (wss://) is used as-is.
-        if let Some(session) = p2p::session_for(self.api.base_url()) {
+        if let Some(session) = p2p::session_for(self.api().base_url()) {
             if url.as_deref().is_some_and(|u| u.starts_with("ws://")) {
-                let bearer = self.api.token().unwrap_or_default().to_string();
-                url = Some(session.voice_url(bearer).await?);
+                url = Some(session.voice_url().await?);
             }
         }
         Ok(VoiceToken { token, room, url })
     }
 
+    /// The host is from before build 51 (its voice status has no `status`) and has no call server
+    /// configured. Anything else, including no answer, is `false`: the refusal stands as it was.
+    async fn older_host_without_voice(&self) -> bool {
+        match self.api().get("/api/voice/config").await {
+            Ok(v) => v.get("status").is_none() && !v["configured"].as_bool().unwrap_or(false),
+            Err(_) => false,
+        }
+    }
+
     /// Resolve (or create) the server's voice channel, returning its id. The call view uses it for
     /// the room, the token, and the per-participant E2EE keys.
     pub async fn ensure_voice_channel(&self, server_id: String, name: String) -> Result<String, CoreError> {
-        let id = self.engine.lock().await.ensure_voice_channel(&server_id, &name).await?;
+        let id = self.engine.lock().await.ensure_voice_channel(&server_id, &name).await.map_err(voice_engine_error)?;
         self.persist().await;
         Ok(id)
     }
@@ -2441,6 +2543,8 @@ impl SkwodClient {
     /// Complete a restore left waiting (`RecoveryPending`): after another device approved it,
     /// with the registration PIN, or once the wait is over.
     pub async fn retry_restore(&self, pin: Option<String>) -> Result<bool, CoreError> {
+        let _whole = self.cache_use.critical();
+        self.refuse_detached()?;
         // Still waiting to be handed the backup (not yet at the re-key step): ask again with
         // the recovery key given earlier in this run.
         if !self.engine.lock().await.rekey_pending() {
@@ -2474,6 +2578,7 @@ impl SkwodClient {
 
     /// `restore_key_backup` with the registration PIN (completes at once when the PIN is right).
     pub async fn restore_key_backup_with_pin(&self, passphrase: String, pin: Option<String>) -> Result<bool, CoreError> {
+        let _whole = self.cache_use.critical();
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
         if self.cache.lock().unwrap_or_else(|e| e.into_inner()).is_none() {
@@ -2600,7 +2705,7 @@ impl SkwodClient {
     /// devices (e.g. the phone that created a solo server) to provision this one — without this,
     /// a solo-server owner signing in on a second device has no provisioner at all.
     pub async fn list_own_devices(&self) -> Result<Vec<String>, CoreError> {
-        let res = self.api.get("/api/e2ee/devices").await?;
+        let res = self.api().get("/api/e2ee/devices").await?;
         Ok(res
             .get("devices")
             .and_then(|v| v.as_array())
@@ -2645,7 +2750,89 @@ fn set_aside(path: &str) {
     }
 }
 
+/// An instance key as an invite carries it.
+fn server_key(b64: &str) -> Result<Vec<u8>, CoreError> {
+    use base64::engine::general_purpose::STANDARD as B64;
+    use base64::Engine as _;
+    let key = B64.decode(b64.as_bytes()).map_err(|_| CoreError::Invalid { detail: "pinned key is not base64".into() })?;
+    if key.len() != 32 {
+        return Err(CoreError::Invalid { detail: "pinned key must be 32 bytes".into() });
+    }
+    Ok(key)
+}
+
+fn open_or_set_aside(path: &str, key: &[u8; 32]) -> Result<Cache, skwod_sync::CacheError> {
+    match Cache::open(&PathBuf::from(path), key) {
+        // The file is there but this key does not open it (the key was lost or replaced, or
+        // the file is damaged). Failing here on every launch is a loop the user cannot
+        // leave; registering without a cache would mint a device that forgets itself. So:
+        // move the unreadable file ASIDE (nothing is deleted — it can still be opened if
+        // its key turns up), start a fresh cache under this key, and say so. The caller
+        // sees "no device restored" and takes the normal recovery path.
+        Err(skwod_sync::CacheError::BadKey) => {
+            set_aside(path);
+            let cache = Cache::open(&PathBuf::from(path), key)?;
+            let _ = cache.kv_set(CACHE_RESET_KEY, &now_ms().to_string());
+            Ok(cache)
+        }
+        other => other,
+    }
+}
+
 /// The engine's sent-message store, kept in the encrypted cache.
+/// With no cache in the slot, whether state counts as stored: only for a client that keeps
+/// everything in memory by choice (`allow_without_cache`), and never once detached. Otherwise NOT
+/// stored — nothing sealed under it leaves, nothing it covers is acknowledged (the server hands it
+/// out again), and no membership event goes unrecorded.
+fn memory_only(cache_use: &cache_lease::CacheUse, ephemeral_ok: &std::sync::atomic::AtomicBool) -> bool {
+    ephemeral_ok.load(std::sync::atomic::Ordering::Relaxed) && !cache_use.detached()
+}
+
+/// The engine's stores that read the cache slot when called: membership events, and the state
+/// (with the outgoing message) persisted before anything encrypted leaves. Installed when the
+/// client is made, and again on any engine that replaces it.
+fn install_sinks(
+    engine: &mut Engine,
+    cache: &std::sync::Arc<Mutex<Option<Cache>>>,
+    cache_use: &std::sync::Arc<cache_lease::CacheUse>,
+    ephemeral_ok: &std::sync::Arc<std::sync::atomic::AtomicBool>,
+) {
+    // Membership events ("X joined (approved by Y)", "X added a device") are written into the
+    // channel BEFORE the engine hands that user or device a key: the engine calls this sink
+    // and only proceeds when the row is in the cache.
+    let (sink_cache, sink_use, sink_mem) = (cache.clone(), cache_use.clone(), ephemeral_ok.clone());
+    engine.set_event_sink(Box::new(move |e| {
+        let row = system_row(&e.scope, &e.kind, &e.user_id, &e.device_id, e.by_user_id.as_deref(), false, e.at_ms as i64);
+        match sink_cache.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some(cache) => cache.insert_core_row(&row).is_ok(),
+            None => memory_only(&sink_use, &sink_mem),
+        }
+    }));
+    // Before anything encrypted leaves, the state that sealed it — and the message itself —
+    // is written here in one transaction (see `skwod_sync::StateSink`).
+    let (state_cache, state_use, state_mem) = (cache.clone(), cache_use.clone(), ephemeral_ok.clone());
+    engine.set_state_sink(Box::new(move |state, row| {
+        let row = row.map(|r| CachedMessage {
+            message_id: r.message_id.clone(),
+            scope: r.scope.clone(),
+            author_id: Some(SELF_AUTHOR.to_string()),
+            content: Some(r.text.clone()),
+            reply_to_id: r.reply_to_id.clone(),
+            is_edited: false,
+            is_pinned: false,
+            deleted_at: None,
+            created_at: r.created_at,
+            updated_at: r.created_at,
+            kind: skwod_sync::cache::KIND_PLAIN,
+        });
+        match state_cache.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some(cache) => cache.persist_send(ENGINE_STATE_KEY, state, row.as_ref()).is_ok(),
+            // (No cache, or detached: nothing to write it to. Nothing is sent.)
+            None => memory_only(&state_use, &state_mem),
+        }
+    }));
+}
+
 struct CacheSentStore(std::sync::Arc<Mutex<Option<Cache>>>);
 
 impl skwod_sync::SentStore for CacheSentStore {
@@ -2709,6 +2896,22 @@ impl SkwodClient {
         }
     }
 
+    fn store_state(&self, bytes: &[u8]) -> bool {
+        match self.cache.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
+            Some(cache) => cache.session_put(ENGINE_STATE_KEY, bytes, 0).is_ok(),
+            None => memory_only(&self.cache_use, &self.ephemeral_ok),
+        }
+    }
+
+    fn api(&self) -> ApiClient {
+        self.api.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    fn refuse_detached(&self) -> Result<(), CoreError> {
+        let _slot = self.cache.lock().unwrap_or_else(|e| e.into_inner());
+        self.cache_use.refuse_if_detached()
+    }
+
     /// Tests and tools: a client that deliberately keeps everything in memory.
     #[doc(hidden)]
     pub fn allow_without_cache(&self) {
@@ -2754,7 +2957,7 @@ impl SkwodClient {
     async fn remote_wrapped_key(&self) -> Result<Option<Vec<u8>>, CoreError> {
         use base64::engine::general_purpose::STANDARD as B64;
         use base64::Engine as _;
-        let resp = match self.api.get("/api/e2ee/key-backup").await {
+        let resp = match self.api().get("/api/e2ee/key-backup").await {
             Ok(v) => v,
             Err(skwod_sync::ClientError::Status { status: 404, .. }) => return Ok(None),
             Err(e) => return Err(e.into()),
@@ -3098,10 +3301,108 @@ pub struct MemberInfo {
 }
 
 /// Whether voice/video is set up on this instance, and the SFU URL clients connect to (if so).
-#[derive(uniffi::Record)]
+#[derive(Debug, PartialEq, uniffi::Record)]
 pub struct VoiceConfig {
     pub configured: bool,
     pub url: Option<String>,
+    /// `on` / `starting` / `off`, right now. A host before build 51 only says `configured`.
+    pub status: String,
+    /// Short code for why (the host's, for a support question; apps show their own sentences).
+    pub reason: String,
+    /// The skwod runs its own call server: there is nothing to set up.
+    pub bundled: bool,
+    /// Another call server is saved (and the owner may clear it).
+    pub external: bool,
+}
+
+impl VoiceConfig {
+    fn from_json(v: &serde_json::Value) -> Self {
+        let configured = v["configured"].as_bool().unwrap_or(false);
+        let status = match v["status"].as_str() {
+            Some(s @ ("on" | "starting" | "off")) => s,
+            _ if configured => "on",
+            _ => "off",
+        };
+        // A short lowercase code or nothing: it is the host's word.
+        let reason = v["reason"].as_str().filter(|r| r.len() <= 32 && r.bytes().all(|b| b.is_ascii_lowercase() || b == b'_')).unwrap_or_default();
+        Self {
+            configured,
+            url: v["url"].as_str().map(str::to_string),
+            status: status.into(),
+            reason: reason.into(),
+            bundled: v["bundled"].as_bool().unwrap_or(false),
+            external: v["external"].as_bool().unwrap_or(false),
+        }
+    }
+}
+
+#[cfg(test)]
+mod voice_tests {
+    use super::*;
+
+    fn status(status: u16, body: &str) -> Option<&'static str> {
+        voice_code(&skwod_sync::ClientError::Status { status, body: body.into() })
+    }
+
+    #[test]
+    fn a_503_is_voice_off_or_starting_and_a_403_is_no_access() {
+        assert_eq!(status(503, r#"{"error":"voice is off on this skwod","code":"voice_off","reason":"ports"}"#), Some("off"));
+        assert_eq!(status(503, r#"{"error":"x","code":"voice_starting","reason":"exited"}"#), Some("starting"));
+        assert_eq!(status(503, r#"{"error":"this server is stopped"}"#), Some("unreachable"));
+        assert_eq!(status(503, "<html>"), Some("unreachable"));
+        assert_eq!(status(502, ""), Some("unreachable"));
+        assert_eq!(status(403, r#"{"error":"forbidden"}"#), Some("no_access"));
+        // About this device or session, not about the channel: left as it is.
+        assert_eq!(status(403, r#"{"error":"device bind required"}"#), None);
+        assert_eq!(status(401, r#"{"error":"unauthorized"}"#), None);
+        assert_eq!(status(500, "{}"), None);
+        // A code in a 403's body changes nothing.
+        assert_eq!(status(403, r#"{"error":"forbidden","code":"voice_off"}"#), Some("no_access"));
+        assert_eq!(voice_code(&skwod_sync::ClientError::Transport("x".into())), Some("unreachable"));
+        assert_eq!(voice_code(&skwod_sync::ClientError::StaleCredential), None);
+        assert!(matches!(voice_engine_error(EngineError::UpdateRequired("u".into())), CoreError::UpdateRequired { .. }));
+    }
+
+    /// A host that answers `voice-token` with 403 and `voice/config` with `config`.
+    async fn voice_host(config: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                let req = String::from_utf8_lossy(&buf[..n]).to_string();
+                let (status, body) = if req.starts_with("GET /api/voice/config") { ("200 OK", config) } else { ("403 Forbidden", r#"{"error":"forbidden"}"#) };
+                let _ = s.write_all(format!("HTTP/1.1 {status}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}", body.len()).as_bytes()).await;
+            }
+        });
+        base
+    }
+
+    #[tokio::test]
+    async fn an_older_host_with_no_call_server_is_voice_off_not_no_access() {
+        let code = |r: Result<VoiceToken, CoreError>| match r { Err(CoreError::Voice { code }) => code, Err(e) => panic!("{e:?}"), Ok(_) => panic!("a token") };
+        // 0.50 with no call server: off.
+        let c = SkwodClient::new(voice_host(r#"{"configured":false,"url":null}"#).await, "t".into());
+        assert_eq!(code(c.voice_token("ch".into()).await), "off");
+        // 0.50 with one: the 403 is about this person.
+        let c = SkwodClient::new(voice_host(r#"{"configured":true,"url":"ws://127.0.0.1:7880"}"#).await, "t".into());
+        assert_eq!(code(c.voice_token("ch".into()).await), "no_access");
+        // 0.51 says what it means itself (a 503 when off): its 403 always stands.
+        let c = SkwodClient::new(voice_host(r#"{"configured":false,"url":null,"status":"off","reason":"ports"}"#).await, "t".into());
+        assert_eq!(code(c.voice_token("ch".into()).await), "no_access");
+    }
+
+    #[test]
+    fn a_status_from_an_older_host_is_read_from_configured() {
+        let old = VoiceConfig::from_json(&serde_json::json!({ "configured": true, "url": "ws://127.0.0.1:1" }));
+        assert_eq!((old.status.as_str(), old.bundled, old.external), ("on", false, false));
+        assert_eq!(VoiceConfig::from_json(&serde_json::json!({ "configured": false, "url": null })).status, "off");
+        let new = VoiceConfig::from_json(&serde_json::json!({ "configured": false, "url": null, "status": "starting", "reason": "no_answer", "bundled": true, "external": false }));
+        assert_eq!((new.status.as_str(), new.reason.as_str(), new.bundled), ("starting", "no_answer", true));
+        assert_eq!(VoiceConfig::from_json(&serde_json::json!({ "status": "<b>", "reason": "Call 555-0100" })).reason, "");
+    }
 }
 
 /// One participant's voice/video E2EE key for a room: a raw 32-byte AES-256 key registered under
@@ -3259,13 +3560,23 @@ pub fn message_is_hidden(text: String) -> bool {
 /// every week or so at launch — BEFORE building the `SkwodClient` — and store the result; the
 /// old token keeps working for a few minutes and then stops. A push registration made under
 /// the old token moves to the new one on the server.
+///
+/// `rotation_key`: from [`new_rotation_key`], stored by the app BEFORE this call and forgotten once
+/// the fresh token is stored. If the answer is lost, the same call with the same key gets a fresh
+/// token again (within the old one's grace; an older host ignores the key and refuses).
 #[uniffi::export(async_runtime = "tokio")]
-pub async fn rotate_session(base_url: String, token: String) -> Result<AuthSession, CoreError> {
-    let v = ApiClient::new(base_url).with_token(token).post("/api/auth/rotate", serde_json::json!({})).await?;
+pub async fn rotate_session(base_url: String, token: String, rotation_key: String) -> Result<AuthSession, CoreError> {
+    let v = ApiClient::new(base_url).with_token(token).post_with_header("/api/auth/rotate", serde_json::json!({}), "x-skwod-rotation-key", &rotation_key).await?;
     match (v["user_id"].as_str(), v["token"].as_str(), v["expires_at"].as_i64()) {
         (Some(user_id), Some(token), Some(expires_at)) => Ok(AuthSession { user_id: user_id.to_string(), token: token.to_string(), expires_at }),
         _ => Err(CoreError::Invalid { detail: "unexpected server response".into() }),
     }
+}
+
+/// A random key for [`rotate_session`].
+#[uniffi::export]
+pub fn new_rotation_key() -> String {
+    hex::encode(skwod_crypto::random_bytes::<32>())
 }
 
 /// What the server says about an invite code before anyone signs up with it.
@@ -3612,6 +3923,50 @@ mod tests {
         assert_eq!(client.kv_get("k".into()).await, None);
         // The pin cannot be read: no owner is reported, and nothing is attested or pinned anew.
         assert_eq!(client.instance_owner().await, None);
+    }
+
+    /// A client made offline goes online with its cache open throughout: what was queued and
+    /// stored meanwhile is there, and requests now go to the new base with the new token.
+    #[tokio::test]
+    async fn an_offline_client_goes_online_with_its_cache_and_outbox() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = format!("http://{}", listener.local_addr().unwrap());
+        let seen = std::sync::Arc::new(Mutex::new(String::new()));
+        let log = seen.clone();
+        tokio::spawn(async move {
+            while let Ok((mut s, _)) = listener.accept().await {
+                let mut buf = vec![0u8; 8192];
+                let n = s.read(&mut buf).await.unwrap_or(0);
+                log.lock().unwrap().push_str(&String::from_utf8_lossy(&buf[..n]));
+                let _ = s.write_all(b"HTTP/1.1 200 OK\r\ncontent-length: 2\r\nconnection: close\r\n\r\n{}").await;
+            }
+        });
+        let client = SkwodClient::new("http://127.0.0.1:9".into(), String::new());
+        let dir = tempfile::tempdir().unwrap();
+        client.attach_cache(dir.path().join("c.sqlite3").to_string_lossy().to_string(), "ab".repeat(32)).await.unwrap();
+        let id = client.queue_channel_message("ch".into(), "hello".into(), None, vec![], vec![]).await.unwrap();
+        let offline = client.flush_outbox().await;
+        assert_eq!((offline.sent, offline.failed), (0, 0), "waits; never refused");
+        assert_eq!(client.session_state().await, SessionState::Unreachable);
+
+        // A pin that cannot be applied: nothing changes and nobody is asked anything.
+        for bad in ["not base64 !", "AAAA"] {
+            assert!(matches!(client.go_online(base.clone(), "tok-1".into(), Some(bad.into())).await, Err(CoreError::Invalid { .. })));
+        }
+        assert_eq!(client.session_state().await, SessionState::Unreachable);
+        let _ = client.list_dms().await;
+        assert_eq!(seen.lock().unwrap().as_str(), "");
+
+        let pin = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA=".to_string();   // 32 bytes
+        assert!(!client.go_online(base, "tok-1".into(), Some(pin)).await.unwrap(), "not a device yet: nothing to bind");
+        assert!(client.cache_attached());
+        assert_eq!(client.pending_sends(None).await.iter().filter(|p| p.message_id == id && p.state == "sending").count(), 1);
+        assert!(client.history("channel:ch".into()).await.iter().any(|m| m.message_id == id));
+        let _ = client.session_state().await;
+        let _ = client.list_dms().await;   // the engine's requests too
+        let asked = seen.lock().unwrap().to_lowercase();
+        assert!(asked.matches("authorization: bearer tok-1").count() >= 2, "{asked}");
     }
 
     /// Without a cache the lenient read says "nothing" and the strict one says WHY; with a

@@ -26,6 +26,8 @@ fun TypingLine(topic: String, accept: (String) -> Boolean, nameOf: (String) -> S
     val model = AppModel.get(LocalContext.current)
     val enabled = model.settings.typingIndicators
     var state by remember(topic) { mutableStateOf(TypingState()) }
+    // (Who is in the conversation, and how they are called, may arrive while this is on screen.)
+    val accepts by rememberUpdatedState(accept)
     var now by remember { mutableLongStateOf(System.currentTimeMillis()) }
     LaunchedEffect(topic, enabled) {
         state = TypingState()
@@ -35,7 +37,7 @@ fun TypingLine(topic: String, accept: (String) -> Boolean, nameOf: (String) -> S
             when (ev.event) {
                 "typing" -> {
                     val uid = ev.payload.optString("user_id")
-                    if (accept(uid)) {
+                    if (accepts(uid)) {
                         now = System.currentTimeMillis()
                         state = state.add(uid, model.session?.userId, model.isBlockedUser(uid), enabled, now)
                     }

@@ -23,6 +23,8 @@ use crate::state::AppState;
 
 /// The instance's p2p secret key: `<data>/p2p.key`, 0600. Its public half is the skwod's address.
 pub const KEY_FILE: &str = "p2p.key";
+/// The UDP port of the last start: kept, so that members find the host where they last reached it.
+const PORT_FILE: &str = "p2p.port";
 
 #[derive(Debug, Clone)]
 pub struct P2pOptions {
@@ -382,7 +384,31 @@ pub async fn start(state: AppState, router: Router, data: &Path, opts: &P2pOptio
     cfg.external_addrs = opts.external_addrs.clone();
     cfg.local_discovery = opts.local_discovery;
     cfg.lan_key = if opts.local_discovery { lan_key(data, true) } else { None };
-    start_with(state, router, &cfg).await
+    start_on_last_port(state, router, cfg, data).await
+}
+
+/// [`start_with`], on the port the operator chose, else on that of the last start, else on any.
+pub(crate) async fn start_on_last_port(state: AppState, router: Router, mut cfg: NetConfig, data: &Path) -> Result<skwod_net::Host, String> {
+    if cfg.bind_port.is_some() {
+        return start_with(state, router, &cfg).await;
+    }
+    let file = data.join(PORT_FILE);
+    cfg.bind_port = std::fs::read_to_string(&file).ok().and_then(|p| p.trim().parse().ok()).filter(|p| *p >= 1024);
+    let host = match start_with(state.clone(), router.clone(), &cfg).await {
+        Err(e) if cfg.bind_port.is_some() => {
+            tracing::warn!(port = cfg.bind_port, error = %e, "the UDP port of the last start cannot be used; taking another (members that connect without a relay may need to look this host up again)");
+            cfg.bind_port = None;
+            start_with(state, router, &cfg).await?
+        }
+        started => started?,
+    };
+    let port = host.endpoint().bound_sockets().iter().find(|s| s.is_ipv4()).map(|s| s.port());
+    if let (Some(port), None) = (port, cfg.bind_port) {
+        if let Err(e) = std::fs::write(&file, port.to_string()) {
+            tracing::warn!(error = %e, "could not keep the UDP port for the next start");
+        }
+    }
+    Ok(host)
 }
 
 /// [`start`] with an explicit network configuration (tests run with discovery + relays off).

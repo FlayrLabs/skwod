@@ -313,6 +313,9 @@ enum KeyAccess {
     /// every wake on iOS — also with app lock on — to make that skwod's banners passive.
     static let skwodMutePrefix = "mute-skwod-"
 
+    /// Where the skwod's host was last reached directly (`DirectRoutes`).
+    static let routesPrefix = "routes-"
+
     static func accessibility(for account: String, settings: Settings, platform: Platform) -> Class {
         if account == workspaces { return .afterFirstUnlock }
         if followsCacheKey(account) {
@@ -324,7 +327,7 @@ enum KeyAccess {
 
     /// Every prefix under which an item is kept per skwod — add a new one HERE: this is the
     /// list a skwod's items are deleted by (`WorkspaceItems`).
-    static let perWorkspacePrefixes = [cacheKeyPrefix, mutesPrefix, skwodMutePrefix, notifNamesPrefix, notifSendersPrefix, retiredMuteConvsPrefix]
+    static let perWorkspacePrefixes = [cacheKeyPrefix, mutesPrefix, skwodMutePrefix, notifNamesPrefix, notifSendersPrefix, routesPrefix, retiredMuteConvsPrefix]
     /// A per-skwod flag an unreleased build-45 state kept ("has a muted conversation",
     /// `MuteFlagStore`). Nothing reads it; a wipe deletes whatever is left of it.
     static let retiredMuteConvsPrefix = "mute-convs-"
@@ -554,6 +557,8 @@ struct BoundClient<Client> {
     /// The bind turn that put this client up (`ClientBinding`). A new turn is a new client:
     /// whatever was (or could not be) read through an earlier one is read again.
     var turn = 0
+    /// Whether this client's server pin was applied.
+    var pin = PinState.unchecked
 
     /// The client to use for `workspaceId`: only the one bound to exactly that workspace.
     /// Throws otherwise (none, or another workspace's) — a store then reads nothing and writes
@@ -578,9 +583,23 @@ struct BoundClient<Client> {
 /// client up only for the turn that is still the latest, and always under the workspace id the
 /// caller itself captured — never one read from state another bind may have changed since.
 final class ClientBinding<Client> {
-    private(set) var bound: BoundClient<Client>?
+    private(set) var bound: BoundClient<Client>? { didSet { onChange?() } }
     private var turn = 0
+    /// Build 51: told whenever a client is put up or taken down (screens that read from the
+    /// client reload from the new one — what a push-woken extension wrote is in ITS cache).
+    var onChange: (() -> Void)?
 
+    /// The pin of the client that is up could not be applied (again).
+    func failPin() { bound?.pin = .failed }
+    /// The client that is up is used another way from now on (it went online): a new turn, so that
+    /// screens read and catch up through it again. Nil: none is up.
+    @discardableResult func renew() -> Int? {
+        guard var same = bound else { return nil }
+        turn += 1
+        same.turn = turn
+        bound = same
+        return turn
+    }
     /// Start a bind (or take the client down): nothing is bound, and every earlier turn is over.
     @discardableResult func begin() -> Int { turn += 1; bound = nil; return turn }
     /// Is `turn` still the latest? Asked after every suspension; a bind that is not stops,
@@ -588,9 +607,9 @@ final class ClientBinding<Client> {
     func isCurrent(_ turn: Int) -> Bool { turn == self.turn }
     /// Put `client` up as `workspaceId`'s — unless this turn was superseded (false: nothing changed).
     /// `cacheOpen`: whether THIS bind opened the workspace's cache on the client.
-    func commit(_ turn: Int, workspaceId: String, client: Client, cacheOpen: Bool) -> Bool {
+    func commit(_ turn: Int, workspaceId: String, client: Client, cacheOpen: Bool, pin: PinState = .unchecked) -> Bool {
         guard turn == self.turn else { return false }
-        bound = BoundClient(workspaceId: workspaceId, client: client, cacheOpen: cacheOpen, turn: turn)
+        bound = BoundClient(workspaceId: workspaceId, client: client, cacheOpen: cacheOpen, turn: turn, pin: pin)
         return true
     }
 }

@@ -39,6 +39,9 @@ struct Workspace: Codable, Identifiable, Hashable {
     /// for a fresh one at launch (`rotateSession`). nil = stored by a build that did not record
     /// it, which counts as old. (Optional so earlier workspaces still decode.)
     var tokenIssuedAt: Int64? = nil
+    /// The key a rotation of `token` was (or is about to be) asked with — stored BEFORE the request,
+    /// dropped with the old token: with it a rotation whose answer was lost can be asked for again.
+    var rotationKey: String? = nil
     /// A random tag made on this device and handed to this skwod when registering for push.
     /// The skwod passes it to the gateway, which returns it in the wake (`tag`), so the app
     /// knows WHICH skwod a contentless push is about — and no other skwod can claim the wake.
@@ -137,12 +140,15 @@ enum WorkspaceStore {
         return list
     }
 
-    static func save(_ list: [Workspace]) {
+    /// Whether it was written (the Keychain can refuse: locked, busy).
+    @discardableResult
+    static func save(_ list: [Workspace]) -> Bool {
         if let data = try? JSONEncoder().encode(list), let json = String(data: data, encoding: .utf8) {
             // The bearer/sync tokens live in this blob and the background inbox-sync loop reads them
             // while the device is backgrounded/locked, so this one item stays AfterFirstUnlock.
-            Keychain.set(json, for: account, accessibility: .afterFirstUnlock)
+            return Keychain.set(json, for: account, accessibility: .afterFirstUnlock)
         }
+        return false
     }
 
     static var currentId: String? {

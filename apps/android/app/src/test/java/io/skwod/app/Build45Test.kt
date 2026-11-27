@@ -256,7 +256,7 @@ class Build45Test {
         LocalData.forgetItems("", removeSecret = { secrets.remove(it) }, removeNotify = { notify.remove(it) })
         org.junit.Assert.assertEquals(3, secrets.size)
         // The names are the ones the stores have always used (an upgrade must find its items).
-        org.junit.Assert.assertEquals(listOf("cache-key-w", "mutes-w", "announced-w", "contacts-w", "roster-w"), LocalData.secretNames("w"))
+        org.junit.Assert.assertEquals(listOf("cache-key-w", "mutes-w", "announced-w", "contacts-w", "roster-w", "routes-w"), LocalData.secretNames("w"))
         org.junit.Assert.assertEquals(listOf("seenAt-w"), LocalData.notifyNames("w"))
     }
 

@@ -74,7 +74,9 @@ class BoundClient<C>(
  */
 class ClientBinding<C> {
     @Volatile var bound: BoundClient<C>? = null
-        private set
+        private set(value) { field = value; onChange?.invoke() }
+    /** Build 51: told whenever a client is put up or taken down (open screens reload from it). */
+    @Volatile var onChange: (() -> Unit)? = null
     private var turn = 0
 
     /** Start a bind: every earlier turn is over. (What was bound is taken down with [clear].) */

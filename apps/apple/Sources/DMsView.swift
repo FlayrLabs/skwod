@@ -57,6 +57,8 @@ struct DMChatView: View {
     @State private var messages: [ChatMessage] = []
     @State private var draft = ""
     @State private var sending = false
+    /// The skwod this conversation belongs to: what is sent here goes through its cache, or nowhere.
+    @State private var home: String?
     @State private var sendError: String?
     @State private var uploading = false
     @State private var olderRows: [Message] = []
@@ -64,6 +66,10 @@ struct DMChatView: View {
     @State private var loadingOlder = false
     @State private var reachedStart = false
     @State private var showVerify = false
+    /// Build 51: what `messages` were loaded for; failed catch-ups in a row and the pending retry.
+    @State private var loadedConversation: String?
+    @State private var fetchFailures = 0
+    @State private var retryTask: Task<Void, Never>?
     @ObservedObject private var blocks = BlockList.shared
     @State private var blocking: ReportTarget?
     @State private var reporting: ReportTarget?
@@ -94,31 +100,35 @@ struct DMChatView: View {
             sending: sending,
             sendError: sendError,
             placeholder: "Message \(shown.text)",
-            onSend: { Task { await send() } },
+            onSend: { send($0) },
+            canSend: ready,
             onLoadOlder: latestRows.count >= 200 || !olderRows.isEmpty ? { Task { await loadOlder() } } : nil,
             loadingOlder: loadingOlder,
             reachedStart: reachedStart,
             uploading: uploading,
             // A DM attachment carries its own download token: a sealed DM leaves no row on the
             // server that access to the file could hang on.
-            onSendFile: { url in Task { await sendAttachment(.file(url)) } },
-            onSendMusic: { track in Task { await sendTagged { _ in try AttachmentService.musicBody(track) } } },
-            onSendImage: { data in Task { await sendAttachment(.image(data)) } },
+            onSendFile: { url in sendAttachment(.file(url)) },
+            onSendMusic: { track in sendMusic(track) },
+            onSendImage: { data in sendAttachment(.image(data)) },
             // Back works from both contexts: clears the drawer selection (no-op when pushed) and
             // pops the navigation stack (no-op in the drawer).
-            onBack: { chat.selection = nil; dismiss() },
+            onBack: { chat.reveal.send(false); dismiss() },
             // The same menu a channel message has: react, reply, edit and delete (for
             // everyone) — sealed to every device of both people, like the message itself.
-            onReact: { msg, emoji in Task { await toggleReaction(msg, emoji) } },
+            onReact: { msg, emoji in toggleReaction(msg, emoji) },
             onReply: { msg in editing = nil; replyingTo = msg },
             onEdit: { msg in replyingTo = nil; editing = msg; draft = msg.body },
-            onDelete: { msg in Task { await deleteMessage(msg) } },
+            onDelete: { msg in deleteMessage(msg) },
             // "View safety number" on a system row about this contact's devices.
             onSystemAction: { _ in showVerify = true },
             notice: hold != .none ? AnyView(heldBanner) : (shown.badge == .none || shown.badge == .verified ? nil : AnyView(unverifiedBanner)),
             composingBanner: composingBanner,
             onCancelCompose: { if editing != nil { draft = "" }; replyingTo = nil; editing = nil },
             conversationId: convo.conversationId,
+            syncStatus: FetchRetryRule.status(failures: fetchFailures, stripShowing: ConnectionBanner.shows(app)),
+            onRetrySync: { fetchFailures = 0; Task { await refresh() } },
+            onPullToRefresh: { await refresh() },
             headerActions: {
                 AnyView(
                     HStack(spacing: 10) {
@@ -166,8 +176,18 @@ struct DMChatView: View {
             everyoneAllowed: { _ in false },
             mentionable: BlockList.shared.contains(convo.peerUserId) || convo.peerUserId.isEmpty
                 ? [] : [(userId: convo.peerUserId, name: shown.text, username: convo.name)],
-            typingFrom: convo.peerUserId.isEmpty ? [] : [convo.peerUserId]))
-        .task(id: convo.conversationId) { await load() }
+            typingFrom: convo.peerUserId.isEmpty ? [:] : [convo.peerUserId: convo.name]))
+        // Build 51: keyed on the client too (`ConversationLoadKey`): a view opened before the
+        // client was up, or kept across a re-bind, reloads from the client that is up now.
+        .task(id: ConversationLoadKey(id: convo.conversationId, clientTurn: app.clientTurn)) { await load() }
+        .onAppear {
+            guard home == nil else { return }
+            home = chat.spacesWorkspaceId
+            if let draftKey { draft = chat.draft(for: draftKey) }
+        }
+        .onChange(of: draft) { _, now in if editing == nil, let draftKey { chat.keepDraft(now, for: draftKey) } }
+        .onChange(of: app.clientTurn) { _, _ in if sendError == Compose.opening { sendError = nil } }
+        .onReceive(NotificationCenter.default.publisher(for: .skwodCatchUp)) { _ in Task { await refresh() } }
         // Queued / delivered / failed, or a block: redraw from the cache.
         .onReceive(NotificationCenter.default.publisher(for: .skwodOutboxChanged)) { _ in Task { await reloadFromCache() } }
         // Live: a DM for this conversation was just filed into the cache (`AppState.syncMailbox`
@@ -244,7 +264,9 @@ struct DMChatView: View {
     /// unverified), deliver the messages that were held, then send whatever was waiting in the
     /// composer.
     private func acceptAndSend() async {
-        guard let client = app.client else { return }
+        guard let client = Outbox.client(of: home, app) else { sendError = Compose.opening; return }
+        // What is sent after it is what was waiting when the user decided.
+        let waiting = draft
         accepting = true
         defer { accepting = false }
         do {
@@ -261,7 +283,7 @@ struct DMChatView: View {
         }
         await retryHeldSends(client)
         await refreshStatus()
-        if !sendsHeld, !draft.trimmingCharacters(in: .whitespaces).isEmpty { await send() }
+        if !sendsHeld, draft == waiting { _ = send(waiting) }
     }
 
     /// The contact's keys were accepted (here or on the safety-number screen): what failed
@@ -298,6 +320,7 @@ struct DMChatView: View {
     }
 
     private var scope: String { "dm:\(convo.conversationId)" }
+    private var draftKey: String? { home.map { Compose.directKey(workspaceId: $0, conversationId: convo.conversationId) } }
 
     /// A queued send of this conversation failed on the contact's keys (shown "Not delivered").
     private var failedOnIdentity: Bool {
@@ -307,8 +330,10 @@ struct DMChatView: View {
     /// Seed instantly from the local encrypted cache (works offline), then sync once. After
     /// that the view follows live events; the loop is only the slow safety net behind them.
     private func load() async {
+        // No client yet: this runs again when one is up (keyed on `clientTurn`).
         guard app.client != nil else { return }
-        olderRows = []; reachedStart = false
+        if loadedConversation != convo.conversationId { olderRows = []; reachedStart = false; loadedConversation = convo.conversationId }
+        fetchFailures = 0
         await reloadFromCache()
         while !Task.isCancelled {
             await Outbox.flush(app)
@@ -401,88 +426,114 @@ struct DMChatView: View {
     /// Who a message of this conversation is sealed to.
     private var peers: [String] { [convo.peerUserId] }
 
-    /// A file or photo: encrypted file-to-file, queued, uploaded in resumable chunks by the
-    /// outbox (`StreamedUpload`). Returns as soon as it is queued.
-    private func sendAttachment(_ source: StreamedUpload.Source) async {
-        uploading = true; sendError = nil
-        defer { uploading = false }
-        do {
-            try await StreamedUpload.queue(source, to: .dm(conversationId: convo.conversationId, peers: peers), app: app)
-        } catch {
-            sendError = sendFailureText(error)
-        }
+    /// Can something be handed over right now? Only to the cache of the skwod this conversation is
+    /// in; while that is being opened nothing is taken from the composer, and it says so.
+    private func ready() -> Bool {
+        if Outbox.client(of: home, app) == nil { sendError = Compose.opening; return false }
+        if sendError == Compose.opening { sendError = nil }
+        return true
     }
 
-    /// Build a tagged body (encrypted attachment upload or music card) and queue it in the DM.
-    private func sendTagged(_ make: @escaping (BlobStore) async throws -> AttachmentService.Outgoing) async {
-        guard let client = app.client, let store = BlobStore(app: app) else {
-            sendError = "Not connected — try again in a moment."
-            return
+    /// Send, reply or edit. Everything about it is settled here, at the tap (`SendOrder`): what comes
+    /// after — another conversation, another skwod — changes nothing about where it goes. Nothing
+    /// waits for the network: it is queued in the core (shown at once as "Sending…").
+    private func send(_ written: String) -> Bool {
+        let (replyTarget, editTarget, key) = (replyingTo, editing, draftKey)
+        let taken = Compose.take(text: written, home: home, bound: app.bound.flatMap { $0.cacheOpen ? $0.workspaceId : nil },
+                                 place: .direct(conversationId: convo.conversationId, peers: peers), replyTo: replyTarget?.id, editing: editTarget?.id)
+        guard case .send(let order) = taken, let client = Outbox.client(of: home, app) else {
+            if taken != .nothing { sendError = Compose.opening }
+            return false
         }
-        uploading = true; sendError = nil
-        var uploaded: [String] = []
-        do {
-            let out = try await make(store)
-            uploaded = out.blobIds
-            _ = try await client.queueDm(conversationId: convo.conversationId, peerUserIds: peers, text: out.body, replyToId: nil, uploadIds: [])
-            // Writing in a conversation is the user taking it: it now claims its id.
-            app.chatModel?.claimDM(convo)
-            Outbox.kick(app, composed: true)
-        } catch {
-            sendError = sendFailureText(error)
-            for id in uploaded { await store.delete(id) }
-        }
-        uploading = false
-    }
-
-    /// Send, reply or edit — queued in the core (shown at once as "Sending…"), delivered to
-    /// every device of both people when the connection allows.
-    private func send() async {
-        guard let client = app.client else { return }
-        let text = draft.trimmingCharacters(in: .whitespaces); guard !text.isEmpty else { return }
-        let (replyTarget, editTarget) = (replyingTo, editing)
         draft = ""; sendError = nil; replyingTo = nil; editing = nil
-        do {
-            if let editTarget {
-                try await client.queueDmEdit(conversationId: convo.conversationId, peerUserIds: peers, messageId: editTarget.id, text: text)
-            } else {
-                _ = try await client.queueDm(conversationId: convo.conversationId, peerUserIds: peers, text: text, replyToId: replyTarget?.id, uploadIds: [])
+        Task {
+            do {
+                try await Outbox.queue(order, through: client)
                 // Writing in a conversation is the user taking it: it now claims its id.
-                app.chatModel?.claimDM(convo)
+                if order.editing == nil, chat.spacesWorkspaceId == order.workspaceId { chat.claimDM(convo) }
+                Outbox.kick(app, composed: true)
+            } catch {
+                // Could not even be queued (too long, the outbox is full, the cache was just taken):
+                // the text goes back to this conversation's composer.
+                draft = Compose.givenBack(order.text, to: draft)
+                replyingTo = replyTarget; editing = editTarget
+                if editTarget == nil, let key { chat.keepDraft(Compose.givenBack(order.text, to: chat.draft(for: key)), for: key) }
+                sendError = sendFailureText(error)
             }
-            Outbox.kick(app, composed: true)
-        } catch {
-            draft = draft.isEmpty ? text : "\(text)\n\(draft)"
-            replyingTo = replyTarget; editing = editTarget
-            sendError = sendFailureText(error)
+        }
+        return true
+    }
+
+    private func sendMusic(_ track: MusicTrack) {
+        guard ready(), let client = Outbox.client(of: home, app), let home else { return }
+        let order: SendOrder
+        do { order = SendOrder(workspaceId: home, place: .direct(conversationId: convo.conversationId, peers: peers), text: try AttachmentService.musicBody(track).body) }
+        catch { sendError = sendFailureText(error); return }
+        Task {
+            do {
+                try await Outbox.queue(order, through: client)
+                // Writing in a conversation is the user taking it: it now claims its id.
+                if chat.spacesWorkspaceId == order.workspaceId { chat.claimDM(convo) }
+                Outbox.kick(app, composed: true)
+            } catch { sendError = sendFailureText(error) }
         }
     }
 
-    private func toggleReaction(_ msg: ChatMessage, _ emoji: String) async {
-        guard let client = app.client else { return }
-        let mineAlready = msg.reactionPills.first(where: { $0.emoji == emoji })?.mine ?? false
-        do {
-            try await client.queueDmReaction(conversationId: convo.conversationId, peerUserIds: peers, messageId: msg.id, emoji: emoji, remove: mineAlready)
-            Outbox.kick(app)
-        } catch { sendError = sendFailureText(error) }
+    /// A file or photo: encrypted file-to-file, queued, uploaded in resumable chunks by the outbox
+    /// (`StreamedUpload`). In a channel the server links the blob to the message when the queued send
+    /// goes out, which is what lets members download it.
+    private func sendAttachment(_ source: StreamedUpload.Source) {
+        guard ready(), let client = Outbox.client(of: home, app), let home else { return }
+        let target = StreamedUpload.Target.dm(conversationId: convo.conversationId, peers: peers)
+        uploading = true; sendError = nil
+        Task {
+            do { try await StreamedUpload.queue(source, to: target, through: client, workspace: home, app: app) }
+            catch { sendError = sendFailureText(error) }
+            uploading = false
+        }
     }
 
-    private func deleteMessage(_ msg: ChatMessage) async {
-        guard let client = app.client else { return }
-        do {
-            try await client.queueDmDelete(conversationId: convo.conversationId, peerUserIds: peers, messageId: msg.id)
+    private func toggleReaction(_ msg: ChatMessage, _ emoji: String) {
+        guard ready(), let client = Outbox.client(of: home, app) else { return }
+        let mineAlready = msg.reactionPills.first(where: { $0.emoji == emoji })?.mine ?? false
+        let (conversationId, peers) = (convo.conversationId, peers)
+        Task { do {
+            try await client.queueDmReaction(conversationId: conversationId, peerUserIds: peers, messageId: msg.id, emoji: emoji, remove: mineAlready)
             Outbox.kick(app)
-        } catch { sendError = sendFailureText(error) }
+        } catch { sendError = sendFailureText(error) } }
+    }
+
+    private func deleteMessage(_ msg: ChatMessage) {
+        guard ready(), let client = Outbox.client(of: home, app) else { return }
+        let (conversationId, peers) = (convo.conversationId, peers)
+        Task { do {
+            try await client.queueDmDelete(conversationId: conversationId, peerUserIds: peers, messageId: msg.id)
+            Outbox.kick(app)
+        } catch { sendError = sendFailureText(error) } }
     }
 
     private func refresh() async {
         guard let client = app.client, let me = app.session?.userId else { return }
+        let conversationId = convo.conversationId
         if let hist = try? await client.fetchDm(conversationId: convo.conversationId, userId: convo.peerUserId, deviceId: convo.peerDeviceId, myUserId: me) {
+            guard conversationId == convo.conversationId else { return }
+            fetchFailures = 0; retryTask?.cancel(); retryTask = nil
             latestRows = hist
             await loadOverlays(client)
             // A send the core refused because this contact's keys changed holds the
             // conversation (`refreshStatus` below decides the banner with it).
             messages = map(allRows)
+        } else if conversationId == convo.conversationId {
+            // Never a silent stale list: say so, and retry with backoff (`FetchRetryRule`).
+            fetchFailures += 1
+            retryTask?.cancel()
+            if let wait = FetchRetryRule.delay(afterFailure: fetchFailures) {
+                retryTask = Task {
+                    try? await Task.sleep(for: .seconds(wait))
+                    guard !Task.isCancelled, conversationId == convo.conversationId else { return }
+                    await refresh()
+                }
+            }
         }
         // Syncing the mailbox may have brought DMs for OTHER conversations too.
         await app.drainDmEvents()

@@ -262,7 +262,7 @@ struct SecureJoinView: View {
         guard let token = app.session?.token, let base = URL(string: app.serverURL), !app.serverURL.isEmpty else { return }
         var req = URLRequest(url: base.appendingPathComponent("api/instance/p2p"))
         req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-        guard let (data, resp) = try? await URLSession.shared.data(for: req),
+        guard let (data, resp) = try? await RawSink.data(for: req),
               (resp as? HTTPURLResponse)?.statusCode == 200,
               let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               obj["enabled"] as? Bool == true, let id = obj["node_id"] as? String,

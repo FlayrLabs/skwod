@@ -446,6 +446,7 @@ async fn m3_wiping_or_deleting_a_space_and_repointing_voice_need_a_current_devic
                 ("purge", send(&app, "POST", &format!("/api/servers/{server}/purge"), Some(&token), Some(json!({ "older_than_ms": 0 }))).await.0),
                 ("clear server", send(&app, "POST", &format!("/api/servers/{server}/clear"), Some(&token), Some(json!({}))).await.0),
                 ("voice config", send(&app, "PUT", "/api/voice/config", Some(&token), Some(voice)).await.0),
+                ("clear voice config", send(&app, "DELETE", "/api/voice/config", Some(&token), None).await.0),
                 ("delete server", send(&app, "DELETE", &format!("/api/servers/{server}"), Some(&token), None).await.0),
             ]
         }
@@ -470,6 +471,13 @@ async fn m3_wiping_or_deleting_a_space_and_repointing_voice_need_a_current_devic
     state.require_device_proofs = true;
     let app = crate::api::router(state.clone());
     assert_eq!(send(&app, "DELETE", &format!("/api/servers/{server}"), Some(&host), None).await.0, StatusCode::FORBIDDEN);
+    // Clearing the saved call server goes the same way, under its own op: a signature for
+    // another action is not one for this.
+    assert_eq!(send(&app, "DELETE", "/api/voice/config", Some(&host), None).await.0, StatusCode::FORBIDDEN);
+    let wrong = proof(&host_store, "voice-config", &owner, "", b"");
+    assert_eq!(send_proved(&app, "DELETE", "/api/voice/config", &host, None, &wrong).await.0, StatusCode::FORBIDDEN);
+    let signed = proof(&host_store, "voice-config-clear", &owner, "", b"");
+    assert_eq!(send_proved(&app, "DELETE", "/api/voice/config", &host, None, &signed).await.0, StatusCode::OK);
     let signed = proof(&host_store, "delete-server", &owner, &server, b"");
     assert_eq!(send_proved(&app, "DELETE", &format!("/api/servers/{server}"), &host, None, &signed).await.0, StatusCode::OK);
 }

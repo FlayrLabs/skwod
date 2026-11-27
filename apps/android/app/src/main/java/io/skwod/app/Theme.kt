@@ -141,11 +141,13 @@ fun rememberAppLogo(): androidx.compose.ui.graphics.ImageBitmap {
 }
 
 /** Presence palette + labels shared by the you-bar and status menus (mirrors iOS PresenceStyle).
- *  Green = available, yellow = away, red = DND and offline (the dot is always shown). */
+ *  Green = available, yellow = away, red = Do Not Disturb only; grey = offline, or not known now
+ *  (the dot is always shown). */
 fun presenceColor(status: String): Color = when (status) {
     "online" -> Color(0xFF4ADE80)
     "idle" -> Color(0xFFFACC15)
-    else -> Color(0xFFF87171)
+    "dnd" -> Color(0xFFF87171)
+    else -> Color(0xFF8E8E93)
 }
 
 fun presenceLabel(status: String): String = when (status) {

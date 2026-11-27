@@ -210,7 +210,7 @@ final class WaitingRoom: ObservableObject {
                 var req = URLRequest(url: base.appendingPathComponent("api/servers/\(serverId)/members/\(w.userId)"))
                 req.httpMethod = "DELETE"
                 req.setValue("Bearer \(token)", forHTTPHeaderField: "Authorization")
-                removed = ((try? await URLSession.shared.data(for: req))?.1 as? HTTPURLResponse)?.statusCode == 200
+                removed = ((try? await RawSink.data(for: req))?.1 as? HTTPURLResponse)?.statusCode == 200
             }
             if removed, let me = app.session?.userId {
                 _ = try? await client.syncServerMembership(serverId: serverId, myUserId: me)
@@ -323,7 +323,7 @@ struct WaitingToJoinSection: View {
                     .foregroundStyle(trusted ? Color.white : .orange).lineLimit(1)
                 // Even a name that checks out is only what the server says, until the user
                 // lets them in (or already knows them).
-                if trusted { TrustBadge(badge: app.contacts.display(w.userId, claimedName: w.username).badge, compact: true) }
+                if trusted { TrustBadge(badge: app.contacts.display(w.userId, claimedName: w.username).badge) }
                 if w.isNew {
                     Text("NEW").font(.system(size: 8.5, weight: .bold)).foregroundStyle(.black)
                         .padding(.horizontal, 4).padding(.vertical, 1).background(.white.opacity(0.75), in: Capsule())

@@ -30,6 +30,27 @@ const INVITE_TEXT = {
   address: ["Server address", "This is your server's address. Press New invite to make a link a friend can ask to join with."],
 };
 
+// What to say for each reason the call server is not running. Fixed sentences: nothing the
+// server says about itself is shown.
+const VOICE_REASON = {
+  ports: "a port it needs is taken",
+  files: "its settings could not be written to the data folder",
+  exec: "its program could not be started",
+  exited: "it stopped by itself",
+  no_answer: "it did not answer in time",
+  storage: "its settings could not be saved",
+  disabled: "turned off in this server's settings",
+  no_call_server: "this server has no call server next to it",
+};
+
+function voiceText(st) {
+  const why = VOICE_REASON[st.voice_reason];
+  if (st.voice_status === "on") return st.voice_server ? "On, through " + st.voice_server + " (saved in the app)" : "On";
+  if (st.voice_status === "starting") return "Starting…" + (why ? " (" + why + ", trying again)" : "");
+  const retried = why && !["disabled", "no_call_server"].includes(st.voice_reason);
+  return "Off" + (why ? ": " + why + (retried ? ". It is tried again by itself." : "") : "");
+}
+
 function render(st) {
   $("state").dataset.phase = st.phase;
   $("state").textContent = { running: "Running", starting: "Starting…", stopped: "Stopped" }[st.phase] || st.phase;
@@ -47,7 +68,7 @@ function render(st) {
   show("running");
   $("members").textContent = st.members;
   $("online").textContent = st.online;
-  $("voice").textContent = st.voice ? "On" : "Off";
+  $("voice").textContent = voiceText(st);
   $("p2p").textContent = st.p2p ? (st.public_fallback ? "Yes" : "Yes (direct only)") : "No";
   if (!busy) $("lan").checked = !!st.local_discovery;
   $("lan").disabled = !st.p2p || busy;

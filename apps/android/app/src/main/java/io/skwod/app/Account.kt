@@ -27,11 +27,13 @@ fun coreErrorKind(e: Throwable): String? = when (e) {
     is CoreException.ResetPending -> "ResetPending"
     is CoreException.LinkRequired -> "LinkRequired"
     is CoreException.UpdateRequired -> "UpdateRequired"
+    is CoreException.SignInReplaced -> "SignInReplaced"
     is CoreException.IdentityChanged -> "IdentityChanged"
     is CoreException.Invalid -> "Invalid"
     is CoreException.Engine -> "Engine"
     is CoreException.Cache -> "Cache"
     is CoreException.NoCache -> "NoCache"
+    is CoreException.Voice -> "Voice"
     else -> null
 }
 

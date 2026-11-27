@@ -54,11 +54,11 @@ object Uploads {
      * descriptor names the blob by the core's placeholder; the body is `<tag>{json}` with that
      * placeholder as a whole string value, which is how the core later sets the real id.
      */
-    suspend fun prepare(ctx: Context, model: AppModel, uri: Uri, forDm: Boolean): Prepared = withContext(Dispatchers.IO) {
+    suspend fun prepare(ctx: Context, model: AppModel, from: BoundClient<uniffi.skwod_core.SkwodClient>, uri: Uri, forDm: Boolean): Prepared = withContext(Dispatchers.IO) {
         val resolver = ctx.contentResolver
         var mime = resolver.getType(uri) ?: "application/octet-stream"
         var name = queryName(ctx, uri) ?: "file"
-        val wid = model.current?.id ?: throw AttachmentException("Not connected — the file wasn't sent.")
+        val wid = from.workspaceId
         // The host's per-file limit, as fresh as a minute: checked before anything is encrypted.
         refreshLimit(model)
         val limit = UploadLimit.current
@@ -90,7 +90,7 @@ object Uploads {
                 "video" -> thumb = AttachmentService.videoThumbBase64(ctx, uri)
                 "audio" -> thumb = AttachmentService.audioArtworkBase64(ctx, uri)
             }
-            seal(ctx, model, staged, name, mime, kind, thumb, forDm)
+            seal(ctx, from, staged, name, mime, kind, thumb, forDm)
         } finally { staged.delete() }
     }
 
@@ -123,21 +123,21 @@ object Uploads {
     }
 
     /** A photo from the camera (a bitmap's JPEG bytes): stripped, staged, encrypted. */
-    suspend fun prepareImage(ctx: Context, model: AppModel, picked: ByteArray, forDm: Boolean): Prepared = withContext(Dispatchers.IO) {
+    suspend fun prepareImage(ctx: Context, from: BoundClient<uniffi.skwod_core.SkwodClient>, picked: ByteArray, forDm: Boolean): Prepared = withContext(Dispatchers.IO) {
         if (picked.size > MAX_PHOTO_BYTES) throw AttachmentException("That photo is too large.")
         val clean = SafeImage.stripped(picked) ?: throw AttachmentException("Couldn't prepare that photo for sending.")
-        val wid = model.current?.id ?: throw AttachmentException("Not connected — the file wasn't sent.")
+        val wid = from.workspaceId
         val staged = File(stagingDir(ctx, wid), "photo-${System.nanoTime()}")
         try {
             staged.writeBytes(clean.data)
             val thumb = SafeImage.jpeg(clean.data, 480, 40)?.let { Base64.encodeToString(it, Base64.NO_WRAP) }
-            seal(ctx, model, staged, "photo-${System.currentTimeMillis()}.${clean.extension}", clean.mime, "image", thumb, forDm)
+            seal(ctx, from, staged, "photo-${System.currentTimeMillis()}.${clean.extension}", clean.mime, "image", thumb, forDm)
         } finally { staged.delete() }
     }
 
-    private suspend fun seal(ctx: Context, model: AppModel, staged: File, name: String, mime: String, kind: String, thumb: String?, forDm: Boolean): Prepared {
-        val c = model.client ?: throw AttachmentException("Not connected — the file wasn't sent.")
-        val wid = model.current?.id ?: throw AttachmentException("Not connected — the file wasn't sent.")
+    /** Through the client the send was made from — its skwod's — and no other. */
+    private suspend fun seal(ctx: Context, from: BoundClient<uniffi.skwod_core.SkwodClient>, staged: File, name: String, mime: String, kind: String, thumb: String?, forDm: Boolean): Prepared {
+        val (c, wid) = from.client to from.workspaceId
         val up = try { c.prepareUpload(staged.absolutePath, workDir(ctx, wid).absolutePath, forDm) }
             catch (e: uniffi.skwod_core.CoreException.Invalid) { throw AttachmentException(e.detail.ifBlank { "Couldn't prepare that file for sending." }) }
         val attachment = ChatAttachment(name, mime, up.plaintextLen.toLong(), kind, up.placeholderBlobId,
@@ -146,8 +146,8 @@ object Uploads {
     }
 
     /** The attachment was never queued (or its send was given up): drop it, and what reached the server. */
-    suspend fun release(model: AppModel, uploadId: String) {
-        try { withContext(Dispatchers.IO) { model.client?.releaseUpload(uploadId, true) } } catch (_: Exception) {}
+    suspend fun release(client: uniffi.skwod_core.SkwodClient, uploadId: String) {
+        try { withContext(Dispatchers.IO) { client.releaseUpload(uploadId, true) } } catch (_: Exception) {}
     }
 
     /** A send is being discarded: release the upload its body still names, if any. */
@@ -155,7 +155,7 @@ object Uploads {
         val c = model.client ?: return
         val body = try { withContext(Dispatchers.IO) { c.cachedMessage(scope, messageId) }?.content } catch (_: Exception) { null } ?: return
         val blobId = ChatTags.parse(body).attachment?.blobId ?: return
-        UploadRules.uploadId(blobId)?.let { release(model, it) }
+        UploadRules.uploadId(blobId)?.let { release(c, it) }
     }
 
     @Volatile private var limitAsked: Pair<String, Long>? = null

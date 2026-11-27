@@ -95,6 +95,9 @@ data class GameEvent<T>(val authorId: String, val createdAt: Long, val event: T)
 
 /** Send + fetch E2EE game events on a channel. Thin wrapper over the channel message path. */
 class GameSync(private val model: AppModel, private val channelId: String) {
+    /** The skwod the channel is in: a move goes through its cache, or nowhere. */
+    private val home = model.chat.spacesWorkspaceId
+
     suspend fun sendChess(s: ChessSnapshot) = send(s.toJson())
     suspend fun sendBoard(e: WhiteboardEvent) = send(e.toJson())
 
@@ -102,7 +105,7 @@ class GameSync(private val model: AppModel, private val channelId: String) {
     private suspend fun send(json: String): Boolean = withContext(Dispatchers.IO) {
         // Queued, like everything a person does: a move made while the connection is down is
         // delivered (once, in order) when it is back. False only when it could not be queued.
-        val c = model.client ?: return@withContext false
+        val c = Compose.sender(model.bound, home)?.client ?: return@withContext false
         try { c.queueChannelMessage(channelId, GAME_TAG + json, null, emptyList(), emptyList()) } catch (_: Exception) { return@withContext false }
         Outbox.kick(model)
         true

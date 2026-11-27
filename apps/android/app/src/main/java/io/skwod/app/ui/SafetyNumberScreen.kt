@@ -77,41 +77,52 @@ fun SafetyNumberDialog(peerName: String, peerUserId: String, onChanged: () -> Un
     // with the core here — for the same skwod's client only.
     // A READ only demotes; a name is raised only after an explicit, successful verification
     // here (`explicitVerify`), and never for a flagged name.
-    suspend fun refreshStatus(explicitVerify: Boolean = false, explicitUnverify: Boolean = false) {
-        val asked = model.client ?: return
-        val st = try { withContext(Dispatchers.IO) { asked.contactStatus(peerUserId) } } catch (_: Exception) { null } ?: return
-        if (model.client !== asked) return
+    // `asked`: the binding captured by the caller before its first await; everything here is
+    // for that skwod only.
+    suspend fun refreshStatus(asked: BoundClient<uniffi.skwod_core.SkwodClient>, explicitVerify: Boolean = false, explicitUnverify: Boolean = false) {
+        if (!Asked.holds(asked, model.bound)) return
+        val wid = asked.workspaceId
+        val st = try { withContext(Dispatchers.IO) { asked.client.contactStatus(peerUserId) } } catch (_: Exception) { null } ?: return
+        if (!Asked.holds(asked, model.bound)) return
         status = st
         when {
             explicitVerify && st.verified -> {
                 // Gated in the store: a flagged name is not pinned.
-                model.contacts.setVerified(peerUserId, true, peerName)
+                model.contacts.setVerified(wid, peerUserId, true, peerName)
             }
-            explicitUnverify -> if (!st.verified) model.contacts.setVerified(peerUserId, false, peerName) else model.contacts.noteStatusRead(peerUserId, true)
-            else -> model.contacts.noteStatusRead(peerUserId, st.verified)
+            explicitUnverify -> if (!st.verified) model.contacts.setVerified(wid, peerUserId, false, peerName) else model.contacts.noteStatusRead(wid, peerUserId, true)
+            else -> model.contacts.noteStatusRead(wid, peerUserId, st.verified)
         }
     }
 
-    suspend fun compute() {
+    suspend fun compute(asked: BoundClient<uniffi.skwod_core.SkwodClient>? = model.bound) {
         val me = model.session?.userId
-        val c = model.client
-        if (me == null || c == null) { failed = true; return }
+        if (me == null || asked == null) { failed = true; return }
+        val c = asked.client
         try {
             // ONE number per account: the device id is ignored by the core.
-            number = withContext(Dispatchers.IO) { c.safetyNumber(me, peerUserId, "") }
-            qr = try { withContext(Dispatchers.IO) { c.safetyQr(peerUserId) } } catch (_: Exception) { null }
+            val n = withContext(Dispatchers.IO) { c.safetyNumber(me, peerUserId, "") }
+            if (!Asked.holds(asked, model.bound)) return
+            number = n
+            val q = try { withContext(Dispatchers.IO) { c.safetyQr(peerUserId) } } catch (_: Exception) { null }
+            if (!Asked.holds(asked, model.bound)) return
+            qr = q
             failed = false
-        } catch (_: Exception) { failed = true }
-        refreshStatus()
+        } catch (_: Exception) {
+            if (!Asked.holds(asked, model.bound)) return
+            // No stale number or code on screen; the status is still read (it may demote).
+            failed = true; number = null; qr = null
+        }
+        refreshStatus(asked)
     }
 
     /**
      * The device set changed while this screen was open: nothing was marked. Show the new number
      * and say so — the comparison has to be done again, with the new number.
      */
-    suspend fun changedUnderneath() {
+    suspend fun changedUnderneath(asked: BoundClient<uniffi.skwod_core.SkwodClient>) {
         scan = null
-        compute()
+        compute(asked)
         problem = if ((status?.unvouchedDevices ?: 0u) > 0u)
             "Not verified: the server now lists a device for $peerName that none of their devices vouched for. Decide about it first."
         else "Not verified: the safety number changed while you were comparing — a device was added or removed. The number above is the new one; compare it again."
@@ -122,57 +133,63 @@ fun SafetyNumberDialog(peerName: String, peerUserId: String, onChanged: () -> Un
      * number and refuses if the device set is no longer the one that number covers.
      */
     suspend fun verify() {
-        val c = model.client ?: return
+        val asked = model.bound ?: return
         val shown = number ?: return
         problem = null
         try {
-            withContext(Dispatchers.IO) { c.verifyContact(peerUserId, shown) }
-            refreshStatus(explicitVerify = true)
-            onChanged()
+            // The record happens only if the skwod is still the one the verify started in.
+            val ran = BoundStep.run(asked, { model.bound }, { withContext(Dispatchers.IO) { asked.client.verifyContact(peerUserId, shown) } }) {
+                refreshStatus(asked, explicitVerify = true)
+            }
+            if (ran) onChanged()
         } catch (_: uniffi.skwod_core.CoreException.IdentityChanged) {
-            changedUnderneath()
+            if (Asked.holds(asked, model.bound)) changedUnderneath(asked)
         } catch (_: Exception) {
-            problem = "Couldn't mark $peerName verified. Check your connection and try again."
+            if (Asked.holds(asked, model.bound)) problem = "Couldn't mark $peerName verified. Check your connection and try again."
         }
     }
 
     suspend fun unverify() {
-        val c = model.client ?: return
-        try { withContext(Dispatchers.IO) { c.unverifyContact(peerUserId) } } catch (_: Exception) {}
-        refreshStatus(explicitUnverify = true)
+        val asked = model.bound ?: return
+        try { withContext(Dispatchers.IO) { asked.client.unverifyContact(peerUserId) } } catch (_: Exception) {}
+        if (!Asked.holds(asked, model.bound)) return
+        refreshStatus(asked, explicitUnverify = true)
         onChanged()
     }
 
     /** Continue with the devices the directory lists now (clears "verified"). */
     suspend fun accept() {
-        val c = model.client ?: return
+        val asked = model.bound ?: return
         problem = null
         try {
             // Exactly the set this screen showed (audit L2).
-            withContext(Dispatchers.IO) { c.acceptIdentityChange(peerUserId, "", status?.acceptFingerprint ?: "") }
-            compute()
+            withContext(Dispatchers.IO) { asked.client.acceptIdentityChange(peerUserId, "", status?.acceptFingerprint ?: "") }
+            if (!Asked.holds(asked, model.bound)) return
+            compute(asked)
             onChanged()
         } catch (_: uniffi.skwod_core.CoreException.IdentityChanged) {
-            compute()
+            if (!Asked.holds(asked, model.bound)) return
+            compute(asked)
             problem = "Their devices changed while you were deciding. Nothing was accepted — look again and decide."
-        } catch (_: Exception) { problem = "Couldn't accept the change. Check your connection and try again." }
+        } catch (_: Exception) { if (Asked.holds(asked, model.bound)) problem = "Couldn't accept the change. Check your connection and try again." }
     }
 
     /** A live camera scan of the other person's screen. */
     suspend fun check(scanned: String) {
-        val c = model.client ?: return
+        val asked = model.bound ?: return
         val shown = number ?: return
         try {
-            val matched = withContext(Dispatchers.IO) { c.checkSafetyQr(peerUserId, scanned) }
+            val matched = withContext(Dispatchers.IO) { asked.client.checkSafetyQr(peerUserId, scanned) }
+            if (!Asked.holds(asked, model.bound)) return
             if (matched == null) { scan = ScanResult.NOT_A_SAFETY_NUMBER; return }
             // The code matched the number the core holds NOW; it must also be the one on screen.
-            if (matched != shown) { changedUnderneath(); return }
+            if (matched != shown) { changedUnderneath(asked); return }
             scan = ScanResult.MATCH
             verify()
         } catch (_: uniffi.skwod_core.CoreException.IdentityChanged) {
-            scan = ScanResult.MISMATCH
+            if (Asked.holds(asked, model.bound)) scan = ScanResult.MISMATCH
         } catch (_: Exception) {
-            problem = "Couldn't check that code. Check your connection and try again."
+            if (Asked.holds(asked, model.bound)) problem = "Couldn't check that code. Check your connection and try again."
         }
     }
 

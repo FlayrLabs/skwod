@@ -77,7 +77,7 @@ pub async fn test_state_concurrent() -> AppState {
 }
 
 /// A fresh PostgreSQL database for one test, created through the `admin` URL.
-async fn postgres_pool(admin: &str) -> Db {
+pub async fn postgres_pool(admin: &str) -> Db {
     let name = format!("skwod_test_{}", crate::state::new_id().replace('-', "").to_lowercase());
     let maintenance = sqlx::postgres::PgPoolOptions::new().max_connections(1).connect(admin).await.expect("connect to SKWOD_TEST_POSTGRES");
     sqlx::query(&format!("CREATE DATABASE {name}")).execute(&maintenance).await.expect("create test database");
@@ -3020,7 +3020,7 @@ mod voice {
     }
 
     async fn seed_livekit(db: &crate::state::Db) {
-        for (name, value) in [("livekit_api_key", "lk_testkey"), ("livekit_api_secret", "test-secret-value")] {
+        for (name, value) in [("livekit_url", "wss://sfu.example.org"), ("livekit_api_key", "lk_testkey"), ("livekit_api_secret", "test-secret-value")] {
             sqlx::query("INSERT INTO instance_secrets (name, value, created_at) VALUES ($1, $2, 0)")
                 .bind(name)
                 .bind(value.as_bytes())
@@ -3055,9 +3055,85 @@ mod voice {
     async fn fails_closed_without_livekit_config() {
         let (app, _db) = test_app().await;
         let (owner, _member, channel_id) = voice_world(&app).await;
-        // No LiveKit creds seeded → no token, even for a permitted member.
-        let (status, _) = send(&app, "POST", &format!("/api/channels/{channel_id}/voice-token"), Some(&owner), None).await;
-        assert_eq!(status, StatusCode::FORBIDDEN);
+        // No LiveKit creds seeded → no token, even for a permitted member — and said as what it
+        // is: 503 with a code, not the 403 that means "you may not".
+        let path = format!("/api/channels/{channel_id}/voice-token");
+        let (status, body) = send(&app, "POST", &path, Some(&owner), None).await;
+        assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!((body["code"].as_str(), body["reason"].as_str()), (Some("voice_off"), Some("not_set_up")));
+        assert!(body.get("token").is_none());
+        // Only to someone who may join.
+        let (_, outsider) = signup(&app, "voicestranger").await;
+        assert_eq!(send(&app, "POST", &path, Some(&outsider), None).await.0, StatusCode::FORBIDDEN);
+        // What a 0.50 app reads of the status is unchanged.
+        let (status, body) = send(&app, "GET", "/api/voice/config", Some(&owner), None).await;
+        assert_eq!((status, body["configured"].as_bool(), body["url"].is_null()), (StatusCode::OK, Some(false), true));
+        assert_eq!((body["status"].as_str(), body["bundled"].as_bool(), body["external"].as_bool()), (Some("off"), Some(false), Some(false)));
+    }
+
+    /// The credentials are there but the call server is down (it is being restarted): the same
+    /// answer, "starting" — never a token without anywhere to go.
+    #[tokio::test]
+    async fn a_call_server_that_is_down_or_starting_is_a_503_with_its_code() {
+        let state = test_state().await;
+        let app = api::router(state.clone());
+        seed_livekit(&state.db).await;
+        let (_owner, member, channel_id) = voice_world(&app).await;
+        let path = format!("/api/channels/{channel_id}/voice-token");
+        sqlx::query("DELETE FROM instance_secrets WHERE name = 'livekit_url'").execute(&state.db).await.unwrap();
+        use crate::livekit::{Reason, VoicePhase};
+        for (phase, reason, code) in [(VoicePhase::Starting, Reason::Exited, "voice_starting"), (VoicePhase::Off, Reason::Ports, "voice_off")] {
+            state.voice.set(phase, reason, true);
+            let (status, body) = send(&app, "POST", &path, Some(&member), None).await;
+            assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE);
+            assert_eq!((body["code"].as_str(), body["reason"].as_str()), (Some(code), Some(reason.code())));
+            // Any member may read it too.
+            let (_, config) = send(&app, "GET", "/api/voice/config", Some(&member), None).await;
+            assert_eq!((config["status"].as_str(), config["reason"].as_str(), config["bundled"].as_bool()), (Some(phase.as_str()), Some(reason.code()), Some(true)));
+        }
+        state.voice.set(VoicePhase::On, Reason::Managed, true);
+        for (name, value) in [("livekit_url", "ws://127.0.0.1:7880"), ("livekit_managed", "1")] {
+            sqlx::query("INSERT INTO instance_secrets (name, value, created_at) VALUES ($1, $2, 0)").bind(name).bind(value.as_bytes()).execute(&state.db).await.unwrap();
+        }
+        assert_eq!(send(&app, "POST", &path, Some(&member), None).await.0, StatusCode::OK);
+    }
+
+    /// Who may change the call server: the owner, and on a skwod with its own call server nobody
+    /// can save another by mistake (a 0.50 app's setup sheet did, and it kept the bundled one off
+    /// on every start). One that IS saved can be seen, changed and cleared.
+    #[tokio::test]
+    async fn the_saved_call_server_is_the_owners_to_clear_and_not_to_set_by_mistake() {
+        let state = test_state().await;
+        let app = api::router(state.clone());
+        let (owner, member, _) = voice_world(&app).await;
+        let (_, me) = send(&app, "GET", "/api/auth/me", Some(&owner), None).await;
+        sqlx::query("INSERT INTO instance_secrets (name, value, created_at) VALUES ('owner_user_id', $1, 0)").bind(me["user_id"].as_str().unwrap().as_bytes()).execute(&state.db).await.unwrap();
+        let voice = json!({ "url": "wss://sfu.example.org", "api_key": "k", "api_secret": "s" });
+        use crate::livekit::{Reason, VoicePhase};
+        state.voice.set(VoicePhase::Starting, Reason::Launching, true);
+        let (status, _) = send(&app, "PUT", "/api/voice/config", Some(&owner), Some(voice.clone())).await;
+        assert_eq!(status, StatusCode::CONFLICT, "there is nothing to set up here");
+        // Nothing saved: nothing to clear.
+        let (status, body) = send(&app, "DELETE", "/api/voice/config", Some(&owner), None).await;
+        assert_eq!((status, body["cleared"].as_bool()), (StatusCode::OK, Some(false)));
+        // What the bundled server advertises is never cleared from here.
+        for (name, value) in [("livekit_url", "ws://127.0.0.1:7880"), ("livekit_managed", "1")] {
+            sqlx::query("INSERT INTO instance_secrets (name, value, created_at) VALUES ($1, $2, 0)").bind(name).bind(value.as_bytes()).execute(&state.db).await.unwrap();
+        }
+        assert_eq!(send(&app, "DELETE", "/api/voice/config", Some(&owner), None).await.1["cleared"], false);
+        assert!(crate::livekit::external_url(&state).await.is_none());
+
+        // Without a bundled server it is set as before; the managed mark does not outlive it.
+        state.voice.set(VoicePhase::Off, Reason::NoBinary, false);
+        assert_eq!(send(&app, "PUT", "/api/voice/config", Some(&owner), Some(voice)).await.0, StatusCode::OK);
+        assert_eq!(crate::livekit::external_url(&state).await.as_deref(), Some("wss://sfu.example.org"));
+        let (_, config) = send(&app, "GET", "/api/voice/config", Some(&member), None).await;
+        assert_eq!((config["external"].as_bool(), config["configured"].as_bool(), config["status"].as_str()), (Some(true), Some(true), Some("on")));
+        // A member may not clear it; the owner may, key and secret with it.
+        assert_eq!(send(&app, "DELETE", "/api/voice/config", Some(&member), None).await.0, StatusCode::FORBIDDEN);
+        assert_eq!(send(&app, "DELETE", "/api/voice/config", Some(&owner), None).await.1["cleared"], true);
+        let left: i64 = sqlx::query_scalar("SELECT count(*) FROM instance_secrets WHERE name IN ('livekit_url', 'livekit_api_key', 'livekit_api_secret', 'livekit_managed')").fetch_one(&state.db).await.unwrap();
+        assert_eq!(left, 0);
     }
 
     #[tokio::test]

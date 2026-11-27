@@ -37,15 +37,20 @@ import uniffi.skwod_core.Message
  * A single channel's E2EE conversation — the chat page of the drawer. Header carries a back affordance
  * (swipe-back on the pager also works) and an invite button that opens the secure-join sheet.
  */
+@OptIn(androidx.compose.material3.ExperimentalMaterial3Api::class)
 @Composable
-fun ChannelView(space: RealSpace, onBack: () -> Unit) {
+fun ChannelView(space: RealSpace, onBack: () -> Unit, inFront: Boolean = true) {
     val model = AppModel.get(LocalContext.current)
     val me = model.session?.userId ?: return
     val scope = rememberCoroutineScope()
     val messages = remember { mutableStateListOf<Message>() }
     val listState = rememberLazyListState()
     val ctx = LocalContext.current
-    var draft by remember { mutableStateOf("") }
+    // The conversation this composer was opened for: what is written here goes here, or nowhere.
+    val composedIn = remember { model.chat.conversationKey(space) }
+    /** The skwod this channel is in: what is sent here goes through its cache, or nowhere ([Compose]). */
+    val home = remember { model.chat.spacesWorkspaceId }
+    var draft by remember { mutableStateOf(model.chat.draft(composedIn)) }
     var sending by remember { mutableStateOf(false) }
     var sendError by remember { mutableStateOf<String?>(null) }
     var showInvite by remember { mutableStateOf(false) }
@@ -65,6 +70,12 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
     var blocking by remember { mutableStateOf<SafetyTarget?>(null) }
     var reporting by remember { mutableStateOf<SafetyTarget?>(null) }
 
+    // Build 51: failed catch-ups in a row, the retry waiting for its turn, the channel on screen.
+    var fetchFailures by remember(space.channelId) { mutableStateOf(0) }
+    var retryJob by remember { mutableStateOf<kotlinx.coroutines.Job?>(null) }
+    val onScreenChannel = rememberUpdatedState(space.channelId)
+    var refreshingByPull by remember { mutableStateOf(false) }
+    var justSent by remember(space.channelId) { mutableStateOf(false) }
     // Pages fetched with "Load older", in front of the live window (`messages`).
     val older = remember(space.channelId) { mutableStateListOf<Message>() }
     var loadingOlder by remember(space.channelId) { mutableStateOf(false) }
@@ -105,14 +116,15 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
 
     /** Queue a channel write (shown at once), then let the outbox deliver it. */
     fun queue(failure: String, write: suspend (uniffi.skwod_core.SkwodClient) -> Unit) {
-        val c = model.client ?: run { sendError = "Not connected — try again in a moment."; return }
-        scope.launch {
+        val c = Compose.sender(model.bound, home)?.client ?: run { sendError = Compose.OPENING; return }
+        // (Not this screen's scope: leaving it must not take back what was sent.)
+        model.launchJob {
             try {
-                withContext(Dispatchers.IO) { write(c) }
-                reloadLocal()
+                write(c)
+                withContext(Dispatchers.Main) { try { reloadLocal() } catch (_: Exception) {} }
                 Outbox.kick(model)
             } catch (e: Exception) {
-                sendError = OutboxPolicy.queueError((e as? uniffi.skwod_core.CoreException.Invalid)?.detail, failure)
+                withContext(Dispatchers.Main) { sendError = OutboxPolicy.queueError((e as? uniffi.skwod_core.CoreException.Invalid)?.detail, failure) }
             }
         }
     }
@@ -133,6 +145,31 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
         refreshReactions()
         refreshSendStates()
         model.drainDmEvents()                  // the fetch may have drained the sealed mailbox
+    }
+
+    /**
+     * [refreshMessages], and when it fails: say so and try again with backoff ([FetchRetryRule]),
+     * a bounded number of times — never a silently stale or empty list.
+     */
+    suspend fun refreshOrRetry() {
+        val channelId = space.channelId
+        val asked = model.bound
+        try {
+            refreshMessages()
+            if (model.bound === asked) model.chat.noteRead(space, null)
+            fetchFailures = 0; retryJob?.cancel(); retryJob = null
+        } catch (e: kotlinx.coroutines.CancellationException) { throw e
+        } catch (e: Exception) {
+            if (model.bound === asked) model.chat.noteRead(space, e)
+            if (channelId != onScreenChannel.value) return
+            fetchFailures++
+            retryJob?.cancel()
+            val wait = FetchRetryRule.delayMs(fetchFailures) ?: return
+            retryJob = scope.launch {
+                kotlinx.coroutines.delay(wait)
+                if (channelId == onScreenChannel.value) refreshOrRetry()
+            }
+        }
     }
 
     /** "Load older": the next page from the cache, and from the server once the cache runs out. */
@@ -168,6 +205,7 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
     // It belongs to this channel only ([StagingRule]).
     var pasted by remember(space.channelId) { mutableStateOf<PastedImage?>(null) }
     val onScreen by rememberUpdatedState(space.channelId)
+    SideEffect { if (editing == null) model.chat.keepDraft(composedIn, draft) }
     val clipHasImage = rememberClipboardHasImage()
     // @mentions: who was picked in the composer (user id → the "@name" inserted), the server's
     // pinned owner (whose @everyone counts), and how a mentioned account is named here.
@@ -177,7 +215,7 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
     // Whose @everyone counts here: the pinned owner and the server's admins ([Mentions.everyoneSenders]).
     val everyoneAllowed = model.everyoneSenders[space.serverId] ?: emptySet()
     // Opening the channel clears its "@ n" (and again whenever a mention lands while it is open).
-    LaunchedEffect(space.channelId, model.mentionCount(listOf("channel:${space.channelId}"))) { model.clearMentionBadges("channel:${space.channelId}") }
+    LaunchedEffect(space.channelId, inFront, model.mentionCount(listOf("channel:${space.channelId}"))) { if (inFront) model.clearMentionBadges("channel:${space.channelId}") }
     val mentionName: (String, String) -> String = { uid, typed ->
         if (uid == model.session?.userId) ContactTrust.SELF_MENTION
         else model.contacts.shown(uid, memberNames[uid] ?: typed).let { s -> s.labelFor(NameSurface.MENTION_CHIP) + chipMark(s) }
@@ -198,10 +236,11 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
 
     var showMusic by remember { mutableStateOf(false) }
 
-    fun sendAttachment(make: suspend () -> Uploads.Prepared) {
-        if (model.client == null) { sendError = "Not connected — the file wasn't sent."; return }
+    fun sendAttachment(make: suspend (BoundClient<uniffi.skwod_core.SkwodClient>) -> Uploads.Prepared) {
+        if (!Landing.maySend(composedIn, model.chat.conversationKey(space))) return
+        val from = Compose.sender(model.bound, home) ?: run { sendError = Compose.OPENING; return }
         uploading = true; sendError = null
-        scope.launch {
+        model.launchJob {
             var prepared: Uploads.Prepared? = null
             try {
                 // Encrypted file-to-file by the core — nothing is read into memory and nothing
@@ -209,34 +248,40 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
                 // core uploads it (resuming after a dropped connection or a restart), links the
                 // blob to the message — which is what lets everyone else in the channel open it —
                 // and sends the message once.
-                val up = make()
+                val up = make(from)
                 prepared = up
-                withContext(Dispatchers.IO) { model.client!!.queueChannelMessage(space.channelId, up.body, null, emptyList(), listOf(up.uploadId)) }
+                from.client.queueChannelMessage(space.channelId, up.body, null, emptyList(), listOf(up.uploadId))
                 prepared = null
-                try { reloadLocal() } catch (_: Exception) {}
+                withContext(Dispatchers.Main) { try { reloadLocal() } catch (_: Exception) {} }
                 Uploads.watch(model)
                 Outbox.kick(model, composed = true)
-            } catch (e: AttachmentException) { sendError = e.message
-            } catch (e: uniffi.skwod_core.CoreException.Invalid) { sendError = HistoryWindow.sendError(e.detail, "Couldn't send the file.")
-            } catch (_: Exception) { sendError = "Couldn't send the file." }
+            } catch (e: Exception) {
+                withContext(Dispatchers.Main) {
+                    sendError = when (e) {
+                        is AttachmentException -> e.message
+                        is uniffi.skwod_core.CoreException.Invalid -> HistoryWindow.sendError(e.detail, "Couldn't send the file.")
+                        else -> "Couldn't send the file."
+                    }
+                }
+            }
             // Prepared but never queued: drop it again.
-            prepared?.let { Uploads.release(model, it.uploadId) }
-            uploading = false
+            prepared?.let { Uploads.release(from.client, it.uploadId) }
+            withContext(Dispatchers.Main) { uploading = false }
         }
     }
 
     val picker = rememberLauncherForActivityResult(ActivityResultContracts.GetContent()) { uri ->
-        if (uri != null) sendAttachment { Uploads.prepare(ctx, model, uri, forDm = false) }
+        if (uri != null) sendAttachment { from -> Uploads.prepare(ctx, model, from, uri, forDm = false) }
     }
     val photoPicker = rememberLauncherForActivityResult(ActivityResultContracts.PickVisualMedia()) { uri ->
-        if (uri != null) sendAttachment { Uploads.prepare(ctx, model, uri, forDm = false) }
+        if (uri != null) sendAttachment { from -> Uploads.prepare(ctx, model, from, uri, forDm = false) }
     }
     val cameraPicker = rememberLauncherForActivityResult(ActivityResultContracts.TakePicturePreview()) { bmp ->
         if (bmp != null) {
             val out = java.io.ByteArrayOutputStream()
             bmp.compress(android.graphics.Bitmap.CompressFormat.JPEG, 85, out)
             val bytes = out.toByteArray()
-            sendAttachment { Uploads.prepareImage(ctx, model, bytes, forDm = false) }
+            sendAttachment { from -> Uploads.prepareImage(ctx, from, bytes, forDm = false) }
         }
     }
 
@@ -296,14 +341,18 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
         return
     }
 
-    LaunchedEffect(space.channelId) {
+    // Build 51: keyed on the client too — a channel opened before the client was up (launch), or
+    // kept across a re-bind (a replaced p2p session), reloads from the client that is up now.
+    LaunchedEffect(space.channelId, model.clientTurn.intValue) {
         val c = model.client ?: return@LaunchedEffect
-        messages.clear(); messages.addAll(withContext(Dispatchers.IO) { c.history("channel:${space.channelId}") })
+        val rows = withContext(Dispatchers.IO) { c.history("channel:${space.channelId}") }
+        messages.clear(); messages.addAll(rows)
+        fetchFailures = 0
         // Driven by the WebSocket: the channel is re-read when the relay says something happened
         // in it (a message, an edit, a delete, a reaction, a clear), when the socket reconnects,
-        // and on a slow safety timer — not every two seconds.
+        // on an app-wide catch-up (back in front, network back), and on a slow safety timer.
         val topic = "channel:${space.channelId}"
-        model.realtime.refreshLoop(45_000, match = { it.topic == topic }) { Outbox.flush(model); refreshMessages() }
+        model.realtime.refreshLoop(45_000, match = { it.topic == topic }) { Outbox.flush(model); refreshOrRetry() }
     }
     val all = HistoryWindow.merge(older, messages, { it.messageId }, { it.createdAt })
     // Feed posts, stories, comments, and game moves ride this channel but belong to the Feed /
@@ -321,33 +370,61 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
     // Frozen at open: the divider stays where the new messages began while they are read.
     var unreadAtOpen by remember(space.channelId) { mutableStateOf<Triple<String, Int, Long>?>(null) }
     var positioned by remember(space.channelId) { mutableStateOf(false) }
+    // The marker and the moment of opening ([io.skwod.app.UnreadRule.atOpen]).
+    var markerAtOpen by remember(space.channelId) { mutableStateOf<io.skwod.app.ReadMarker?>(null) }
+    var openedAt by remember(space.channelId) { mutableStateOf(0L) }
     var barDismissed by remember(space.channelId) { mutableStateOf(false) }
     var lastSeenId by remember(space.channelId) { mutableStateOf<String?>(null) }
-    val atBottom by remember { derivedStateOf { !listState.canScrollForward } }
+    // Build 51: only the reader leaves the bottom ([ChatScrollRule.stillAtBottom]); our own
+    // scroll down to the newest row counts as "at the bottom" while it runs.
+    var atBottom by remember(space.channelId) { mutableStateOf(true) }
+    var followingDown by remember { mutableStateOf(false) }
+    LaunchedEffect(listState) {
+        snapshotFlow { !listState.canScrollForward to listState.isScrollInProgress }.collect { (atEnd, scrolling) ->
+            if (atEnd) followingDown = false
+            atBottom = if (followingDown) true else ChatScrollRule.stillAtBottom(atBottom, scrolling, atEnd)
+        }
+    }
     val unreadItems = visible.map { io.skwod.app.UnreadItem(it.messageId, it.createdAt, it.authorId == "__me__" || it.authorId == me, it.isSystem) }
     LaunchedEffect(space.channelId, readKey) {
         val c = model.client
         marker = if (c != null && readKey != null) io.skwod.app.ReadMarker.decode(try { withContext(Dispatchers.IO) { c.kvRead(readKey) } } catch (_: Exception) { null }) else null
         markerLoaded = true
     }
-    // Opens at the first unread message (the divider a little below the top), else at the newest.
-    LaunchedEffect(markerLoaded, newestId != null) {
-        if (!markerLoaded || positioned || newestId == null) return@LaunchedEffect
+    // Build 51: opens at the NEWEST message ([ChatScrollRule]); the bar jumps up to the first
+    // unread and the "New" divider marks it.
+    // Only in front of the reader (the pager may compose this page behind the list).
+    LaunchedEffect(markerLoaded, newestId != null, inFront) {
+        if (!markerLoaded || positioned || newestId == null || !inFront) return@LaunchedEffect
         positioned = true
-        val first = io.skwod.app.UnreadRule.firstUnreadIndex(unreadItems, marker)
-        unreadAtOpen = first?.let { Triple(unreadItems[it].id, io.skwod.app.UnreadRule.unreadCount(unreadItems, marker), unreadItems[it].createdAt) }
+        markerAtOpen = marker
+        openedAt = System.currentTimeMillis()
+        unreadAtOpen = io.skwod.app.UnreadRule.atOpen(unreadItems, markerAtOpen, openedAt)?.let { (i, n) -> Triple(unreadItems[i].id, n, unreadItems[i].createdAt) }
         lastSeenId = newestId
-        // +1: the "load older" row is item 0.
-        listState.scrollToItem(if (first != null) first + 1 else visible.size)
+        // The "load older" row is item 0, so the newest message is item visible.size.
+        listState.scrollToItem(visible.size)
     }
-    // Follow new messages only while at the bottom (or my own); otherwise the pill counts them.
+    // A catch-up that lands after opening (cold launch: the cache first) brings rows written before
+    // the open: they join what was unread at open (it only grows; dismissed, it stays down).
+    LaunchedEffect(visible.size, newestId) {
+        if (!positioned || barDismissed) return@LaunchedEffect
+        val open = io.skwod.app.UnreadRule.atOpen(unreadItems, markerAtOpen, openedAt) ?: return@LaunchedEffect
+        if (open.second > (unreadAtOpen?.second ?: 0)) unreadAtOpen = Triple(unreadItems[open.first].id, open.second, unreadItems[open.first].createdAt)
+    }
+    // Follow new messages only while at the bottom (or my own / just sent); otherwise the pill counts them.
     LaunchedEffect(newestId) {
         if (newestId == null || !positioned) return@LaunchedEffect
-        if (atBottom || unreadItems.lastOrNull()?.mine == true) { listState.animateScrollToItem(visible.size); lastSeenId = newestId }
+        val arrival = ChatScrollRule.onArrival(atBottom, unreadItems.lastOrNull()?.mine == true, justSent,
+            io.skwod.app.UnreadRule.newBelow(unreadItems, lastSeenId))
+        if (arrival == ChatScrollRule.Arrival.FOLLOW) {
+            justSent = false; followingDown = true
+            try { listState.animateScrollToItem(visible.size) } finally { followingDown = false }
+            atBottom = true; lastSeenId = newestId
+        }
     }
     // At the newest message: read up to it (kept in the encrypted cache, one key per channel).
-    LaunchedEffect(atBottom, newestId, positioned) {
-        if (!atBottom || !positioned) return@LaunchedEffect
+    LaunchedEffect(atBottom, newestId, positioned, inFront) {
+        if (!atBottom || !positioned || !inFront) return@LaunchedEffect
         val last = unreadItems.lastOrNull() ?: return@LaunchedEffect
         lastSeenId = last.id
         val next = io.skwod.app.UnreadRule.advanced(marker, last)
@@ -357,7 +434,9 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
         if (readKey != null) try { withContext(Dispatchers.IO) { c.kvWrite(readKey, next.encode()) } } catch (_: Exception) {}
     }
     val newBelow = if (atBottom) 0 else io.skwod.app.UnreadRule.newBelow(unreadItems, lastSeenId)
-    val barText = unreadAtOpen?.takeIf { !barDismissed && io.skwod.app.UnreadRule.unreadCount(unreadItems, marker) > 0 }?.let {
+    // Opening at the newest reads it all: the bar stands on what was unread AT OPEN until it is
+    // used, dismissed, or the channel is left.
+    val barText = unreadAtOpen?.takeIf { !barDismissed }?.let {
         io.skwod.app.UnreadRule.barText(it.second, java.text.DateFormat.getTimeInstance(java.text.DateFormat.SHORT).format(java.util.Date(it.third)))
     }
 
@@ -398,6 +477,12 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
                 ((if (it.authorId == "__me__" || it.authorId == me) "you" else MemberLabel.of(model.contacts.shown(it.authorId, memberNames[it.authorId]), it.authorId)) to ChatTags.parse(it.content ?: "").text) }
         }
         Box(Modifier.weight(1f)) {
+        // Build 51: pull down to catch up by hand.
+        androidx.compose.material3.pulltorefresh.PullToRefreshBox(
+            isRefreshing = refreshingByPull,
+            onRefresh = { scope.launch { refreshingByPull = true; try { refreshOrRetry() } finally { refreshingByPull = false } } },
+            modifier = Modifier.fillMaxSize(),
+        ) {
         LazyColumn(Modifier.fillMaxSize().dismissKeyboardOnTapOrDrag(listState), state = listState) {
             item {
                 Box(Modifier.fillMaxWidth().padding(vertical = 4.dp), contentAlignment = Alignment.Center) {
@@ -479,10 +564,18 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
                     sendState = if (mine) sendStates[m.messageId] else null, mentionsMe = mentionsMe, mentionName = mentionName)
             }
         }
+        }
+        // Build 51: "Reconnecting…" / "Couldn't load new messages · Retry" — never a silent stale list.
+        SyncStatusChip(FetchRetryRule.status(fetchFailures, connectionStripShowing(model)), Modifier.align(Alignment.TopCenter).padding(top = if (barText != null) 52.dp else 6.dp)) {
+            fetchFailures = 0; scope.launch { refreshOrRetry() }
+        }
         // "N new messages since …" across the top, and "↓ N new" while scrolled up.
         barText?.let { text ->
             NewMessagesBar(text, Modifier.align(Alignment.TopCenter).padding(horizontal = 4.dp, vertical = 6.dp),
-                onJump = { unreadAtOpen?.first?.let { id -> scope.launch { listState.animateScrollToItem(visible.indexOfFirst { it.messageId == id }.coerceAtLeast(0) + 1) } } },
+                onJump = {
+                    unreadAtOpen?.first?.let { id -> scope.launch { listState.animateScrollToItem(visible.indexOfFirst { it.messageId == id }.coerceAtLeast(0) + 1) } }
+                    barDismissed = true
+                },
                 onMarkRead = {
                     barDismissed = true
                     unreadItems.lastOrNull()?.let { last ->
@@ -538,7 +631,7 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
         }
         // Only this server's members (as listed) can show as typing here.
         TypingLine("channel:${space.channelId}", accept = { it.isNotEmpty() && it in memberNames },
-            nameOf = { model.contacts.shown(it, memberNames[it] ?: it.take(6)).label })
+            nameOf = { MemberLabel.of(model.contacts.shown(it, memberNames[it]), it) })
         pasted?.let { p -> PastedImagePreview(p, onRemove = { pasted = null }) }
             ?: run { if (clipHasImage && !uploading && editing == null) PasteImageChip {
                 // Tagged with the channel it started in: a picture read after a switch is dropped.
@@ -578,10 +671,13 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
                     unfocusedBorderColor = Color.White.copy(alpha = 0.15f)))
             Spacer(Modifier.width(8.dp))
             FilledIconButton(onClick = {
+                if (!Landing.maySend(composedIn, model.chat.conversationKey(space))) return@FilledIconButton
+                // (Nothing is taken from the composer unless it can be handed over now.)
+                val c = Compose.sender(model.bound, home)?.client ?: run { sendError = Compose.OPENING; return@FilledIconButton }
                 // A pasted picture goes exactly like one picked with + (stripped, encrypted, queued).
                 pasted?.takeIf { editing == null }?.let { pic ->
                     pasted = null
-                    sendAttachment { Uploads.prepareImage(ctx, model, pic.bytes, forDm = false) }
+                    sendAttachment { from -> Uploads.prepareImage(ctx, from, pic.bytes, forDm = false) }
                 }
                 val text = draft.trim(); if (text.isEmpty()) return@FilledIconButton
                 lastTyping = 0L
@@ -591,20 +687,24 @@ fun ChannelView(space: RealSpace, onBack: () -> Unit) {
                 // Nothing here waits for the network: the message is queued in the core (it is
                 // in this device's history at once, marked "Sending…") and delivered when the
                 // connection allows — typing while offline loses nothing.
-                val c = model.client
-                scope.launch {
+                // Sending always goes to the bottom ([ChatScrollRule]).
+                justSent = true
+                scope.launch { try { listState.animateScrollToItem(visible.size) } catch (_: Exception) {} }
+                // (Not this screen's scope: leaving it must not take back what was sent.)
+                model.launchJob {
                     try {
-                        if (c == null) throw IllegalStateException()
-                        withContext(Dispatchers.IO) {
-                            if (editTarget != null) c.queueChannelEdit(space.channelId, editTarget.messageId, outgoing)
-                            else c.queueChannelMessage(space.channelId, outgoing, replyTarget?.messageId, emptyList(), emptyList())
-                        }
-                        reloadLocal()
+                        if (editTarget != null) c.queueChannelEdit(space.channelId, editTarget.messageId, outgoing)
+                        else c.queueChannelMessage(space.channelId, outgoing, replyTarget?.messageId, emptyList(), emptyList())
+                        withContext(Dispatchers.Main) { try { reloadLocal() } catch (_: Exception) {} }
                         Outbox.kick(model, composed = true)
                     } catch (e: Exception) {
-                        // Could not even be queued (too long, or the outbox is full): give the text back.
-                        draft = text; replyingTo = replyTarget; editing = editTarget
-                        sendError = OutboxPolicy.queueError((e as? uniffi.skwod_core.CoreException.Invalid)?.detail)
+                        // Could not even be queued (too long, or the outbox is full): give the text back
+                        // to this conversation's composer, whether or not it is still on screen.
+                        withContext(Dispatchers.Main) {
+                            draft = Compose.givenBack(text, draft); replyingTo = replyTarget; editing = editTarget
+                            if (editTarget == null) model.chat.keepDraft(composedIn, Compose.givenBack(text, model.chat.draft(composedIn)))
+                            sendError = OutboxPolicy.queueError((e as? uniffi.skwod_core.CoreException.Invalid)?.detail)
+                        }
                     }
                 }
             }, enabled = !sending && (draft.isNotBlank() || (pasted != null && editing == null && !uploading)), shape = RoundedCornerShape(50)) {
@@ -691,6 +791,25 @@ fun CreateServerDialog(onCancel: () -> Unit, onCreate: (RealSpace) -> Unit) {
 }
 
 /** The line above the first message that was new when the channel opened (build 49). */
+/** Build 51: what the last catch-up of this conversation came to, if it failed (nothing when ok). */
+@Composable
+internal fun SyncStatusChip(status: FetchRetryRule.Status, modifier: Modifier, onRetry: () -> Unit) {
+    if (status == FetchRetryRule.Status.OK) return
+    Surface(color = Color(0xFF1B1B26), shape = RoundedCornerShape(50), modifier = modifier) {
+        Row(Modifier.padding(horizontal = 12.dp, vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {
+            if (status == FetchRetryRule.Status.RETRYING) {
+                CircularProgressIndicator(Modifier.size(12.dp), strokeWidth = 1.5.dp, color = Color.White)
+                Spacer(Modifier.width(8.dp))
+                Text("Reconnecting…", color = Color.White.copy(alpha = 0.85f), fontSize = 12.sp)
+            } else {
+                Text("Couldn't load new messages", color = Color.White.copy(alpha = 0.85f), fontSize = 12.sp)
+                Spacer(Modifier.width(8.dp))
+                Text("Retry", color = SkAccent, fontSize = 12.sp, fontWeight = FontWeight.SemiBold, modifier = Modifier.clickable { onRetry() })
+            }
+        }
+    }
+}
+
 @Composable
 private fun NewMessagesDivider() {
     Row(Modifier.fillMaxWidth().padding(vertical = 6.dp), verticalAlignment = Alignment.CenterVertically) {

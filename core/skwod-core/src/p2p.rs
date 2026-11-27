@@ -1128,7 +1128,7 @@ mod release_tests {
         assert_eq!(session.clone().ensure_front().await, P2pFrontState { relistened: false, failed: false, base_url: base.clone(), credential: None });
         session.proxy.drop_listener_for_test();
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        assert_eq!(session.check(2_000).await.proxy_ok, false, "the port answers nothing");
+        assert!(!session.check(2_000).await.proxy_ok, "the port answers nothing");
         let state = session.clone().ensure_front().await;
         assert!(state.relistened && !state.failed);
         assert_eq!(port_of(&state.base_url), port_of(&base), "the same port");
@@ -1204,7 +1204,7 @@ mod release_tests {
         let base = session.base_url();
         let credential = session.sign_in("tok".into()).await.unwrap();
         session.proxy.mute_challenges_for_test(true);
-        assert_eq!(session.check(3_000).await.proxy_ok, false, "silent is not ours");
+        assert!(!session.check(3_000).await.proxy_ok, "silent is not ours");
         // While ensure_front decides, the front is unverified and forwards nothing.
         let (s2, b2, c2) = (session.clone(), base.clone(), credential.clone());
         let deciding = tokio::spawn(async move { s2.clone().ensure_front().await });
@@ -1819,7 +1819,7 @@ mod release_tests {
         deposit().await.unwrap();
         session.clear_token().await;
         deposit().await.unwrap();
-        let heads = heads.lock().unwrap();
+        let heads = heads.lock().unwrap().clone();
         assert!(heads[0].contains("authorization: bearer s3ss10n"), "the control: the session's own request carries it");
         let deposits: Vec<_> = heads.iter().filter(|h| h.starts_with("post /api/e2ee/sealed/send")).collect();
         assert_eq!(deposits.len(), 3);

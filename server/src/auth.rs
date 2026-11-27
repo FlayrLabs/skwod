@@ -474,7 +474,8 @@ async fn rotate(State(state): State<AppState>, headers: axum::http::HeaderMap) -
     let old_hash = token_hash(old);
     let now = now_ms();
     let key_hash: Option<Vec<u8>> = headers.get(ROTATION_KEY_HEADER).and_then(|v| v.to_str().ok()).filter(|k| (32..=128).contains(&k.len())).map(token_hash);
-    let row: Option<(String, i64, i64, Option<Vec<u8>>, Option<Vec<u8>>)> = sqlx::query_as("SELECT user_id, origin_at, superseded, rotation_key, successor_hash FROM sessions WHERE token_hash = $1 AND expires_at > $2")
+    type RotationRow = (String, i64, i64, Option<Vec<u8>>, Option<Vec<u8>>);
+    let row: Option<RotationRow> = sqlx::query_as("SELECT user_id, origin_at, superseded, rotation_key, successor_hash FROM sessions WHERE token_hash = $1 AND expires_at > $2")
         .bind(&old_hash)
         .bind(now)
         .fetch_optional(&state.db)

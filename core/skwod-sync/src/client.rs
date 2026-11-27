@@ -796,8 +796,9 @@ mod front_tests {
     }
 
     /// A test transport: records (secret, headers) of every in-process request, answers 200 {}.
-    fn recorded() -> std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<(String, String)>)>>> {
-        static LOG: std::sync::OnceLock<std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<(String, String)>)>>>> = std::sync::OnceLock::new();
+    type Recorded = std::sync::Arc<std::sync::Mutex<Vec<(String, Vec<(String, String)>)>>>;
+    fn recorded() -> Recorded {
+        static LOG: std::sync::OnceLock<Recorded> = std::sync::OnceLock::new();
         let log = LOG.get_or_init(Default::default).clone();
         let sink = log.clone();
         set_front_transport(std::sync::Arc::new(move |secret, _m, _p, headers, _b| {

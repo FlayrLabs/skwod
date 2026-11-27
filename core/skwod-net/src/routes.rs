@@ -247,7 +247,7 @@ mod tests {
         r.saw_at(at("8.8.4.4:4433"), false, 100, |_| Some(ip("192.168.1.9")));
         let count = |now| r.onto_at(EndpointAddr::new(host), now, |_| Some(ip("192.168.1.9"))).ip_addrs().count();
         assert_eq!((count(100 + KEEP_GLOBAL_SECS - 1), count(100 + KEEP_GLOBAL_SECS)), (1, 0));
-        assert!(KEEP_GLOBAL_SECS <= 3 * 24 * 60 * 60);
+        const { assert!(KEEP_GLOBAL_SECS <= 3 * 24 * 60 * 60) };
     }
 
     #[test]
